@@ -74,7 +74,8 @@ for (let i = 0; i < frames; i++) {
     duration: frameDuration,
     fence: fences[0],
   });
-  const sample = new VideoSample(frame);
+  // Mediabunny is typed for the DOM's VideoFrame; this one stands in for it.
+  const sample = new VideoSample(frame as unknown as globalThis.VideoFrame);
   try {
     await video.add(sample);
   } finally {
@@ -125,7 +126,11 @@ Mediabunny demuxes the file and drives `VideoDecoder`. The decoded
 without a copy.
 
 ```ts
-import { fileSourceOptions, installWebCodecs } from "react-native-webcodecs";
+import {
+  fileSourceOptions,
+  installWebCodecs,
+  type VideoFrame,
+} from "react-native-webcodecs";
 import { ALL_FORMATS, CustomSource, Input, VideoSampleSink } from "mediabunny";
 
 installWebCodecs();
@@ -135,7 +140,8 @@ const input = new Input({
 });
 const track = await input.getPrimaryVideoTrack();
 const sample = await new VideoSampleSink(track).getSample(1.5);
-const frame = sample.toVideoFrame();
+// This package's VideoFrame, typed as the DOM's by Mediabunny.
+const frame = sample.toVideoFrame() as unknown as VideoFrame;
 sample.close();
 
 const buffer = RNWebGPU.createNativeBufferFromPointer(frame.pixelBuffer, {
@@ -192,6 +198,8 @@ const input = new Input({
   source: new CustomSource(fileSourceOptions(path)),
   formats: ALL_FORMATS,
 });
+const videoTrack = await input.getPrimaryVideoTrack();
+const rotation = videoTrack ? await videoTrack.getRotation() : 0;
 const file = createFileWritable("compressed.mp4");
 const output = new Output({
   // The index first, so the file plays while it downloads.

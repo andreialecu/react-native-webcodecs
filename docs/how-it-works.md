@@ -29,7 +29,8 @@ Every holder (JavaScript's `VideoFrame`, the encoder, a clone) takes its own
 reference. A pool's surface returns to the pool once the last reference is
 gone, so a long export reuses a handful of surfaces instead of allocating
 one per frame. Pools come in three formats: `BGRA` (8 bits), `NV12` (YUV)
-and `RGBA16F` (half float, for HDR).
+and `RGBA16F` (half float, for HDR). Android has no `NV12` pools, and its
+8-bit ones are RGBA.
 
 `new VideoFrame({ handle }, init)` wraps any surface the app already has,
 such as a camera frame, by its handle.
@@ -41,14 +42,17 @@ signals once the surface is drawn. The fence is waited on natively, where
 the surface is read:
 
 - **iOS**: an `MTLSharedEvent` and the value to wait for, which
-  react-native-webgpu's `endAccess()` returns. The encoder waits for the
-  event (with a one-second guard) before handing the surface to
-  VideoToolbox.
+  react-native-webgpu's `endAccess()` returns. The encoder's queue waits
+  for the event before handing the surface to VideoToolbox. After a second
+  it gives up and encodes the surface as it is, so a draw that is never
+  submitted shows up as a stall and a wrong frame, not an error.
 - **Android**: a sync file descriptor. The encoder turns it into an EGL sync
-  and waits on the GPU (`eglWaitSyncKHR`), so even the CPU does not block.
+  and waits on the GPU (`eglWaitSyncKHR`), then copies the surface into the
+  codec's input and waits for that copy on its own thread. HDR frames are
+  read on the CPU, after waiting for the fence there.
 
-This is why the export loop has no `await` for the GPU: drawing frame *n+1*
-overlaps with encoding frame *n*.
+Either way the JavaScript thread never waits for the GPU: drawing frame
+*n+1* overlaps with encoding frame *n*.
 
 ## Encoding
 
@@ -143,7 +147,14 @@ moves the codec to `closed` and calls its `error` callback, as on the web.
 
 **Android encoding** copies each frame once on the GPU (EGL) into
 MediaCodec's input surface. `flush()` on Android's encoder ends the stream;
-encoding after it starts a new stream, from a key frame.
+encoding after it starts a new stream, from a key frame. Frame timestamps
+must grow: MediaCodec drops a frame whose timestamp does not move forward
+(it then counts as dropped, with no output).
+
+**AAC priming.** AAC encoders put about 1600 (Android) to 2112 (iOS)
+samples of silence ahead of the sound, and nothing in the output says so
+yet: the sound of an export starts that much (33 to 44 ms at 48 kHz) after
+the video.
 
 **Android decoding** stalls while JavaScript holds all 16 output frames, as
 a web decoder does until frames are closed.

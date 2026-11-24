@@ -166,6 +166,8 @@ const FRAME_COUNT = 7 * FRAME_RATE; // a 7 s video
 const BITRATE = 8_000_000; // bits per second (8 Mbps)
 const MICROSECONDS_PER_SECOND = 1_000_000; // WebCodecs times are in µs
 const FRAME_DURATION = MICROSECONDS_PER_SECOND / FRAME_RATE;
+// RNWebGPU is the global react-native-webgpu installs; `device` is your
+// GPUDevice (navigator.gpu.requestAdapter(), then requestDevice()).
 
 const file = createFileWritable("export.mp4"); // in the cache directory
 const output = new Output({
@@ -190,11 +192,12 @@ for (let i = 0; i < FRAME_COUNT; i++) {
   buffer.release();
 
   const frame = new VideoFrame(surface, {
-    timestamp: i * FRAME_DURATION,
+    timestamp: i * FRAME_DURATION, // must grow from frame to frame
     duration: FRAME_DURATION,
     fence: fences[0], // the encoder waits for it natively
   });
-  const sample = new VideoSample(frame);
+  // Mediabunny is typed for the DOM's VideoFrame; this one stands in for it.
+  const sample = new VideoSample(frame as unknown as globalThis.VideoFrame);
   try {
     await video.add(sample); // resolves once the encoder has room
   } finally {
