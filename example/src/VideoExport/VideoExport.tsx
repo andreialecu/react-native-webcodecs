@@ -1,35 +1,30 @@
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Platform, StatusBar, StyleSheet, Text, View } from "react-native";
 import type { RouteProp } from "@react-navigation/native";
 import { useNavigation, useRoute } from "@react-navigation/native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useDerivedValue } from "react-native-reanimated";
 import type { SkSkottieAnimation } from "react-native-skia";
-import {
-  Canvas,
-  Group,
-  Skia,
-  Skottie,
-  useClock,
-  useData,
-} from "react-native-skia";
+import { Canvas, Group, Skottie, useClock } from "react-native-skia";
 
 import type { Routes } from "../Route";
 
-import card from "./card.json";
+import type { CardAssets } from "./lottieCard";
+import { loadCardAssets, loadSound, makeCard } from "./lottieCard";
 import type { Result } from "./export";
-import { assetBytes, exportVideo, HEIGHT, shareVideo, WIDTH } from "./export";
-import { boostLights } from "./hdr";
+import { exportVideo, HEIGHT, shareVideo, WIDTH } from "./export";
 import { HdrPreview } from "./HdrPreview";
 import { colors, PillButton, RoundButton, Segmented } from "./ui";
 
 // The share card of react-native-skia's Skottie export example, exported
 // with react-native-webcodecs (export.ts), or with the browser's WebCodecs on
 // the web (export.web.ts).
-
-const json = JSON.stringify(card);
-// For HDR, the lights go above SDR white, up to the HLG peak.
-const hdrJson = JSON.stringify(boostLights(card));
 
 type Status =
   | { state: "idle" }
@@ -87,9 +82,17 @@ export const VideoExportView = ({
   onClose?: () => void;
 }) => {
   const insets = useSafeAreaInsets();
-  const photo = useData(require("./assets/photo.jpg"));
-  const logo = useData(require("./assets/logo.png"));
-  const font = useData(require("./assets/Roboto-Bold.ttf"));
+  const [assets, setAssets] = useState<CardAssets | null>(null);
+  useEffect(() => {
+    let mounted = true;
+    loadCardAssets().then(
+      (loaded) => mounted && setAssets(loaded),
+      (e) => console.warn(e),
+    );
+    return () => {
+      mounted = false;
+    };
+  }, []);
   const [sound, setSound] = useState<Sound>("sound");
   const [status, setStatus] = useState<Status>({ state: "idle" });
   const abort = useRef<AbortController | null>(null);
@@ -101,17 +104,8 @@ export const VideoExportView = ({
   // One instance for the preview, another for the export: seeking one does
   // not move the other.
   const make = useCallback(
-    () =>
-      photo && logo && font
-        ? Skia.Skottie.Make(hdr ? hdrJson : json, {
-            "photo.jpg": photo,
-            "logo.png": logo,
-            // The animation asks for SF Pro, which can't be redistributed:
-            // Roboto stands in.
-            SFProBold: font,
-          })
-        : null,
-    [photo, logo, font, hdr],
+    () => (assets ? makeCard(assets, hdr) : null),
+    [assets, hdr],
   );
   const preview = useMemo(make, [make]);
 
@@ -124,10 +118,7 @@ export const VideoExportView = ({
     abort.current = controller;
     setStatus({ state: "exporting", frames: 0, totalFrames: 0 });
     try {
-      const bytes =
-        sound === "sound"
-          ? await assetBytes(require("./assets/sound.m4a"))
-          : null;
+      const bytes = sound === "sound" ? await loadSound() : null;
       const result = await exportVideo(
         animation,
         bytes,
