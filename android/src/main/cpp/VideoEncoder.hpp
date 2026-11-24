@@ -69,26 +69,44 @@ constexpr auto kEndOfStreamDrainTimeout = std::chrono::milliseconds(200);
 constexpr auto kForeignReadTimeout = std::chrono::milliseconds(10000);
 
 // Set once a frame's buffer has been read (or never will be): when the GL
-// thread signals it, or at the latest when the task holding it is gone.
+// thread signals it, when the task's body exits without reading it (see
+// FrameReadGuard), or at the latest when the task holding it is destroyed
+// unrun. The waiter keeps only the future: the task holds the only
+// FrameRead, so its destructor does run when the task is gone.
 class FrameRead {
 public:
-  FrameRead() : _future(_promise.get_future()) {}
   ~FrameRead() {
     signal();
+  }
+  std::future<void> future() {
+    return _promise.get_future();
   }
   void signal() {
     if (!_signaled.exchange(true)) {
       _promise.set_value();
     }
   }
-  bool waitFor(std::chrono::milliseconds timeout) {
-    return _future.wait_for(timeout) == std::future_status::ready;
-  }
 
 private:
   std::promise<void> _promise;
-  std::future<void> _future;
   std::atomic<bool> _signaled{false};
+};
+
+// Signals a FrameRead when the scope exits, by any path: a frame that is
+// not drawn (the encoder has failed, the draw throws) is never read.
+class FrameReadGuard {
+public:
+  explicit FrameReadGuard(FrameRead* read) : _read(read) {}
+  ~FrameReadGuard() {
+    if (_read) {
+      _read->signal();
+    }
+  }
+  FrameReadGuard(const FrameReadGuard&) = delete;
+  FrameReadGuard& operator=(const FrameReadGuard&) = delete;
+
+private:
+  FrameRead* _read;
 };
 
 // Debug builds only: a fault the e2e tests make the encoder act out, from
@@ -300,9 +318,11 @@ public:
     // returns. So encode() returns once it has been read. Pool and decoder
     // buffers are not reused while the encoder holds them.
     std::shared_ptr<FrameRead> read = ref->foreign() ? std::make_shared<FrameRead>() : nullptr;
-    // The task's copy: signalled after the read, or when the task is gone.
-    std::shared_ptr<FrameRead> readByTask = read;
-    _gl.post([this, ref, fence, visibleWidth, visibleHeight, ts, duration, keyFrame, read = std::move(readByTask)]() mutable {
+    // encode() keeps only the future; the task owns the FrameRead.
+    std::future<void> readDone = read ? read->future() : std::future<void>();
+    _gl.post([this, ref, fence, visibleWidth, visibleHeight, ts, duration, keyFrame, read = std::move(read)]() mutable {
+      // Signalled after the read, or on whatever path leaves it unread.
+      FrameReadGuard readGuard(read.get());
       if (_failed) {
         if (fence >= 0) {
           ::close(fence);
@@ -386,7 +406,7 @@ public:
         fail(errorMessage("EncodingError", "encoder-failed", e.what()));
       }
     });
-    if (read && !read->waitFor(kForeignReadTimeout)) {
+    if (readDone.valid() && readDone.wait_for(kForeignReadTimeout) != std::future_status::ready) {
       throw domError("EncodingError", "the frame was not read within " + std::to_string(kForeignReadTimeout.count()) +
                                           " ms; its buffer may be written over before it is");
     }

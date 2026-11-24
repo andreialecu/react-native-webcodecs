@@ -2488,6 +2488,78 @@ describe("react-native-webcodecs + Mediabunny", () => {
     });
   }, 120000);
 
+  // encode() of a wrapped surface waits until its buffer has been read. A
+  // frame that is never drawn (the draw fails, or the encoder has already
+  // failed) is never read either: encode() must return at once then, not
+  // block the JS thread until the read times out. Debug builds only: the
+  // second draw fails.
+  it("does not block encode() of a wrapped surface whose frame is not drawn (Android fault)", async () => {
+    if (client.OS !== "android") {
+      return;
+    }
+    setFault("venc-draw-fail:2");
+    let run: any;
+    try {
+      run = (await client.eval(({ webcodecs: wc }) => {
+        const errors: string[] = [];
+        const thrown: string[] = [];
+        const ms: number[] = [];
+        let reported: () => void = () => {};
+        const failure = new Promise<void>((resolve) => {
+          reported = resolve;
+        });
+        const encoder = new wc.VideoEncoder({
+          output: () => {},
+          error: (e: any) => {
+            errors.push(`${e.name}: ${e.message}`);
+            reported();
+          },
+        });
+        encoder.configure({ codec: "avc1.42001f", width: 128, height: 128 });
+        const pool = wc.createSurfacePool(128, 128);
+        const surfaces: any[] = [];
+        // Frame 0 is drawn, frame 1's draw fails, frame 2 comes to an
+        // encoder that has failed.
+        for (let i = 0; i < 3; i++) {
+          const surface = pool.acquire();
+          surfaces.push(surface);
+          const frame = new wc.VideoFrame(
+            { handle: surface.handle },
+            { timestamp: i * 100000, duration: 100000 },
+          );
+          const started = Date.now();
+          try {
+            encoder.encode(frame, { keyFrame: i === 0 });
+          } catch (e: any) {
+            thrown.push(`${e && e.name}: ${e && e.message}`);
+          }
+          ms.push(Date.now() - started);
+          frame.close();
+        }
+        return Promise.race([
+          failure.then(() => "failed"),
+          new Promise((resolve) => setTimeout(() => resolve("timeout"), 20000)),
+        ]).then((outcome: any) => {
+          const { state } = encoder;
+          if (state !== "closed") {
+            encoder.close();
+          }
+          surfaces.forEach((s) => s.release());
+          return { outcome, errors, thrown, ms, state };
+        });
+      })) as any;
+    } finally {
+      setFault("");
+    }
+    console.log(`wrapped, not drawn: ${JSON.stringify(run)}`);
+    expect(run.thrown).toEqual([]);
+    expect(Math.max(...run.ms)).toBeLessThan(3000);
+    expect(run.outcome).toBe("failed");
+    expect(run.errors.length).toBe(1);
+    expect(run.errors[0]).toMatch(/^EncodingError: .*the draw failed/);
+    expect(run.state).toBe("closed");
+  }, 120000);
+
   it("releases the old VideoEncoder codec before configure() makes a new one (Android fault)", async () => {
     if (client.OS !== "android") {
       return;
