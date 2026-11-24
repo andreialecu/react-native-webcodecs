@@ -118,6 +118,11 @@ public:
                     int64_t presentationNs) {
     makeCurrent(target);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    // Cleared first, though the quad covers it all: some drivers keep (and
+    // tile-based GPUs load) the window buffer's old contents otherwise, and
+    // the encoder can be given a stale or partly drawn picture (webrtc:5147).
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
     // Window: GL's first row is the bottom of the picture.
     draw(source, visibleWidth, visibleHeight, width, height, true);
     eglPresentationTimeANDROID(_display, target, presentationNs);
