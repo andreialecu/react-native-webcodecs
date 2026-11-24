@@ -914,6 +914,10 @@ describe("react-native-webcodecs + Mediabunny", () => {
     const local = copyLocal(result.path);
     const audio = streamOf(local, "audio");
     expect(audio.codec_name).toBe("aac");
+    // AAC-LC, as configured ("mp4a.40.2").
+    expect(
+      probe(local).streams.find((s) => s.codec_type === "audio")?.profile,
+    ).toBe("LC");
     expect(Math.abs(Number(audio.duration) - 2)).toBeLessThan(0.1);
     // The sine survives the round trip at its level (silence would be
     // below -90 dB).

@@ -218,6 +218,9 @@ private:
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_SAMPLE_RATE, _sampleRate);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_CHANNEL_COUNT, _channels);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_AAC_PROFILE, 2);  // LC
+    // The same, for encoders that read only "profile" (AACObjectLC). The
+    // literal: AMEDIAFORMAT_KEY_PROFILE is API 28, above our minimum (26).
+    AMediaFormat_setInt32(format, "profile", 2);
     double bitrate = _config.bitrate.value_or(0);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_BIT_RATE, bitrate > 0 ? static_cast<int32_t>(bitrate) : 128000);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, 64 * 1024);
