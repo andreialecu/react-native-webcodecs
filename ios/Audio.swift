@@ -189,6 +189,9 @@ final class HybridNativeAudioEncoder: HybridNativeAudioEncoderSpec {
       // later encode() calls, as WebCodecs allows encoding after a flush.
       if let converter = self.converter { AudioConverterReset(converter) }
       self.endOfStream = false
+      // Which starts at its own first timestamp, as Android's does.
+      self.start = nil
+      self.framesOut = 0
     }
   }
 
