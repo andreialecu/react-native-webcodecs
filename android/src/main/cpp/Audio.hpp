@@ -365,34 +365,21 @@ public:
                            std::function<void(const NativeDecodedAudio&)> output,
                            std::function<void(const std::string&)> error)
       : HybridObject(TAG), _output(std::move(output)), _error(std::move(error)) {
-    _sampleRate = static_cast<int32_t>(config.sampleRate);
-    _channels = static_cast<int32_t>(config.numberOfChannels);
-    std::string mime;
+    _sampleRate = _configSampleRate = static_cast<int32_t>(config.sampleRate);
+    _channels = _configChannels = static_cast<int32_t>(config.numberOfChannels);
     if (config.codec == "aac") {
-      mime = "audio/mp4a-latm";
+      _mime = "audio/mp4a-latm";
     } else if (config.codec == "mp3") {
-      mime = "audio/mpeg";
+      _mime = "audio/mpeg";
     } else {
       throw domError("NotSupportedError", "codec " + config.codec);
     }
-    AMediaFormat* format = AMediaFormat_new();
-    AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime.c_str());
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_SAMPLE_RATE, _sampleRate);
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_CHANNEL_COUNT, _channels);
-    if (config.codec == "aac") {
-      AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_IS_ADTS, 0);
-      if (config.description.has_value() && config.description.value()) {
-        auto& d = config.description.value();
-        AMediaFormat_setBuffer(format, "csd-0", d->data(), d->size());
-      }
+    // Copied: a new codec may be started on the worker thread (flush()).
+    if (_mime == "audio/mp4a-latm" && config.description.has_value() && config.description.value()) {
+      auto& d = config.description.value();
+      _csd.assign(d->data(), d->data() + d->size());
     }
-    try {
-      _codec.start(format, false, mime);
-    } catch (...) {
-      AMediaFormat_delete(format);
-      throw;
-    }
-    AMediaFormat_delete(format);
+    startCodec();
   }
 
   ~HybridNativeAudioDecoder() override {
@@ -418,6 +405,7 @@ public:
       }
       media_status_t status = _codec.feed(bytes.data(), bytes.size(), ts, 0, 0, 0, [this](int64_t t) { return drain(t); });
       if (status == AMEDIA_OK) {
+        _fedSinceFlush++;
         status = drain(0);
       }
       if (status != AMEDIA_OK) {
@@ -433,7 +421,8 @@ public:
       return promise;
     }
     _queue.post([this, promise] {
-      if (!_failed) {
+      DecoderFlush action = decoderFlushAction(_fedSinceFlush, _formatSeen);
+      if (!_failed && action != DecoderFlush::Skip) {
         _eos = false;
         media_status_t status = _codec.feed(nullptr, 0, 0, 0, 0, kBufferFlagEndOfStream, [this](int64_t t) { return drain(t); });
         for (int i = 0; status == AMEDIA_OK && !_eos && i < 2000; i++) {
@@ -441,9 +430,18 @@ public:
         }
         if (status != AMEDIA_OK) {
           fail(describeCodecStatus(status, "decoder", "decoder"));
-        } else {
+        } else if (action == DecoderFlush::Flush) {
           AMediaCodec_flush(_codec.get());
+        } else {
+          WC_LOG("audio decoder: no output format before flush, starting a new codec");
+          _codec.stop();
+          try {
+            startCodec();
+          } catch (const std::exception& e) {
+            fail(e.what());
+          }
         }
+        _fedSinceFlush = 0;
       }
       if (_failed) {
         promise->reject(std::make_exception_ptr(std::runtime_error(_failure)));
@@ -461,6 +459,31 @@ public:
   }
 
 private:
+  // A codec for the config, timed and sized from it again.
+  void startCodec() {
+    AMediaFormat* format = AMediaFormat_new();
+    AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, _mime.c_str());
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_SAMPLE_RATE, _configSampleRate);
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_CHANNEL_COUNT, _configChannels);
+    if (_mime == "audio/mp4a-latm") {
+      AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_IS_ADTS, 0);
+      if (!_csd.empty()) {
+        AMediaFormat_setBuffer(format, "csd-0", _csd.data(), _csd.size());
+      }
+    }
+    try {
+      _codec.start(format, false, _mime);
+    } catch (...) {
+      AMediaFormat_delete(format);
+      throw;
+    }
+    AMediaFormat_delete(format);
+    _sampleRate = _configSampleRate;
+    _channels = _configChannels;
+    _fedSinceFlush = 0;
+    _formatSeen = false;
+  }
+
   media_status_t drain(int64_t timeoutUs) {
     while (true) {
       AMediaCodecBufferInfo info{};
@@ -472,6 +495,7 @@ private:
         continue;
       }
       if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+        _formatSeen = true;
         AMediaFormat* format = AMediaCodec_getOutputFormat(_codec.get());
         int32_t value = 0;
         if (AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_SAMPLE_RATE, &value) && value > 0) {
@@ -489,6 +513,9 @@ private:
       timeoutUs = 0;
       size_t capacity = 0;
       uint8_t* data = AMediaCodec_getOutputBuffer(_codec.get(), index, &capacity);
+      if (data && info.size > 0) {
+        _formatSeen = true;
+      }
       if (data && info.size > 0 && !_closed) {
         // s16 interleaved → f32 interleaved.
         size_t samples = info.size / sizeof(int16_t);
@@ -525,11 +552,21 @@ private:
   std::atomic<bool> _closed{false};
   std::string _failure;
 
-  // Worker thread only.
+  // The config, for a new codec.
+  std::string _mime;
+  int32_t _configSampleRate = 44100;
+  int32_t _configChannels = 2;
+  std::vector<uint8_t> _csd;
+
+  // Worker thread only (and the constructor).
   AudioCodec _codec;
   int32_t _sampleRate = 44100;
   int32_t _channels = 2;
   bool _eos = false;
+  // Inputs fed since the codec started or was last flushed, and whether it
+  // has given an output format (or output) since it started.
+  int64_t _fedSinceFlush = 0;
+  bool _formatSeen = false;
 
   SerialQueue _queue{"wc-adec"};
 };

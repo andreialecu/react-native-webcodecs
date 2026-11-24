@@ -43,9 +43,18 @@ static void keepFrame() {
   CHECK(aacKeepFrame(1000, 48000, std::nullopt));
 }
 
+static void decoderFlush() {
+  CHECK(decoderFlushAction(0, false) == DecoderFlush::Skip);
+  CHECK(decoderFlushAction(0, true) == DecoderFlush::Skip);
+  CHECK(decoderFlushAction(1, true) == DecoderFlush::Flush);
+  CHECK(decoderFlushAction(376, true) == DecoderFlush::Flush);
+  CHECK(decoderFlushAction(1, false) == DecoderFlush::Recreate);
+}
+
 int main() {
   encoderDelay();
   keepFrame();
+  decoderFlush();
   if (failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", failures);
     return EXIT_FAILURE;

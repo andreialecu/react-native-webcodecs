@@ -33,4 +33,26 @@ inline bool aacKeepFrame(int64_t framesOut, int64_t framesIn, std::optional<int6
   return !delay.has_value() || framesOut * 1024 < framesIn + *delay;
 }
 
+// What a decoder's flush() does with its codec.
+enum class DecoderFlush {
+  // Nothing fed since the last flush: nothing to drain. No end of stream is
+  // queued (as a first input it can lose the AAC config on API 29's
+  // c2.android.aac.decoder) and the codec is left as it is.
+  Skip,
+  // An end of stream, drained, then AMediaCodec_flush.
+  Flush,
+  // An end of stream, drained, then a new codec: flushed before its first
+  // output format, a codec forgets its config (csd) (b/141097367, API 29's
+  // c2.android.aac.decoder; Media3 releases the codec then too). Done for
+  // every decoder, so no name or API level is checked.
+  Recreate,
+};
+
+inline DecoderFlush decoderFlushAction(int64_t fedSinceFlush, bool formatSeen) {
+  if (fedSinceFlush == 0) {
+    return DecoderFlush::Skip;
+  }
+  return formatSeen ? DecoderFlush::Flush : DecoderFlush::Recreate;
+}
+
 } // namespace margelo::nitro::webcodecs

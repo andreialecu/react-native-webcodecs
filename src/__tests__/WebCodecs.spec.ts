@@ -1297,6 +1297,118 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(after).toEqual([]);
   }, 60000);
 
+  // AudioDecoder.flush() with nothing queued (first thing after configure,
+  // and right after another flush) settles at once and outputs nothing; the
+  // decoder then decodes the whole sound, twice over, with flushes between.
+  // (On Android an end of stream queued as the first input, or a codec
+  // flushed before any output format, can lose the AAC config: b/141097367.)
+  it("flushes an AudioDecoder with nothing queued, then decodes after flushes", async () => {
+    if (!supported()) {
+      return;
+    }
+    const sound = await pushAsset("sine-8s.m4a");
+    const result = await runOnDevice<any>(
+      ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+        const input = new mb.Input({
+          source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+          formats: mb.ALL_FORMATS,
+        });
+        return input.getPrimaryAudioTrack().then((track: any) =>
+          track.getDecoderConfig().then((config: any) => {
+            const errors: string[] = [];
+            let frames = 0;
+            let sum = 0;
+            let count = 0;
+            const decoder = new wc.AudioDecoder({
+              output: (data: any) => {
+                frames += data.numberOfFrames;
+                const samples = new Float32Array(
+                  data.numberOfFrames * data.numberOfChannels,
+                );
+                data.copyTo(samples, { planeIndex: 0, format: "f32" });
+                for (let i = 0; i < samples.length; i++) {
+                  sum += samples[i] * samples[i];
+                }
+                count += samples.length;
+                data.close();
+              },
+              error: (e: any) => errors.push(String(e)),
+            });
+            decoder.configure(config);
+            const timedFlush = () => {
+              const before = frames;
+              const t0 = Date.now();
+              return decoder
+                .flush()
+                .then(() => ({ ms: Date.now() - t0, frames: frames - before }));
+            };
+            const pass = () => {
+              const before = frames;
+              let packetCount = 0;
+              const packets = new mb.EncodedPacketSink(track).packets();
+              const step = (): Promise<void> =>
+                packets.next().then((r: any) => {
+                  if (r.done) {
+                    return undefined;
+                  }
+                  packetCount++;
+                  decoder.decode(r.value.toEncodedAudioChunk());
+                  return step();
+                });
+              sum = 0;
+              count = 0;
+              return step()
+                .then(() => decoder.flush())
+                .then(() => ({
+                  packets: packetCount,
+                  frames: frames - before,
+                  rms: Math.sqrt(sum / Math.max(1, count)),
+                }));
+            };
+            const out: any = { errors };
+            return timedFlush()
+              .then((first) => {
+                out.first = first;
+                return pass();
+              })
+              .then((one) => {
+                out.one = one;
+                return timedFlush();
+              })
+              .then((again) => {
+                out.again = again;
+                return pass();
+              })
+              .then((two) => {
+                out.two = two;
+                decoder.close();
+                input.dispose();
+                return out;
+              });
+          }),
+        );
+      },
+      { file: sound },
+      120000,
+    );
+    expect(result.errors).toEqual([]);
+    expect(result.first.frames).toBe(0);
+    expect(result.first.ms).toBeLessThan(1000);
+    expect(result.again.frames).toBe(0);
+    expect(result.again.ms).toBeLessThan(1000);
+    for (const run of [result.one, result.two]) {
+      // One AAC frame per packet, give or take the decoder's priming and
+      // tail (out of scope here).
+      expect(run.frames).toBeGreaterThan((run.packets - 4) * 1024);
+      expect(run.frames).toBeLessThanOrEqual((run.packets + 1) * 1024);
+      // The sine, not silence.
+      expect(run.rms).toBeGreaterThan(0.01);
+    }
+    expect(Math.abs(result.two.frames - result.one.frames)).toBeLessThanOrEqual(
+      2048,
+    );
+  }, 180000);
+
   it("flushes a VideoEncoder given two frames with one timestamp", async () => {
     if (!supported()) {
       return;
