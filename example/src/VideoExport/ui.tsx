@@ -25,6 +25,9 @@ const icons = {
   redo: "M20 12 A8 8 0 1 1 17.66 6.34 M20 4 L20 9 L15 9",
   // Two arrows pointing in: make smaller.
   compress: "M4 4 L10 10 M10 5 L10 10 L5 10 M20 20 L14 14 M14 19 L14 14 L19 14",
+  // A four-pointed sparkle.
+  sparkle:
+    "M12 3 L13.8 10.2 L21 12 L13.8 13.8 L12 21 L10.2 13.8 L3 12 L10.2 10.2 Z",
   // A film frame with a plus.
   video:
     "M4 6 L15 6 L15 18 L4 18 Z M15 10 L20 7 L20 17 L15 14 M9.5 9.5 L9.5 14.5 M7 12 L12 12",
@@ -124,37 +127,56 @@ export const PillButton = ({
   );
 };
 
+// `accent` fills the selected option with the accent color, for a switch
+// that has to stand out (the web page's choice of demo).
 export const Segmented = <T extends string>({
   options,
   value,
   onChange,
   disabled,
   style,
+  accent,
 }: {
-  options: { value: T; label: string }[];
+  options: { value: T; label: string; icon?: keyof typeof icons }[];
   value: T;
   onChange: (value: T) => void;
   disabled?: boolean;
   style?: ViewStyle;
+  accent?: boolean;
 }) => (
-  <View style={[styles.segmented, disabled && { opacity: 0.5 }, style]}>
+  <View
+    style={[
+      styles.segmented,
+      accent && styles.segmentedAccent,
+      disabled && { opacity: 0.5 },
+      style,
+    ]}
+  >
     {options.map((option) => {
       const selected = option.value === value;
+      let color = selected ? colors.text : colors.textDim;
+      if (accent) {
+        color = selected ? colors.onAccent : colors.text;
+      }
       return (
         <Pressable
           key={option.value}
           disabled={disabled}
           onPress={() => onChange(option.value)}
-          style={[styles.segment, selected && styles.segmentSelected]}
+          // react-native-web adds `hovered` to the state.
+          style={(state) => [
+            styles.segment,
+            accent && styles.segmentTall,
+            selected && styles.segmentSelected,
+            selected && accent && styles.segmentSelectedAccent,
+            !selected &&
+              accent &&
+              (state as { hovered?: boolean }).hovered &&
+              styles.segmentHovered,
+          ]}
         >
-          <Text
-            style={[
-              styles.segmentLabel,
-              { color: selected ? colors.text : colors.textDim },
-            ]}
-          >
-            {option.label}
-          </Text>
+          {option.icon && <Icon name={option.icon} color={color} size={18} />}
+          <Text style={[styles.segmentLabel, { color }]}>{option.label}</Text>
         </Pressable>
       );
     })}
@@ -203,14 +225,31 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: colors.border,
   },
+  segmentedAccent: {
+    borderRadius: 26,
+    borderWidth: 1,
+    borderColor: "rgba(60, 227, 246, 0.35)",
+  },
   segment: {
     flex: 1,
     height: 36,
     borderRadius: 18,
+    flexDirection: "row",
+    gap: 8,
     alignItems: "center",
     justifyContent: "center",
   },
+  segmentTall: {
+    height: 44,
+    borderRadius: 22,
+  },
   segmentSelected: {
+    backgroundColor: colors.surfaceRaised,
+  },
+  segmentSelectedAccent: {
+    backgroundColor: colors.accent,
+  },
+  segmentHovered: {
     backgroundColor: colors.surfaceRaised,
   },
   segmentLabel: {
