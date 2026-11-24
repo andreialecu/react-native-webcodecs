@@ -207,7 +207,15 @@ public:
         start();
         started->set_value("");
       } catch (const std::exception& e) {
-        started->set_value(e.what());
+        std::string message = e.what();
+        // The destructor will not run: let go of the codec and the EGL
+        // context here, on the thread that made them.
+        try {
+          stop();
+          _blitter.destroy();
+        } catch (...) {
+        }
+        started->set_value(message);
       }
     });
     std::string message = result.get();
@@ -256,7 +264,14 @@ public:
         if (_ended) {
           // After flush() (end of stream), a new codec for what comes next.
           stop();
-          start();
+          try {
+            start();
+          } catch (...) {
+            if (fence >= 0) {
+              ::close(fence);
+            }
+            throw;
+          }
         }
         if (keyFrame && _framesIn > 0) {
           AMediaFormat* params = AMediaFormat_new();
@@ -346,13 +361,10 @@ public:
         start();
         restarted->set_value("");
       } catch (const std::exception& e) {
-        // No codec now (an encoder without Main 10 or P010): later frames
-        // are dropped, and the caller gets the error.
-        {
-          std::lock_guard<std::mutex> lock(_mutex);
-          _failure = errorMessage("NotSupportedError", "encoder-failed", e.what());
-          _failed = true;
-        }
+        // No codec now (an encoder without Main 10 or P010): the encoder
+        // has failed, and says so through the error callback too, so that
+        // JS closes it rather than queue frames that are dropped.
+        fail(errorMessage("NotSupportedError", "encoder-failed", e.what()));
         restarted->set_value(e.what());
       }
     });
@@ -494,10 +506,16 @@ private:
         throw std::runtime_error("AMediaCodec_createInputSurface failed (" + std::to_string(status) + ")");
       }
       _nativeWindow = window;
-      _window = _blitter.createWindowSurface(window);
+      try {
+        _window = _blitter.createWindowSurface(window);
+      } catch (...) {
+        stopQuietly();
+        throw;
+      }
     }
     status = AMediaCodec_start(_codec);
     if (status != AMEDIA_OK) {
+      stopQuietly();
       throw std::runtime_error("AMediaCodec_start failed (" + std::to_string(status) + ")");
     }
     if (_aspects.hdr()) {
@@ -527,6 +545,7 @@ private:
       WC_LOG("video encoder: P010 input, stride %zu, slice height %zu", _stride, _sliceHeight);
     }
     _framesIn = 0;
+    _framesOut = 0;
     _ended = false;
     {
       std::lock_guard<std::mutex> lock(_mutex);
@@ -557,6 +576,14 @@ private:
     if (_nativeWindow) {
       ANativeWindow_release(_nativeWindow);
       _nativeWindow = nullptr;
+    }
+  }
+
+  // stop() on a failure path, where the first error is the one to report.
+  void stopQuietly() {
+    try {
+      stop();
+    } catch (...) {
     }
   }
 
@@ -640,6 +667,17 @@ private:
       }
       AMediaCodec_releaseOutputBuffer(codec, index, false);
       if (info.flags & kBufferFlagEndOfStream) {
+        // Frames the codec took and never output (MediaCodec drops a frame
+        // whose timestamp does not move forward): an empty chunk each, as
+        // VideoToolbox reports a dropped frame, so JS stops counting them.
+        // (flush() waits on the GL thread meanwhile: _framesIn is still.)
+        for (int64_t n = _framesIn - _framesOut; n > 0 && !_failed; n--) {
+          _output(NativeEncodedChunk(ArrayBuffer::allocate(0), 0, 0, false, std::nullopt));
+        }
+        {
+          std::lock_guard<std::mutex> lock(_mutex);
+          _durations.clear();
+        }
         {
           std::lock_guard<std::mutex> lock(_mutex);
           _eos = true;
@@ -740,6 +778,7 @@ private:
       return;
     }
     std::vector<uint8_t> chunk(data, data + size);
+    _framesOut++;
     _output(NativeEncodedChunk(ArrayBuffer::move(std::move(chunk)), static_cast<double>(ptsUs), duration, key, std::nullopt));
   }
 
@@ -774,6 +813,7 @@ private:
     if (_failed) {
       return;
     }
+    _framesOut++;
     _output(NativeEncodedChunk(ArrayBuffer::move(std::move(avcc)), static_cast<double>(ptsUs), duration, key, description));
   }
 
@@ -818,7 +858,10 @@ private:
   std::optional<std::string> _encoderName;
   size_t _stride = 0;
   size_t _sliceHeight = 0;
-  int64_t _framesIn = 0;
+  // Frames drawn into the current codec (GL thread), and output by it
+  // (drain thread).
+  std::atomic<int64_t> _framesIn{0};
+  std::atomic<int64_t> _framesOut{0};
   bool _ended = false;
   std::atomic<bool> _hardware{false};
   std::thread _drain;
