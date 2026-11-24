@@ -1748,11 +1748,12 @@ describe("react-native-webcodecs + Mediabunny", () => {
     }
   }, 400000);
 
-  // JS holds every picture the decoder's ImageReader has for longer than
-  // the decoder's 5 s wait for a picture: the decoder must wait for JS
-  // rather than drop or lose any (a guard: our drain renders one picture
-  // at a time, so the surface has nothing to drop).
-  it("loses no frame while JS holds every decoded picture for 6 s", async () => {
+  // JS holds every picture the decoder's ImageReader has (Android: 16) for
+  // longer than the decoder's 5 s waits for a picture or an input buffer:
+  // the decoder must wait for JS rather than drop, lose or fail any (our
+  // drain renders one picture at a time, so the surface has nothing to
+  // drop). iOS has no such limit and does not wait.
+  it("loses no frame while JS holds every decoded picture for 12 s", async () => {
     if (!supported() || !probes()) {
       return;
     }
@@ -1843,7 +1844,7 @@ describe("react-native-webcodecs + Mediabunny", () => {
       frames: result.frames,
       unordered: result.unordered,
       lost,
-      waited: result.ms > 12000,
+      waited: android ? result.ms > 12000 : true,
     }).toEqual({
       errors: [],
       frames: 90,
