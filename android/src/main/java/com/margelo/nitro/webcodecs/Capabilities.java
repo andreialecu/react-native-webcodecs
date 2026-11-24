@@ -3,10 +3,12 @@ package com.margelo.nitro.webcodecs;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
 import android.os.Build;
-import android.util.Range;
 
 import androidx.annotation.Keep;
 import androidx.annotation.Nullable;
+
+import java.util.ArrayList;
+import java.util.List;
 
 // What the device's codecs can do, from MediaCodecList: the NDK has no
 // capability queries before API 36. Called from C++ (VideoEncoder.hpp), for
@@ -27,6 +29,12 @@ public final class Capabilities {
   @Nullable
   public static String findVideoEncoder(
       String mime, int width, int height, double frameRate, int bitrate, int profile, int colorFormat) {
+    return EncoderRules.choose(videoEncoders(mime), width, height, frameRate, bitrate, profile, colorFormat);
+  }
+
+  // The encoders for `mime`, in the platform's order, aliases left out.
+  private static List<EncoderRules.Encoder> videoEncoders(String mime) {
+    List<EncoderRules.Encoder> encoders = new ArrayList<>();
     MediaCodecInfo[] infos = new MediaCodecList(MediaCodecList.REGULAR_CODECS).getCodecInfos();
     for (MediaCodecInfo info : infos) {
       if (!info.isEncoder()) {
@@ -44,11 +52,64 @@ public final class Capabilities {
       } catch (IllegalArgumentException e) {
         continue;
       }
-      if (fits(caps, width, height, frameRate, bitrate, profile, colorFormat)) {
-        return info.getName();
+      if (caps.getVideoCapabilities() == null) {
+        continue;
       }
+      encoders.add(new VideoEncoder(info, caps));
     }
-    return null;
+    return encoders;
+  }
+
+  // MediaCodecInfo's capabilities, as EncoderRules reads them.
+  private static final class VideoEncoder implements EncoderRules.Encoder {
+    private final MediaCodecInfo info;
+    private final MediaCodecInfo.CodecCapabilities caps;
+    private final MediaCodecInfo.VideoCapabilities video;
+
+    VideoEncoder(MediaCodecInfo info, MediaCodecInfo.CodecCapabilities caps) {
+      this.info = info;
+      this.caps = caps;
+      this.video = caps.getVideoCapabilities();
+    }
+
+    @Override
+    public String name() {
+      return info.getName();
+    }
+
+    @Override
+    public boolean isSizeSupported(int width, int height) {
+      return video.isSizeSupported(width, height);
+    }
+
+    @Override
+    public boolean areSizeAndRateSupported(int width, int height, double frameRate) {
+      return video.areSizeAndRateSupported(width, height, frameRate);
+    }
+
+    @Override
+    public int bitrateLower() {
+      return video.getBitrateRange().getLower();
+    }
+
+    @Override
+    public int bitrateUpper() {
+      return video.getBitrateRange().getUpper();
+    }
+
+    @Override
+    public int[] profiles() {
+      int[] profiles = new int[caps.profileLevels.length];
+      for (int i = 0; i < profiles.length; i++) {
+        profiles[i] = caps.profileLevels[i].profile;
+      }
+      return profiles;
+    }
+
+    @Override
+    public int[] colorFormats() {
+      return caps.colorFormats;
+    }
   }
 
   /**
@@ -107,50 +168,6 @@ public final class Capabilities {
   private static boolean supportsType(MediaCodecInfo info, String mime) {
     for (String type : info.getSupportedTypes()) {
       if (type.equalsIgnoreCase(mime)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static boolean fits(
-      MediaCodecInfo.CodecCapabilities caps,
-      int width,
-      int height,
-      double frameRate,
-      int bitrate,
-      int profile,
-      int colorFormat) {
-    MediaCodecInfo.VideoCapabilities video = caps.getVideoCapabilities();
-    if (video == null) {
-      return false;
-    }
-    boolean size = frameRate > 0
-        ? video.areSizeAndRateSupported(width, height, frameRate)
-        : video.isSizeSupported(width, height);
-    if (!size) {
-      return false;
-    }
-    if (bitrate > 0) {
-      Range<Integer> range = video.getBitrateRange();
-      if (!range.contains(bitrate)) {
-        return false;
-      }
-    }
-    if (profile > 0) {
-      boolean found = false;
-      for (MediaCodecInfo.CodecProfileLevel level : caps.profileLevels) {
-        if (level.profile == profile) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        return false;
-      }
-    }
-    for (int format : caps.colorFormats) {
-      if (format == colorFormat) {
         return true;
       }
     }
