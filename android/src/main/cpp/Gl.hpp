@@ -101,12 +101,14 @@ public:
     eglDestroySyncKHR(_display, sync);
   }
 
-  // Draws `source` over the whole of `target` (current: window surface).
-  void drawToWindow(EGLSurface target, AHardwareBuffer* source, int width, int height, int64_t presentationNs) {
+  // Draws the top-left `visibleWidth` x `visibleHeight` of `source` (its
+  // crop; 0: all of it) over the whole of `target` (current: window surface).
+  void drawToWindow(EGLSurface target, AHardwareBuffer* source, uint32_t visibleWidth, uint32_t visibleHeight, int width, int height,
+                    int64_t presentationNs) {
     makeCurrent(target);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     // Window: GL's first row is the bottom of the picture.
-    draw(source, width, height, true);
+    draw(source, visibleWidth, visibleHeight, width, height, true);
     eglPresentationTimeANDROID(_display, target, presentationNs);
     // Done reading `source` before it goes back to the pool.
     glFinish();
@@ -133,6 +135,24 @@ public:
   }
 
 private:
+  struct CropUv {
+    float scale;
+    float max;
+  };
+
+  // The texture coordinates of the first `visible` of `size` texels. A
+  // cropped edge stops one texel short of the crop, as SurfaceTexture's
+  // transform does, so filtering (and 4:2:0 chroma, at half the size)
+  // reads none of the padding.
+  static CropUv cropUv(uint32_t visible, uint32_t size) {
+    if (visible == 0 || size == 0 || visible >= size) {
+      return {1.0f, 1.0f};
+    }
+    float scale = static_cast<float>(visible) / static_cast<float>(size);
+    float max = static_cast<float>(visible > 1 ? visible - 1 : visible) / static_cast<float>(size);
+    return {scale, max};
+  }
+
   EGLImageKHR createImage(AHardwareBuffer* buffer) {
     EGLClientBuffer client = eglGetNativeClientBufferANDROID(buffer);
     const EGLint attributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
@@ -143,7 +163,11 @@ private:
     return image;
   }
 
-  void draw(AHardwareBuffer* source, int width, int height, bool flipY) {
+  void draw(AHardwareBuffer* source, uint32_t visibleWidth, uint32_t visibleHeight, int width, int height, bool flipY) {
+    AHardwareBuffer_Desc desc{};
+    AHardwareBuffer_describe(source, &desc);
+    CropUv x = cropUv(visibleWidth, desc.width);
+    CropUv y = cropUv(visibleHeight, desc.height);
     EGLImageKHR image = createImage(source);
     GLuint texture = 0;
     glGenTextures(1, &texture);
@@ -161,6 +185,8 @@ private:
     glUseProgram(_program);
     glUniform1i(_samplerLocation, 0);
     glUniform1f(_flipLocation, flipY ? 1.0f : 0.0f);
+    glUniform2f(_scaleLocation, x.scale, y.scale);
+    glUniform2f(_maxLocation, x.max, y.max);
     glBindVertexArray(_vertexArray);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
@@ -189,21 +215,25 @@ private:
     const char* vertex = R"(#version 300 es
 in vec2 aPosition;
 uniform float uFlip;
+// The visible part of the buffer (its crop, at the top left).
+uniform vec2 uScale;
 out vec2 vUv;
 void main() {
   // Texture row 0 is the top of the picture.
   float v = uFlip > 0.5 ? (1.0 - aPosition.y) * 0.5 : (1.0 + aPosition.y) * 0.5;
-  vUv = vec2((aPosition.x + 1.0) * 0.5, v);
+  vUv = vec2((aPosition.x + 1.0) * 0.5, v) * uScale;
   gl_Position = vec4(aPosition, 0.0, 1.0);
 })";
     const char* fragment = R"(#version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
 precision mediump float;
 uniform samplerExternalOES uTexture;
+// Where sampling stops: short of the padding past a crop.
+uniform vec2 uMax;
 in vec2 vUv;
 out vec4 color;
 void main() {
-  color = texture(uTexture, vUv);
+  color = texture(uTexture, min(vUv, uMax));
 })";
     GLuint vs = compile(GL_VERTEX_SHADER, vertex);
     GLuint fs = compile(GL_FRAGMENT_SHADER, fragment);
@@ -221,6 +251,8 @@ void main() {
     }
     _samplerLocation = glGetUniformLocation(_program, "uTexture");
     _flipLocation = glGetUniformLocation(_program, "uFlip");
+    _scaleLocation = glGetUniformLocation(_program, "uScale");
+    _maxLocation = glGetUniformLocation(_program, "uMax");
 
     const GLfloat quad[] = {-1, -1, 1, -1, -1, 1, 1, 1};
     glGenVertexArrays(1, &_vertexArray);
@@ -242,6 +274,8 @@ void main() {
   GLuint _vertexBuffer = 0;
   GLint _samplerLocation = -1;
   GLint _flipLocation = -1;
+  GLint _scaleLocation = -1;
+  GLint _maxLocation = -1;
 };
 
 } // namespace margelo::nitro::webcodecs

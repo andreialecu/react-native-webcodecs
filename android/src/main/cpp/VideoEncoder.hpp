@@ -248,12 +248,14 @@ public:
     // Taken now: JS may close the frame right after encode().
     auto ref = native->ref();
     int fence = native->dupFence();
+    uint32_t visibleWidth = native->visibleWidth();
+    uint32_t visibleHeight = native->visibleHeight();
     int64_t ts = static_cast<int64_t>(timestamp);
     {
       std::lock_guard<std::mutex> lock(_mutex);
       _durations[ts] = duration;
     }
-    _gl.post([this, ref, fence, ts, keyFrame] {
+    _gl.post([this, ref, fence, visibleWidth, visibleHeight, ts, keyFrame] {
       if (_failed) {
         if (fence >= 0) {
           ::close(fence);
@@ -284,8 +286,8 @@ public:
           queueP010(ref->buffer, ts);
         } else {
           _blitter.waitFence(fence);
-          _blitter.drawToWindow(_window, ref->buffer, static_cast<int>(_config.width), static_cast<int>(_config.height),
-                                ts * 1000);
+          _blitter.drawToWindow(_window, ref->buffer, visibleWidth, visibleHeight, static_cast<int>(_config.width),
+                                static_cast<int>(_config.height), ts * 1000);
         }
         _framesIn++;
       } catch (const std::exception& e) {

@@ -387,13 +387,21 @@ private:
       return;
     }
     AImage_getTimestamp(image, &timestampNs);
+    // The picture's size: the buffer can be larger (c2.android's decoders
+    // pad the width to 128), the image is its crop.
+    int32_t visibleWidth = 0;
+    int32_t visibleHeight = 0;
+    AImage_getWidth(image, &visibleWidth);
+    AImage_getHeight(image, &visibleHeight);
     int64_t pts = (timestampNs + 500) / 1000;
     double duration = takeDuration(pts);
     // The image goes back to the reader (kept alive meanwhile) when the last
     // reference dies.
     auto owner = _readerOwner;
     auto ref = std::make_shared<HardwareBufferRef>(source, [owner, image](AHardwareBuffer*) { AImage_delete(image); });
-    _output(NativeDecodedFrame(std::make_shared<HybridNativeSurface>(ref), static_cast<double>(pts), duration));
+    auto surface = std::make_shared<HybridNativeSurface>(ref, -1, static_cast<uint32_t>(std::max(visibleWidth, 0)),
+                                                         static_cast<uint32_t>(std::max(visibleHeight, 0)));
+    _output(NativeDecodedFrame(surface, static_cast<double>(pts), duration));
     countDelivered();
   }
 

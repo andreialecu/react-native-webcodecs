@@ -100,7 +100,12 @@ numbers.
 - **Android**: an H.264 `MediaCodec` decoder writing into an `AImageReader`. Each output
   image's `AHardwareBuffer` becomes the frame's surface, with no copy, and
   stays with the decoder until JavaScript closes the frame. The reader has
-  16 images, so a decoder stalls if JavaScript keeps all of them.
+  16 images, so a decoder stalls if JavaScript keeps all of them. The
+  frame's size is the image's crop, which can be smaller than the buffer
+  (padding on the right or bottom); the encoder samples only that part.
+  `hardwareAcceleration` picks the decoder: `"prefer-software"` a
+  software one, `"prefer-hardware"` another, falling back to the rest when
+  the preferred ones fail to start.
 
 A config needs a `description`. The output frames carry the config's
 `colorSpace` (BT.709 for what it leaves out).

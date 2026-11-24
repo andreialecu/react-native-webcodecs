@@ -45,9 +45,14 @@ inline std::string formatName(uint32_t format) {
 
 class HybridNativeSurface : public HybridNativeSurfaceSpec {
 public:
-  explicit HybridNativeSurface(std::shared_ptr<HardwareBufferRef> ref, int fence = -1)
+  // `visibleWidth` x `visibleHeight`: the picture in the buffer's top left
+  // when the buffer is larger (a decoder's crop; 0: all of it).
+  explicit HybridNativeSurface(std::shared_ptr<HardwareBufferRef> ref, int fence = -1, uint32_t visibleWidth = 0,
+                               uint32_t visibleHeight = 0)
       : HybridObject(TAG), _ref(std::move(ref)), _fence(fence) {
     AHardwareBuffer_describe(_ref->buffer, &_desc);
+    _visibleWidth = visibleWidth > 0 && visibleWidth < _desc.width ? visibleWidth : _desc.width;
+    _visibleHeight = visibleHeight > 0 && visibleHeight < _desc.height ? visibleHeight : _desc.height;
   }
 
   ~HybridNativeSurface() override {
@@ -62,11 +67,12 @@ public:
   uint64_t getPixelBuffer() override {
     return getHandle();
   }
+  // The picture's size: the buffer may be larger (padding past the crop).
   double getWidth() override {
-    return _desc.width;
+    return _visibleWidth;
   }
   double getHeight() override {
-    return _desc.height;
+    return _visibleHeight;
   }
   std::string getFormat() override {
     return formatName(_desc.format);
@@ -83,7 +89,7 @@ public:
   }
 
   std::shared_ptr<HybridNativeSurfaceSpec> clone() override {
-    return std::make_shared<HybridNativeSurface>(ref(), dupFence());
+    return std::make_shared<HybridNativeSurface>(ref(), dupFence(), _visibleWidth, _visibleHeight);
   }
 
   void release() override {
@@ -111,6 +117,13 @@ public:
     return ref()->buffer;
   }
 
+  uint32_t visibleWidth() const {
+    return _visibleWidth;
+  }
+  uint32_t visibleHeight() const {
+    return _visibleHeight;
+  }
+
   // A copy of the fence for a consumer to wait on and close (-1: none).
   int dupFence() {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -128,6 +141,8 @@ private:
   std::mutex _mutex;
   std::shared_ptr<HardwareBufferRef> _ref;
   AHardwareBuffer_Desc _desc{};
+  uint32_t _visibleWidth = 0;
+  uint32_t _visibleHeight = 0;
   int _fence;
 };
 

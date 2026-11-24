@@ -1665,6 +1665,167 @@ describe("react-native-webcodecs + Mediabunny", () => {
     }
   }, 300000);
 
+  // A width that is not a multiple of 128 (360): Android's software decoder
+  // pads its pictures to 384, and only the crop says where the picture is.
+  // The frames must have the visible size, and an encoder given them must
+  // take that region only: the red stripe on the right edge stays there,
+  // and no padding comes in.
+  it("decodes a 360x640 video to frames without the decoder's padding", async () => {
+    if (!supported() || !probes()) {
+      return;
+    }
+    const clip = path.join(clipDirectory, "clip-360x640.mp4");
+    fs.mkdirSync(clipDirectory, { recursive: true });
+    if (!fs.existsSync(clip)) {
+      execFileSync("ffmpeg", [
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=blue:s=360x640:r=30:d=1",
+        "-vf",
+        "drawbox=x=344:y=0:w=16:h=640:color=red:t=fill,drawbox=x=0:y=624:w=360:h=16:color=yellow:t=fill",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "high",
+        clip,
+      ]);
+    }
+    const file = await pushFile(clip);
+    const decoded = await runOnDevice<Decoded & { path: string }>(
+      ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+        const input = new mb.Input({
+          source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+          formats: mb.ALL_FORMATS,
+        });
+        const target = new mb.BufferTarget();
+        const output = new mb.Output({
+          format: new mb.Mp4OutputFormat(),
+          target,
+        });
+        const source = new mb.EncodedVideoPacketSource("avc");
+        output.addVideoTrack(source, { frameRate: 30 });
+        const result: any = { frames: 0, errors: [], first: null, path: "" };
+        let written = Promise.resolve();
+        const encoder = new wc.VideoEncoder({
+          output: (chunk: any, meta: any) => {
+            const data = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(data);
+            const packet = new mb.EncodedPacket(
+              data,
+              chunk.type,
+              chunk.timestamp / 1e6,
+              (chunk.duration || 0) / 1e6,
+            );
+            written = written.then(() => source.add(packet, meta));
+          },
+          error: (e: any) => result.errors.push(`encoder: ${e}`),
+        });
+        encoder.configure({
+          codec: "avc1.42001f",
+          width: 360,
+          height: 640,
+          framerate: 30,
+        });
+        return output.start().then(() =>
+          input.getPrimaryVideoTrack().then((track: any) =>
+            track.getDecoderConfig().then((trackConfig: any) => {
+              const decoder = new wc.VideoDecoder({
+                output: (frame: any) => {
+                  if (!result.first) {
+                    const r = frame.visibleRect;
+                    result.first = {
+                      codedWidth: frame.codedWidth,
+                      codedHeight: frame.codedHeight,
+                      visibleRect: {
+                        x: r.x,
+                        y: r.y,
+                        width: r.width,
+                        height: r.height,
+                      },
+                      displayWidth: frame.displayWidth,
+                      displayHeight: frame.displayHeight,
+                      format: frame.format,
+                    };
+                  }
+                  encoder.encode(frame, { keyFrame: result.frames === 0 });
+                  result.frames++;
+                  frame.close();
+                },
+                error: (e: any) => result.errors.push(`decoder: ${e}`),
+              });
+              decoder.configure(
+                Object.assign({}, trackConfig, {
+                  hardwareAcceleration: "prefer-software",
+                }),
+              );
+              const packets = new mb.EncodedPacketSink(track).packets();
+              const step = (): Promise<void> =>
+                packets.next().then((r: any) => {
+                  if (r.done) {
+                    return undefined;
+                  }
+                  decoder.decode(r.value.toEncodedVideoChunk());
+                  return step();
+                });
+              return step()
+                .then(() => decoder.flush())
+                .then(() => encoder.flush())
+                .then(() => written)
+                .then(() => output.finalize())
+                .then(() => {
+                  decoder.close();
+                  encoder.close();
+                  input.dispose();
+                  result.path = wc.writeFile("e2e-crop-out.mp4", target.buffer);
+                  return result;
+                });
+            }),
+          ),
+        );
+      },
+      { file },
+      120000,
+    );
+    const local = copyLocal(decoded.path);
+    const px = {
+      redEdge: pixel(local, 0, 355, 320),
+      blue: pixel(local, 0, 300, 320),
+      yellowBottom: pixel(local, 0, 180, 633),
+    };
+    console.log(`crop: ${JSON.stringify({ ...decoded, px })}`);
+    const is = (p: number[], rgb: boolean[]) =>
+      p.every((v, i) => (rgb[i] ? v > 170 : v < 90));
+    expect({
+      frames: decoded.frames,
+      errors: decoded.errors,
+      visibleRect: decoded.first?.visibleRect,
+      codedWidth: decoded.first?.codedWidth,
+      codedHeight: decoded.first?.codedHeight,
+      displayWidth: decoded.first?.displayWidth,
+      displayHeight: decoded.first?.displayHeight,
+      redEdge: is(px.redEdge, [true, false, false]),
+      blue: is(px.blue, [false, false, true]),
+      yellowBottom: is(px.yellowBottom, [true, true, false]),
+    }).toEqual({
+      frames: 30,
+      errors: [],
+      visibleRect: { x: 0, y: 0, width: 360, height: 640 },
+      codedWidth: 360,
+      codedHeight: 640,
+      displayWidth: 360,
+      displayHeight: 640,
+      redEdge: true,
+      blue: true,
+      yellowBottom: true,
+    });
+  }, 300000);
+
   // The example app's screens, through its own code (example/src/Tests.tsx
   // hands it over): the Lottie share card exported as the Video Export
   // screens do, and videos compressed as the Compress screen does.

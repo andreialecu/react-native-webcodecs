@@ -159,7 +159,7 @@ frame.close();
 | Platform | Decoded frame |
 | :-- | :-- |
 | iOS | A BGRA `CVPixelBuffer` by default; NV12 with `outputFormat: "NV12"` in the decoder config. |
-| Android | The decoder's own YUV (NV12) `AHardwareBuffer`. |
+| Android | The decoder's own YUV (NV12) `AHardwareBuffer`. It can be wider or taller than the frame (software decoders pad the width to a multiple of 128): the picture is its top-left `codedWidth` x `codedHeight`, so sample only that. |
 
 The frame's `colorSpace` comes from the stream (Mediabunny passes the
 track's to `configure`). Android's buffers carry no color information of
