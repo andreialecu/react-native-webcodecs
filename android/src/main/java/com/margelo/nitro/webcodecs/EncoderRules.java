@@ -62,15 +62,13 @@ final class EncoderRules {
 
   /**
    * The bitrate to configure: the one asked for, or when none (0 or less)
-   * width * height * fps * 0.1; a hint, clamped into the encoder's range
-   * [lower, upper] when one was asked for.
+   * width * height * fps * 0.1 (fps 30 when none); a hint either way,
+   * clamped into the encoder's range [lower, upper].
    */
   static int bitrate(double requested, int width, int height, double frameRate, int lower, int upper) {
-    if (requested > 0) {
-      return (int) Math.max(lower, Math.min(upper, requested));
-    }
     double fps = frameRate(frameRate) > 0 ? frameRate(frameRate) : 30;
-    return (int) Math.min((double) width * height * fps * 0.1, Integer.MAX_VALUE);
+    double bitrate = requested > 0 ? requested : (double) width * height * fps * 0.1;
+    return (int) Math.max(lower, Math.min(upper, bitrate));
   }
 
   static boolean contains(int[] values, int value) {

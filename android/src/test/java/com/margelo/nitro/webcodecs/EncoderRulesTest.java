@@ -128,4 +128,16 @@ public class EncoderRulesTest {
     assertEquals(64_000, EncoderRules.bitrate(1000, 1280, 720, 30, 64_000, 12_000_000));
     assertEquals(Integer.MAX_VALUE, EncoderRules.bitrate(5e12, 1280, 720, 30, 1, Integer.MAX_VALUE));
   }
+
+  // With no bitrate, width * height * fps * 0.1, in the encoder's range:
+  // vision-camera's 100 Mbps default failed on an 80 Mbps encoder (#2208).
+  @Test
+  public void theDefaultBitrateIsClampedIntoTheRange() {
+    assertEquals(2_764_800, EncoderRules.bitrate(0, 1280, 720, 30, 1, 80_000_000));
+    assertEquals(80_000_000, EncoderRules.bitrate(0, 3840, 2160, 120, 1, 80_000_000));
+    assertEquals(12_000_000, EncoderRules.bitrate(0, 1080, 1920, 120, 1, 12_000_000));
+    // No frame rate (or below 1): 30.
+    assertEquals(2_764_800, EncoderRules.bitrate(0, 1280, 720, 0.5, 1, 80_000_000));
+    assertEquals(500_000, EncoderRules.bitrate(0, 64, 64, 30, 500_000, 80_000_000));
+  }
 }
