@@ -107,6 +107,7 @@ public:
 
   std::string writeFile(const std::string& path, const std::shared_ptr<ArrayBuffer>& data) override {
     std::string resolved = resolveFilePath(path);
+    makeParentDirectories(resolved);
     int fd = ::open(resolved.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) {
       throw domError("NotFoundError", "cannot write " + resolved + " (" + std::to_string(errno) + ")");

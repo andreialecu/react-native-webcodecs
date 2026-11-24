@@ -11,7 +11,9 @@
 
 namespace margelo::nitro::webcodecs {
 
-// The app's cache directory, from its package name.
+// The app's cache directory, from its package name and Android user:
+// /data/data is user 0's only, a work profile or secondary user has its
+// files under /data/user/<user>.
 inline std::string cacheDirectory() {
   static std::string directory = [] {
     std::ifstream cmdline("/proc/self/cmdline");
@@ -21,16 +23,49 @@ inline std::string cacheDirectory() {
     if (colon != std::string::npos) {
       name = name.substr(0, colon);
     }
-    return "/data/data/" + name + "/cache";
+    // AID_USER_OFFSET: each Android user has 100000 uids.
+    unsigned user = static_cast<unsigned>(::getuid()) / 100000;
+    return "/data/user/" + std::to_string(user) + "/" + name + "/cache";
   }();
   return directory;
+}
+
+// "%20" and the like in a file:// URL.
+inline std::string percentDecode(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  auto hex = [](char c) -> int {
+    if (c >= '0' && c <= '9') {
+      return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+      return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+      return c - 'A' + 10;
+    }
+    return -1;
+  };
+  for (size_t i = 0; i < in.size(); i++) {
+    if (in[i] == '%' && i + 2 < in.size()) {
+      int high = hex(in[i + 1]);
+      int low = hex(in[i + 2]);
+      if (high >= 0 && low >= 0) {
+        out.push_back(static_cast<char>(high * 16 + low));
+        i += 2;
+        continue;
+      }
+    }
+    out.push_back(in[i]);
+  }
+  return out;
 }
 
 // Relative paths are in the cache directory; "file://" URLs are paths.
 inline std::string resolveFilePath(const std::string& path) {
   std::string p = path;
   if (p.rfind("file://", 0) == 0) {
-    p = p.substr(7);
+    p = percentDecode(p.substr(7));
   }
   if (!p.empty() && p[0] == '/') {
     return p;
@@ -38,9 +73,19 @@ inline std::string resolveFilePath(const std::string& path) {
   return cacheDirectory() + "/" + p;
 }
 
+// mkdir -p of the directory a file goes in.
+inline void makeParentDirectories(const std::string& file) {
+  for (size_t slash = file.find('/', 1); slash != std::string::npos; slash = file.find('/', slash + 1)) {
+    ::mkdir(file.substr(0, slash).c_str(), 0755);
+  }
+}
+
 class HybridNativeFile : public HybridNativeFileSpec {
 public:
   HybridNativeFile(std::string path, bool write) : HybridObject(TAG), _path(std::move(path)) {
+    if (write) {
+      makeParentDirectories(_path);
+    }
     _fd = ::open(_path.c_str(), write ? (O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC) : (O_RDONLY | O_CLOEXEC), 0644);
     if (_fd < 0) {
       if (errno == ENOENT) {
