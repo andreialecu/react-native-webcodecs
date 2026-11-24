@@ -34,7 +34,10 @@ android {
   compileSdkVersion safeExt("compileSdkVersion", 35)
 
   defaultConfig {
-    minSdkVersion safeExt("minSdkVersion", 26)
+    // AHardwareBuffer needs API 26. Never lower, even when the app's is: an
+    // app below 26 then gets a manifest merger error naming this library,
+    // instead of C++ errors.
+    minSdkVersion Math.max(safeExt("minSdkVersion", 26) as int, 26)
     targetSdkVersion safeExt("targetSdkVersion", 35)
     externalNativeBuild {
       cmake {
