@@ -1637,7 +1637,12 @@ describe("react-native-webcodecs + Mediabunny", () => {
       const codecs = android
         ? allocatedCodecs().filter((name) => /decoder/.test(name))
         : [];
-      return { frames: decoded.frames, errors: decoded.errors, codecs };
+      return {
+        frames: decoded.frames,
+        errors: decoded.errors,
+        format: decoded.first?.format,
+        codecs,
+      };
     };
     const software = await run("prefer-software");
     const hardware = await run("prefer-hardware");
@@ -1652,6 +1657,7 @@ describe("react-native-webcodecs + Mediabunny", () => {
       errors: [...software.errors, ...hardware.errors, ...plain.errors],
       softwareDecoders: software.codecs.every(isSoftware),
       hardwareDecoders: hardware.codecs.some(isSoftware),
+      formats: [software.format, hardware.format, plain.format],
     }).toEqual({
       software: 90,
       hardware: 90,
@@ -1659,6 +1665,8 @@ describe("react-native-webcodecs + Mediabunny", () => {
       errors: [],
       softwareDecoders: true,
       hardwareDecoders: false,
+      // The decoder's own picture on Android, whatever its layout.
+      formats: Array(3).fill(ios() ? "BGRA" : "NV12"),
     });
     if (android) {
       expect(software.codecs.length).toBeGreaterThan(0);
@@ -1809,6 +1817,7 @@ describe("react-native-webcodecs + Mediabunny", () => {
       codedHeight: decoded.first?.codedHeight,
       displayWidth: decoded.first?.displayWidth,
       displayHeight: decoded.first?.displayHeight,
+      format: decoded.first?.format,
       redEdge: is(px.redEdge, [true, false, false]),
       blue: is(px.blue, [false, false, true]),
       yellowBottom: is(px.yellowBottom, [true, true, false]),
@@ -1820,6 +1829,7 @@ describe("react-native-webcodecs + Mediabunny", () => {
       codedHeight: 640,
       displayWidth: 360,
       displayHeight: 640,
+      format: ios() ? "BGRA" : "NV12",
       redEdge: true,
       blue: true,
       yellowBottom: true,

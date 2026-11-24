@@ -47,9 +47,11 @@ class HybridNativeSurface : public HybridNativeSurfaceSpec {
 public:
   // `visibleWidth` x `visibleHeight`: the picture in the buffer's top left
   // when the buffer is larger (a decoder's crop; 0: all of it).
+  // `formatFallback`: the format to report when the buffer's has no name
+  // here (a decoder's YV12 or vendor-private 4:2:0 layout is its "NV12").
   explicit HybridNativeSurface(std::shared_ptr<HardwareBufferRef> ref, int fence = -1, uint32_t visibleWidth = 0,
-                               uint32_t visibleHeight = 0)
-      : HybridObject(TAG), _ref(std::move(ref)), _fence(fence) {
+                               uint32_t visibleHeight = 0, std::string formatFallback = "")
+      : HybridObject(TAG), _ref(std::move(ref)), _formatFallback(std::move(formatFallback)), _fence(fence) {
     AHardwareBuffer_describe(_ref->buffer, &_desc);
     _visibleWidth = visibleWidth > 0 && visibleWidth < _desc.width ? visibleWidth : _desc.width;
     _visibleHeight = visibleHeight > 0 && visibleHeight < _desc.height ? visibleHeight : _desc.height;
@@ -75,7 +77,8 @@ public:
     return _visibleHeight;
   }
   std::string getFormat() override {
-    return formatName(_desc.format);
+    std::string name = formatName(_desc.format);
+    return name == "unknown" && !_formatFallback.empty() ? _formatFallback : name;
   }
 
   // `handle` is a sync_fd the surface now owns (react-native-webgpu's
@@ -89,7 +92,7 @@ public:
   }
 
   std::shared_ptr<HybridNativeSurfaceSpec> clone() override {
-    return std::make_shared<HybridNativeSurface>(ref(), dupFence(), _visibleWidth, _visibleHeight);
+    return std::make_shared<HybridNativeSurface>(ref(), dupFence(), _visibleWidth, _visibleHeight, _formatFallback);
   }
 
   void release() override {
@@ -143,6 +146,7 @@ private:
   AHardwareBuffer_Desc _desc{};
   uint32_t _visibleWidth = 0;
   uint32_t _visibleHeight = 0;
+  std::string _formatFallback;
   int _fence;
 };
 

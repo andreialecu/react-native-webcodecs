@@ -399,8 +399,11 @@ private:
     // reference dies.
     auto owner = _readerOwner;
     auto ref = std::make_shared<HardwareBufferRef>(source, [owner, image](AHardwareBuffer*) { AImage_delete(image); });
+    // The format is the decoder's 4:2:0 layout: YCbCr_420_888 (NV12 here),
+    // YV12 (c2.android) or a vendor's private one, all "NV12" to JS. The
+    // picture is sampled through the buffer's own YCbCr conversion.
     auto surface = std::make_shared<HybridNativeSurface>(ref, -1, static_cast<uint32_t>(std::max(visibleWidth, 0)),
-                                                         static_cast<uint32_t>(std::max(visibleHeight, 0)));
+                                                         static_cast<uint32_t>(std::max(visibleHeight, 0)), "NV12");
     _output(NativeDecodedFrame(surface, static_cast<double>(pts), duration));
     countDelivered();
   }
