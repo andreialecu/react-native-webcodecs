@@ -73,6 +73,8 @@ struct EncoderFault {
   bool noEndOfStream = false;
   int stallOutputSeconds = 0;
   int slowStopMs = 0;
+  // The draw of this frame (1-based) fails on the GL thread.
+  int drawFailAt = 0;
 
   static EncoderFault read() {
     EncoderFault fault;
@@ -89,6 +91,8 @@ struct EncoderFault {
       fault.stallOutputSeconds = std::max(1, argument("venc-stall-output:"));
     } else if (text.rfind("venc-slow-stop:", 0) == 0) {
       fault.slowStopMs = std::max(0, argument("venc-slow-stop:"));
+    } else if (text.rfind("venc-draw-fail:", 0) == 0) {
+      fault.drawFailAt = std::max(1, argument("venc-draw-fail:"));
     }
     if (!text.empty()) {
       WC_LOG("video encoder: fault %s", value);
@@ -352,6 +356,12 @@ public:
         {
           std::lock_guard<std::mutex> lock(_mutex);
           pts = _timestamps.push(ts, duration);
+        }
+        if (_fault.drawFailAt > 0 && _framesIn + 1 == _fault.drawFailAt) {
+          if (fence >= 0) {
+            ::close(fence);
+          }
+          throw std::runtime_error("fault: the draw failed");
         }
         if (_aspects.hdr()) {
           waitFenceCpu(fence);
@@ -746,8 +756,11 @@ private:
       _framesSkipped = 0;
     }
     {
+      // Surface input only: that is where the GL thread can block (in
+      // eglSwapBuffers). HDR takes buffers, with bounded waits that end on
+      // _failed, and its codec is not stopped under a P010 copy.
       std::lock_guard<std::mutex> lock(_codecMutex);
-      _liveCodec = _codec;
+      _liveCodec = _aspects.hdr() ? nullptr : _codec;
       _aborted = false;
     }
     _drain = std::thread([this, codec = _codec] { drainLoop(codec); });
@@ -793,10 +806,12 @@ private:
     }
   }
 
-  // Stops the codec from any thread, once: its input surface is let go, so
-  // a draw blocked waiting for the codec to take a buffer (eglSwapBuffers in
-  // dequeueBuffer) returns, and the GL thread gets to what comes next. The
-  // GL thread's stop() still deletes it.
+  // Stops the codec from another thread than the GL thread, once: its input
+  // surface is let go, so a draw blocked waiting for the codec to take a
+  // buffer (eglSwapBuffers in dequeueBuffer) returns, and the GL thread gets
+  // to what comes next. The GL thread's stop() still deletes it. Under
+  // _codecMutex, which the drain thread holds while it reads an output
+  // buffer: stopping the codec takes its buffers back.
   void abortCodec() {
     std::lock_guard<std::mutex> lock(_codecMutex);
     if (!_liveCodec || _aborted) {
@@ -855,7 +870,7 @@ private:
         if (!waiting) {
           lastOutput = std::chrono::steady_clock::now();
         } else if (std::chrono::steady_clock::now() - lastOutput > std::chrono::seconds(_fault.stallOutputSeconds)) {
-          fail(errorMessage("EncodingError", "encoder-failed", "timed out waiting for the encoder"));
+          fail(errorMessage("EncodingError", "encoder-failed", "timed out waiting for the encoder"), true);
           return;
         }
         continue;
@@ -872,7 +887,7 @@ private:
         if (!waiting) {
           lastOutput = std::chrono::steady_clock::now();
         } else if (std::chrono::steady_clock::now() - lastOutput > kStallTimeout) {
-          fail(errorMessage("EncodingError", "encoder-failed", "timed out waiting for the encoder"));
+          fail(errorMessage("EncodingError", "encoder-failed", "timed out waiting for the encoder"), true);
           return;
         }
         continue;
@@ -902,7 +917,15 @@ private:
         continue;
       }
       if (isCodecError(index)) {
-        fail(describeCodecStatus(static_cast<media_status_t>(index), "encoder", "encoder"));
+        fail(describeCodecStatus(static_cast<media_status_t>(index), "encoder", "encoder"), true);
+        return;
+      }
+      // From the buffer to its release, the codec is not stopped from another
+      // thread (abortCodec), which would take the buffer back mid-copy. No
+      // fail() in here: abortCodec() takes this mutex.
+      std::unique_lock<std::mutex> codecLock(_codecMutex);
+      if (_aborted) {
+        // Stopped meanwhile: the index is no longer the codec's.
         return;
       }
       size_t capacity = 0;
@@ -921,6 +944,7 @@ private:
         }
       }
       AMediaCodec_releaseOutputBuffer(codec, index, false);
+      codecLock.unlock();
       if ((info.flags & kBufferFlagEndOfStream) && !_fault.noEndOfStream) {
         // Frames the codec took and never output (dropped): an empty chunk
         // each, as VideoToolbox reports a dropped frame, so JS stops
@@ -1084,7 +1108,11 @@ private:
     _cv.notify_all();
   }
 
-  void fail(const std::string& message) {
+  // stopCodec: from the drain thread (holding no output buffer), whose
+  // failure may leave the GL thread blocked drawing into the codec. Not from
+  // the GL thread, which is not blocked, while the drain thread may be
+  // copying from an output buffer.
+  void fail(const std::string& message, bool stopCodec = false) {
     bool expected = false;
     if (!_reported.compare_exchange_strong(expected, true)) {
       return;
@@ -1097,7 +1125,9 @@ private:
     _cv.notify_all();
     // A failed codec takes nothing more: stop it now, so that the GL thread
     // is not left blocked drawing into it.
-    abortCodec();
+    if (stopCodec) {
+      abortCodec();
+    }
     if (!_closed) {
       _error(message);
     }

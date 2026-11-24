@@ -2213,6 +2213,74 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(after.chunks).toEqual([0]);
   }, 120000);
 
+  it("does not stop a VideoEncoder codec from the GL thread when a draw fails (Android fault)", async () => {
+    if (client.OS !== "android") {
+      return;
+    }
+    // Debug builds only: the 10th draw fails on the GL thread while the
+    // drain thread is taking the codec's output. The GL thread is not
+    // blocked, so the codec must not be stopped under the drain thread
+    // (which may be copying from one of its buffers): only the GL thread's
+    // stop(), at close(), lets it go.
+    setFault("venc-draw-fail:10");
+    adb(["logcat", "-c"]);
+    let failed: any;
+    try {
+      failed = (await client.eval(({ webcodecs: wc }) => {
+        const errors: string[] = [];
+        let chunks = 0;
+        let reported: () => void = () => {};
+        const failure = new Promise<void>((resolve) => {
+          reported = resolve;
+        });
+        const encoder = new wc.VideoEncoder({
+          output: () => {
+            chunks++;
+          },
+          error: (e: any) => {
+            errors.push(`${e.name}: ${e.message}`);
+            reported();
+          },
+        });
+        encoder.configure({ codec: "avc1.42001f", width: 640, height: 480 });
+        const pool = wc.createSurfacePool(640, 480);
+        for (let i = 0; i < 30; i++) {
+          const frame = new wc.VideoFrame(pool.acquire(), {
+            timestamp: i * 33333,
+          });
+          encoder.encode(frame, { keyFrame: i === 0 });
+          frame.close();
+        }
+        return Promise.race([
+          failure.then(() => "failed"),
+          new Promise((resolve) => setTimeout(() => resolve("timeout"), 20000)),
+        ]).then((outcome: any) => {
+          const { state } = encoder;
+          if (state !== "closed") {
+            encoder.close();
+          }
+          return { outcome, errors, chunks, state };
+        });
+      })) as any;
+    } finally {
+      setFault("");
+    }
+    expect(failed.outcome).toBe("failed");
+    expect(failed.errors.length).toBe(1);
+    expect(failed.errors[0]).toMatch(/^EncodingError: .*the draw failed/);
+    expect(failed.state).toBe("closed");
+    let log = "";
+    for (let i = 0; i < 50; i++) {
+      log = adb(["logcat", "-d", "-s", "WebCodecs"]).toString();
+      if (/video encoder: released/.test(log)) {
+        break;
+      }
+      execFileSync("sleep", ["0.2"]);
+    }
+    expect(log).toMatch(/video encoder: released/);
+    expect(log).not.toMatch(/stopping .* from another thread/);
+  }, 120000);
+
   it("releases the old VideoEncoder codec before configure() makes a new one (Android fault)", async () => {
     if (client.OS !== "android") {
       return;
