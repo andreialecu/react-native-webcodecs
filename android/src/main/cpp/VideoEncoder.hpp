@@ -191,17 +191,6 @@ inline std::vector<std::string> findVideoEncoders(const NativeVideoEncoderConfig
                                           mediaCodecProfile(config), config.codec == "avc", hdr ? kColorFormatYuvP010 : kColorFormatSurface);
 }
 
-// Waits on the CPU for a sync fd (taken over, closed either way), at most
-// kFenceTimeoutMs.
-inline void waitFenceCpu(int fd) {
-  if (waitSyncFd(fd, kFenceTimeoutMs) != FenceWait::Signaled) {
-    WC_LOG("video encoder: an HDR frame's GPU fence did not signal");
-  }
-  if (fd >= 0) {
-    ::close(fd);
-  }
-}
-
 // H.264, or AV1, through MediaCodec. Frames are copied (GPU, EGL) into the
 // codec's input surface on one thread; a second one drains the encoded
 // output. HDR (HLG or PQ in BT.2020, from half-float surfaces holding R'G'B'
@@ -336,7 +325,9 @@ public:
           }
         }
         if (_aspects.hdr()) {
-          waitFenceCpu(fence);
+          // Read on the CPU: a fence that does not signal in time fails the
+          // frame (throws) rather than letting it be read half written.
+          awaitFence(fence);
           queueP010(ref->buffer, pts);
         } else {
           _blitter.waitFence(fence);
@@ -990,13 +981,24 @@ private:
     if (!dst || capacity < size) {
       throw std::runtime_error("the input buffer is too small for P010");
     }
+    // No fence (-1): the caller waited for the frame's fence to signal
+    // (awaitFence). Passing it would hand it to gralloc, whose wait on it can
+    // be unbounded.
     void* src = nullptr;
     int locked = AHardwareBuffer_lock(buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, &src);
     if (locked != 0 || !src) {
       throw std::runtime_error("AHardwareBuffer_lock failed (" + std::to_string(locked) + ")");
     }
-    rgba16fToP010(static_cast<const uint16_t*>(src), desc.stride * 4, width, height, dst, _stride, _sliceHeight);
-    AHardwareBuffer_unlock(buffer, nullptr);
+    {
+      // Unlocked whatever happens while it is read.
+      struct Unlock {
+        AHardwareBuffer* buffer;
+        ~Unlock() {
+          AHardwareBuffer_unlock(buffer, nullptr);
+        }
+      } unlock{buffer};
+      rgba16fToP010(static_cast<const uint16_t*>(src), desc.stride * 4, width, height, dst, _stride, _sliceHeight);
+    }
     media_status_t status = AMediaCodec_queueInputBuffer(_codec, static_cast<size_t>(index), 0, size, ptsUs, 0);
     if (status != AMEDIA_OK) {
       throw std::runtime_error("queueInputBuffer failed (" + std::to_string(status) + ")");
