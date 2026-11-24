@@ -1,0 +1,33 @@
+{
+  "name": "Example",
+  "displayName": "Example",
+  "singleApp": "example-app",
+  "components": [
+    {
+      "appKey": "Example",
+      "displayName": "Example",
+      "slug": "example-app"
+    }
+  ],
+  "resources": {
+    "android": [
+      "dist/res"
+    ],
+    "ios": [
+      "dist/assets",
+      "dist/main.ios.jsbundle"
+    ]
+  },
+  "ios": {
+    "metalAPIValidation": false,
+    "bundleIdentifier": "com.reactnativewebcodecs.example"
+  },
+  "android": {
+    "package": "com.reactnativewebcodecs.example",
+    "permissions": [
+      {
+        "android:name": "android.permission.INTERNET"
+      }
+    ]
+  }
+}

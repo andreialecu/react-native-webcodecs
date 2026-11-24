@@ -1,0 +1,121 @@
+name: CI
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lint files
+        run: yarn lint
+
+      - name: Typecheck files
+        run: yarn tsc
+
+      - name: Unit tests
+        run: yarn test:unit
+
+      - name: Build the package
+        run: yarn build
+
+      # The generated Nitro sources are committed: fail when they are stale.
+      - name: Check Nitro specs
+        run: yarn specs && git diff --exit-code -- nitrogen
+
+      # Validate the semantic-release config without publishing, so a broken
+      # .releaserc is caught on PRs rather than at release time.
+      - name: Release dry run
+        run: yarn semantic-release --dry-run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          YARN_NPM_AUTH_TOKEN: ''
+          NPM_TOKEN: ''
+
+  # Builds the example, runs it on a simulator and runs the e2e tests against
+  # it (src/__tests__): exports checked with ffprobe and
+  # ffmpeg on the host.
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      METRO_PORT: 8081
+      E2E_PORT: 4242
+      IOS_SIMULATOR: webcodecs-ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install ffmpeg
+        run: command -v ffprobe >/dev/null || brew install ffmpeg
+
+      # xcpretty is a gem, not part of the macOS runner image.
+      - name: Install xcpretty
+        run: command -v xcpretty >/dev/null || sudo gem install xcpretty --no-document
+
+      - name: Install CocoaPods
+        working-directory: example/ios
+        run: pod install
+
+      - name: Start Package Manager
+        working-directory: example
+        run: CI=true yarn start --port $METRO_PORT --reset-cache &
+
+      - name: Build example for iOS
+        working-directory: example/ios
+        run: |
+          set -o pipefail && xcodebuild \
+            -workspace Example.xcworkspace \
+            -scheme Example \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath build \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build | xcpretty
+
+      - name: Prepare iOS simulator
+        run: |
+          RUNTIME=$(xcrun simctl list runtimes available --json | jq -r '
+            .runtimes | map(select(.platform == "iOS"))
+            | sort_by(.version | split(".") | map(tonumber)) | last | .identifier')
+          DEVICE_TYPE=$(xcrun simctl list devicetypes --json | jq -r '
+            .devicetypes | map(select(.name | test("^iPhone [0-9]+ Pro$")))
+            | sort_by(.name | capture("^iPhone (?<n>[0-9]+) Pro$").n | tonumber) | last | .identifier')
+          UDID=$(xcrun simctl create "$IOS_SIMULATOR" "$DEVICE_TYPE" "$RUNTIME")
+          echo "IOS_SIMULATOR_UDID=$UDID" >> $GITHUB_ENV
+          echo "SIMULATOR_UDID=$UDID" >> $GITHUB_ENV
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Install and launch app on Simulator
+        run: |
+          xcrun simctl install "$IOS_SIMULATOR_UDID" example/ios/build/Build/Products/Debug-iphonesimulator/ReactTestApp.app
+          xcrun simctl launch "$IOS_SIMULATOR_UDID" com.reactnativewebcodecs.example \
+            -RCT_jsLocation "localhost:$METRO_PORT"
+
+      - name: Run e2e tests
+        run: yarn test

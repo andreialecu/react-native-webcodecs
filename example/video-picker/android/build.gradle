@@ -1,0 +1,24 @@
+// The example app's own video picker. Linked from ../react-native.config.js.
+apply plugin: "com.android.library"
+
+def safeExt(name, fallback) {
+  return rootProject.ext.has(name) ? rootProject.ext.get(name) : fallback
+}
+
+android {
+  namespace "com.webcodecs.videopicker"
+  compileSdkVersion safeExt("compileSdkVersion", 35)
+  defaultConfig {
+    minSdkVersion safeExt("minSdkVersion", 26)
+  }
+}
+
+repositories {
+  google()
+  mavenCentral()
+}
+
+dependencies {
+  // The version comes from the app's React Native.
+  implementation "com.facebook.react:react-android"
+}

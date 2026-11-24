@@ -1,0 +1,47 @@
+name: Deploy the web demo
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# One deployment at a time; a newer push replaces a queued one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The example app's web page as static files (example/scripts/build-web.js).
+      - name: Build the demo
+        run: yarn example build:web
+
+      - name: Upload
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: example/web-build
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

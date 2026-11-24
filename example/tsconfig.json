@@ -1,0 +1,9 @@
+{
+  "extends": "eslint-config-react-native-wcandillon/tsconfig.base",
+  "compilerOptions": {
+    "paths": {
+      "react-native-webcodecs": ["../src/index"]
+    },
+    "types": ["@webgpu/types", "@types/node"]
+  }
+}

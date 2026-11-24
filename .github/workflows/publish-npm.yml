@@ -1,0 +1,48 @@
+name: Create a release
+on: workflow_dispatch
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to push tags and the CHANGELOG commit, and create the GitHub release
+      issues: write # to comment on released issues
+      pull-requests: write # to comment on released pull requests
+      id-token: write # to mint the OIDC token for npm provenance / trusted publishing
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # semantic-release needs full history and tags
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Use Node 24 (npm 12 needs it)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build the package
+        run: yarn build
+
+      # Releases are staged: the workflow's trusted publisher may only run
+      # `npm stage publish` (npm 12), and each version waits on npmjs.com
+      # until a maintainer approves it with 2FA (`npm stage approve`).
+      - name: Release
+        run: yarn release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Trusted publishing authenticates via the OIDC id-token, so no npm
+          # token is needed. These are set empty so semantic-release-yarn's
+          # verifyConditions step does not trip on a missing token.
+          YARN_NPM_AUTH_TOKEN: ''
+          NPM_TOKEN: ''
+          NPM_CONFIG_PROVENANCE: true

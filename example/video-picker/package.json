@@ -1,0 +1,6 @@
+{
+  "name": "video-picker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The example app's own video picker (PHPicker on iOS, ACTION_GET_CONTENT on Android)"
+}
