@@ -1747,7 +1747,81 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(result.errors).toEqual([]);
     expect(result.flushed).toBe("flushed");
     expect(result.queue).toBe(0);
-    expect(result.chunks.length).toBeGreaterThanOrEqual(3);
+    if (client.OS === "android") {
+      expect(result.chunks.length).toBe(4);
+    } else {
+      expect(result.chunks.length).toBeGreaterThanOrEqual(3);
+    }
+  }, 60000);
+
+  it("encodes every frame when timestamps repeat or go backwards", async () => {
+    if (!supported()) {
+      return;
+    }
+    const cases = {
+      repeated: [0, 0, 33333, 66666],
+      backwards: [0, 33333, 20000, 66666],
+    };
+    const result = (await client.eval(
+      ({ webcodecs: wc, cases: input }) => {
+        const encodeAll = (times: number[]) => {
+          const chunks: { timestamp: number; duration: number }[] = [];
+          const errors: string[] = [];
+          const encoder = new wc.VideoEncoder({
+            output: (chunk: any) =>
+              chunks.push({
+                timestamp: chunk.timestamp,
+                duration: chunk.duration,
+              }),
+            error: (e: any) => errors.push(String(e)),
+          });
+          encoder.configure({ codec: "avc1.42001f", width: 64, height: 64 });
+          const pool = wc.createSurfacePool(64, 64);
+          times.forEach((timestamp: number, i: number) => {
+            // A duration per frame: each chunk must keep its own.
+            const frame = new wc.VideoFrame(pool.acquire(), {
+              timestamp,
+              duration: 1000 + i,
+            });
+            encoder.encode(frame, { keyFrame: i === 0 });
+            frame.close();
+          });
+          return encoder.flush().then(
+            () => {
+              encoder.close();
+              return { chunks, errors };
+            },
+            (e: any) => {
+              encoder.close();
+              return { chunks, errors: errors.concat([String(e)]) };
+            },
+          );
+        };
+        return encodeAll(input.repeated).then((repeated: any) =>
+          encodeAll(input.backwards).then((backwards: any) => ({
+            repeated,
+            backwards,
+          })),
+        );
+      },
+      { cases },
+    )) as any;
+    for (const name of ["repeated", "backwards"] as const) {
+      const run = result[name];
+      expect(run.errors).toEqual([]);
+      if (client.OS === "android") {
+        // Every frame comes out, in input order, with its own timestamp and
+        // duration (no B-frames: output order is input order).
+        expect(run.chunks).toEqual(
+          cases[name].map((timestamp, i) => ({
+            timestamp,
+            duration: 1000 + i,
+          })),
+        );
+      } else {
+        expect(run.chunks.length).toBeGreaterThanOrEqual(3);
+      }
+    }
   }, 60000);
 
   it("writes into missing directories and reads percent-encoded file:// URLs", async () => {

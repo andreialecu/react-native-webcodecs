@@ -15,7 +15,6 @@
 #include <cmath>
 #include <cstring>
 #include <future>
-#include <map>
 #include <optional>
 
 #include "Capabilities.hpp"
@@ -25,6 +24,7 @@
 #include "NativeEncodedChunk.hpp"
 #include "NativeVideoEncoderConfig.hpp"
 #include "Surface.hpp"
+#include "Timestamps.hpp"
 
 namespace margelo::nitro::webcodecs {
 
@@ -255,11 +255,7 @@ public:
     uint32_t visibleWidth = native->visibleWidth();
     uint32_t visibleHeight = native->visibleHeight();
     int64_t ts = static_cast<int64_t>(timestamp);
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _durations[ts] = duration;
-    }
-    _gl.post([this, ref, fence, visibleWidth, visibleHeight, ts, keyFrame] {
+    _gl.post([this, ref, fence, visibleWidth, visibleHeight, ts, duration, keyFrame] {
       if (_failed) {
         if (fence >= 0) {
           ::close(fence);
@@ -285,13 +281,20 @@ public:
           AMediaCodec_setParameters(_codec, params);
           AMediaFormat_delete(params);
         }
+        // Recorded in draw order for this codec; the codec gets a pts that
+        // moves forward (see Timestamps.hpp), the chunk the real one.
+        int64_t pts = 0;
+        {
+          std::lock_guard<std::mutex> lock(_mutex);
+          pts = _timestamps.push(ts, duration);
+        }
         if (_aspects.hdr()) {
           waitFenceCpu(fence);
-          queueP010(ref->buffer, ts);
+          queueP010(ref->buffer, pts);
         } else {
           _blitter.waitFence(fence);
           _blitter.drawToWindow(_window, ref->buffer, visibleWidth, visibleHeight, static_cast<int>(_config.width),
-                                static_cast<int>(_config.height), ts * 1000);
+                                static_cast<int>(_config.height), pts * 1000);
         }
         _framesIn++;
       } catch (const std::exception& e) {
@@ -630,6 +633,7 @@ private:
       std::lock_guard<std::mutex> lock(_mutex);
       _eos = false;
       _draining = true;
+      _timestamps.clear();
     }
     _drain = std::thread([this, codec = _codec] { drainLoop(codec); });
   }
@@ -695,7 +699,7 @@ private:
         bool waiting = false;
         {
           std::lock_guard<std::mutex> lock(_mutex);
-          waiting = !_durations.empty();
+          waiting = !_timestamps.empty();
         }
         if (!waiting) {
           lastOutput = std::chrono::steady_clock::now();
@@ -746,16 +750,16 @@ private:
       }
       AMediaCodec_releaseOutputBuffer(codec, index, false);
       if (info.flags & kBufferFlagEndOfStream) {
-        // Frames the codec took and never output (MediaCodec drops a frame
-        // whose timestamp does not move forward): an empty chunk each, as
-        // VideoToolbox reports a dropped frame, so JS stops counting them.
+        // Frames the codec took and never output (dropped): an empty chunk
+        // each, as VideoToolbox reports a dropped frame, so JS stops
+        // counting them.
         // (flush() waits on the GL thread meanwhile: _framesIn is still.)
         for (int64_t n = _framesIn - _framesOut; n > 0 && !_failed; n--) {
           _output(NativeEncodedChunk(ArrayBuffer::allocate(0), 0, 0, false, std::nullopt));
         }
         {
           std::lock_guard<std::mutex> lock(_mutex);
-          _durations.clear();
+          _timestamps.clear();
         }
         {
           std::lock_guard<std::mutex> lock(_mutex);
@@ -837,28 +841,30 @@ private:
     }
   }
 
-  double takeDuration(int64_t ptsUs) {
+  // The real timestamp and duration of the frame an output is (the codec's
+  // pts when no frame is waiting).
+  PendingFrame takeFrame(int64_t ptsUs) {
     std::lock_guard<std::mutex> lock(_mutex);
-    auto it = _durations.find(ptsUs);
-    if (it == _durations.end()) {
-      return 0;
+    size_t skipped = 0;
+    auto frame = _timestamps.take(ptsUs, skipped);
+    if (!frame.has_value()) {
+      return {ptsUs, ptsUs, 0};
     }
-    double duration = it->second;
-    _durations.erase(_durations.begin(), std::next(it));
-    return duration;
+    return *frame;
   }
 
   // AV1 chunks are the OBUs as they come (low-overhead format, with sizes),
   // as WebCodecs has them. No description: the av1C record is optional, and
   // the sequence header is in the key frames.
   void emitAv1(const uint8_t* data, size_t size, int64_t ptsUs, bool key) {
-    double duration = takeDuration(ptsUs);
+    PendingFrame frame = takeFrame(ptsUs);
     if (_failed) {
       return;
     }
     std::vector<uint8_t> chunk(data, data + size);
     _framesOut++;
-    _output(NativeEncodedChunk(ArrayBuffer::move(std::move(chunk)), static_cast<double>(ptsUs), duration, key, std::nullopt));
+    _output(NativeEncodedChunk(ArrayBuffer::move(std::move(chunk)), static_cast<double>(frame.realTs), frame.duration, key,
+                               std::nullopt));
   }
 
   void emit(const uint8_t* data, size_t size, int64_t ptsUs, bool key) {
@@ -880,7 +886,7 @@ private:
       avcc.push_back(static_cast<uint8_t>(length));
       avcc.insert(avcc.end(), unit, unit + length);
     }
-    double duration = takeDuration(ptsUs);
+    PendingFrame frame = takeFrame(ptsUs);
     std::optional<std::shared_ptr<ArrayBuffer>> description;
     if (key) {
       auto record = makeAvcC(_sps, _pps);
@@ -893,7 +899,7 @@ private:
       return;
     }
     _framesOut++;
-    _output(NativeEncodedChunk(ArrayBuffer::move(std::move(avcc)), static_cast<double>(ptsUs), duration, key, description));
+    _output(NativeEncodedChunk(ArrayBuffer::move(std::move(avcc)), static_cast<double>(frame.realTs), frame.duration, key, description));
   }
 
   void fail(const std::string& message) {
@@ -918,7 +924,8 @@ private:
 
   std::mutex _mutex;
   std::condition_variable _cv;
-  std::map<int64_t, double> _durations;
+  // Frames drawn and not yet output, in draw order.
+  TimestampQueue _timestamps;
   bool _eos = false;
   bool _draining = false;
   std::string _failure;
