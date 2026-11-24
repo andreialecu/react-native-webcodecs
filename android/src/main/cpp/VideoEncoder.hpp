@@ -488,10 +488,12 @@ public:
     }
   }
 
+  // Synchronous, as the decoder's: the codec is let go before close()
+  // returns, so that a configure() after it (a new native encoder) does not
+  // make a second codec while this one is still there (devices with few
+  // codec instances refuse it). Bounded: see shutdown().
   void close() override {
-    _closed = true;
-    _failed = true;
-    _gl.post([this] { stop(); });
+    shutdown();
   }
 
 private:

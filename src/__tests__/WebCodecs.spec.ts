@@ -2142,6 +2142,64 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(after.chunks.length).toBe(3);
   }, 120000);
 
+  it("releases the old VideoEncoder codec before configure() makes a new one (Android fault)", async () => {
+    if (client.OS !== "android") {
+      return;
+    }
+    // Debug builds only: stopping a codec takes 800 ms longer. Devices
+    // with few codec instances need the old one gone before the new one.
+    setFault("venc-slow-stop:800");
+    adb(["logcat", "-c"]);
+    let result: any;
+    try {
+      result = (await client.eval(({ webcodecs: wc }) => {
+        const chunks: number[] = [];
+        const errors: string[] = [];
+        const encoder = new wc.VideoEncoder({
+          output: (chunk: any) => chunks.push(chunk.timestamp),
+          error: (e: any) => errors.push(String(e)),
+        });
+        const config = { codec: "avc1.42001f", width: 64, height: 64 };
+        const pool = wc.createSurfacePool(64, 64);
+        const encodeSome = (first: number) => {
+          for (let i = first; i < first + 3; i++) {
+            const frame = new wc.VideoFrame(pool.acquire(), {
+              timestamp: i * 33333,
+            });
+            encoder.encode(frame, { keyFrame: i === first });
+            frame.close();
+          }
+        };
+        encoder.configure(config);
+        encodeSome(0);
+        // A new config: the native codec is replaced.
+        encoder.configure(config);
+        encodeSome(3);
+        return encoder.flush().then(
+          () => {
+            encoder.close();
+            return { chunks, errors };
+          },
+          (e: any) => {
+            encoder.close();
+            return { chunks, errors: errors.concat([String(e)]) };
+          },
+        );
+      })) as any;
+    } finally {
+      setFault("");
+    }
+    expect(result.errors).toEqual([]);
+    expect(result.chunks).toEqual([3, 4, 5].map((i) => i * 33333));
+    const log = adb(["logcat", "-d", "-s", "WebCodecs"])
+      .toString()
+      .split("\n")
+      .filter((line) => /video encoder: (c2\.|OMX\.|released)/.test(line))
+      .map((line) => (/released/.test(line) ? "released" : "made"));
+    // Made, released, made: never two at once.
+    expect(log.slice(0, 3)).toEqual(["made", "released", "made"]);
+  }, 120000);
+
   it("writes into missing directories and reads percent-encoded file:// URLs", async () => {
     if (!supported()) {
       return;
