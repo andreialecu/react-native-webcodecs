@@ -18,7 +18,7 @@ public extension NativeVideoDecoderConfig {
   /**
    * Create a new instance of `NativeVideoDecoderConfig`.
    */
-  init(codec: String, description: ArrayBuffer?, codedWidth: Double?, codedHeight: Double?, pixelFormat: String?) {
+  init(codec: String, description: ArrayBuffer?, codedWidth: Double?, codedHeight: Double?, pixelFormat: String?, hardwareAcceleration: String?) {
     self.init(std.string(codec), { () -> bridge.std__optional_std__shared_ptr_ArrayBuffer__ in
       if let __unwrappedValue = description {
         return bridge.create_std__optional_std__shared_ptr_ArrayBuffer__(__unwrappedValue.getArrayBuffer())
@@ -39,6 +39,12 @@ public extension NativeVideoDecoderConfig {
       }
     }(), { () -> bridge.std__optional_std__string_ in
       if let __unwrappedValue = pixelFormat {
+        return bridge.create_std__optional_std__string_(std.string(__unwrappedValue))
+      } else {
+        return .init()
+      }
+    }(), { () -> bridge.std__optional_std__string_ in
+      if let __unwrappedValue = hardwareAcceleration {
         return bridge.create_std__optional_std__string_(std.string(__unwrappedValue))
       } else {
         return .init()
@@ -92,6 +98,18 @@ public extension NativeVideoDecoderConfig {
     return { () -> String? in
       if bridge.has_value_std__optional_std__string_(self.__pixelFormat) {
         let __unwrapped = bridge.get_std__optional_std__string_(self.__pixelFormat)
+        return String(__unwrapped)
+      } else {
+        return nil
+      }
+    }()
+  }
+  
+  @inline(__always)
+  var hardwareAcceleration: String? {
+    return { () -> String? in
+      if bridge.has_value_std__optional_std__string_(self.__hardwareAcceleration) {
+        let __unwrapped = bridge.get_std__optional_std__string_(self.__hardwareAcceleration)
         return String(__unwrapped)
       } else {
         return nil

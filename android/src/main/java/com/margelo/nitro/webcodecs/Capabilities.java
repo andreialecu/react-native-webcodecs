@@ -8,7 +8,7 @@ import android.util.Range;
 import androidx.annotation.Keep;
 import androidx.annotation.Nullable;
 
-// What the device's encoders can do, from MediaCodecList: the NDK has no
+// What the device's codecs can do, from MediaCodecList: the NDK has no
 // capability queries before API 36. Called from C++ (VideoEncoder.hpp), for
 // VideoEncoder.isConfigSupported() and to create the encoder that answered,
 // so the two agree.
@@ -49,6 +49,59 @@ public final class Capabilities {
       }
     }
     return null;
+  }
+
+  /**
+   * The decoders for `mime` that take pictures of this size (either way
+   * round), newline-separated, in the platform's order (the order
+   * MediaCodec.createDecoderByType tries them in), aliases left out. With
+   * `preference` "prefer-software", software decoders only; with
+   * "prefer-hardware", all but the software ones; otherwise all.
+   */
+  @Keep
+  public static String findVideoDecoders(String mime, int width, int height, String preference) {
+    boolean software = "prefer-software".equals(preference);
+    boolean hardware = "prefer-hardware".equals(preference);
+    StringBuilder names = new StringBuilder();
+    MediaCodecInfo[] infos = new MediaCodecList(MediaCodecList.REGULAR_CODECS).getCodecInfos();
+    for (MediaCodecInfo info : infos) {
+      if (info.isEncoder()) {
+        continue;
+      }
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && info.isAlias()) {
+        continue;
+      }
+      if (!supportsType(info, mime)) {
+        continue;
+      }
+      boolean isSoftware = isSoftwareOnly(info);
+      if ((software && !isSoftware) || (hardware && isSoftware)) {
+        continue;
+      }
+      MediaCodecInfo.VideoCapabilities video;
+      try {
+        video = info.getCapabilitiesForType(mime).getVideoCapabilities();
+      } catch (IllegalArgumentException e) {
+        continue;
+      }
+      if (video != null && width > 0 && height > 0
+          && !video.isSizeSupported(width, height) && !video.isSizeSupported(height, width)) {
+        continue;
+      }
+      if (names.length() > 0) {
+        names.append('\n');
+      }
+      names.append(info.getName());
+    }
+    return names.toString();
+  }
+
+  private static boolean isSoftwareOnly(MediaCodecInfo info) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      return info.isSoftwareOnly();
+    }
+    String name = info.getName();
+    return name.startsWith("c2.android.") || name.startsWith("OMX.google.");
   }
 
   private static boolean supportsType(MediaCodecInfo info, String mime) {

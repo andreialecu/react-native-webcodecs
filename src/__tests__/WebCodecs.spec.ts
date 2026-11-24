@@ -796,6 +796,88 @@ const topLevelBoxes = (file: string) => {
   return boxes;
 };
 
+interface Decoded {
+  frames: number;
+  errors: string[];
+  // The first frame's.
+  first: {
+    codedWidth: number;
+    codedHeight: number;
+    visibleRect: { x: number; y: number; width: number; height: number };
+    displayWidth: number;
+    displayHeight: number;
+    format: string | null;
+  } | null;
+}
+
+// Decodes a file of the app's on the device with the track's decoder config
+// and `ctx.config` on top (e.g. hardwareAcceleration).
+const decodeOnDevice = (file: string, config: object) =>
+  runOnDevice<Decoded>(
+    ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+      const input = new mb.Input({
+        source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+        formats: mb.ALL_FORMATS,
+      });
+      return input.getPrimaryVideoTrack().then((track: any) =>
+        track.getDecoderConfig().then((trackConfig: any) => {
+          const result: Decoded = { frames: 0, errors: [], first: null };
+          const decoder = new wc.VideoDecoder({
+            output: (frame: any) => {
+              if (!result.first) {
+                const r = frame.visibleRect;
+                result.first = {
+                  codedWidth: frame.codedWidth,
+                  codedHeight: frame.codedHeight,
+                  visibleRect: {
+                    x: r.x,
+                    y: r.y,
+                    width: r.width,
+                    height: r.height,
+                  },
+                  displayWidth: frame.displayWidth,
+                  displayHeight: frame.displayHeight,
+                  format: frame.format,
+                };
+              }
+              result.frames++;
+              frame.close();
+            },
+            error: (e: any) => result.errors.push(String(e)),
+          });
+          decoder.configure(Object.assign({}, trackConfig, ctx.config));
+          const packets = new mb.EncodedPacketSink(track).packets();
+          const step = (): Promise<void> =>
+            packets.next().then((r: any) => {
+              if (r.done) {
+                return undefined;
+              }
+              decoder.decode(r.value.toEncodedVideoChunk());
+              return step();
+            });
+          return step()
+            .then(() => decoder.flush())
+            .then(() => {
+              decoder.close();
+              input.dispose();
+              return result;
+            });
+        }),
+      );
+    },
+    { file, config },
+    120000,
+  );
+
+// The codecs the app allocated since `logcatClear()` (Android).
+const logcatClear = () => adb(["logcat", "-c"]);
+const allocatedCodecs = () =>
+  adb(["logcat", "-d", "-s", "CCodec:D"])
+    .toString()
+    .split("\n")
+    .map((line) => /allocate\(([^)]+)\)/.exec(line)?.[1])
+    .filter((name): name is string => !!name);
+
 const ios = () => client.OS === "ios";
 const supported = () => client.OS === "ios" || client.OS === "android";
 
@@ -1534,6 +1616,54 @@ describe("react-native-webcodecs + Mediabunny", () => {
     const times = out as number[];
     expect(times.filter((t, i) => i > 0 && t <= times[i - 1])).toEqual([]);
   }, 180000);
+
+  // hardwareAcceleration picks the decoder: "prefer-software" a software
+  // one (on the emulator c2.android.avc.decoder rather than goldfish's),
+  // "prefer-hardware" none of those. iOS takes the preference as a hint.
+  it("decodes on a software decoder with hardwareAcceleration: prefer-software", async () => {
+    if (!supported() || !probes()) {
+      return;
+    }
+    const file = await sourceClip(false);
+    const android = client.OS === "android";
+    const run = async (hardwareAcceleration?: string) => {
+      if (android) {
+        logcatClear();
+      }
+      const decoded = await decodeOnDevice(
+        file,
+        hardwareAcceleration ? { hardwareAcceleration } : {},
+      );
+      const codecs = android
+        ? allocatedCodecs().filter((name) => /decoder/.test(name))
+        : [];
+      return { frames: decoded.frames, errors: decoded.errors, codecs };
+    };
+    const software = await run("prefer-software");
+    const hardware = await run("prefer-hardware");
+    const plain = await run();
+    console.log(`decoders: ${JSON.stringify({ software, hardware, plain })}`);
+    const isSoftware = (name: string) =>
+      /^(c2\.android\.|OMX\.google\.)/.test(name);
+    expect({
+      software: software.frames,
+      hardware: hardware.frames,
+      plain: plain.frames,
+      errors: [...software.errors, ...hardware.errors, ...plain.errors],
+      softwareDecoders: software.codecs.every(isSoftware),
+      hardwareDecoders: hardware.codecs.some(isSoftware),
+    }).toEqual({
+      software: 90,
+      hardware: 90,
+      plain: 90,
+      errors: [],
+      softwareDecoders: true,
+      hardwareDecoders: false,
+    });
+    if (android) {
+      expect(software.codecs.length).toBeGreaterThan(0);
+    }
+  }, 300000);
 
   // The example app's screens, through its own code (example/src/Tests.tsx
   // hands it over): the Lottie share card exported as the Video Export

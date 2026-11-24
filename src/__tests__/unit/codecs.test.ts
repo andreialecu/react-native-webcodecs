@@ -22,12 +22,18 @@ interface FakeCodec<T> {
   setColorSpace: jest.Mock;
   maxFrameDelay: number;
   hardwareAccelerated: boolean;
+  // The native config it was created with.
+  config: unknown;
 }
 
 const made: FakeCodec<unknown>[] = [];
 let createError: Error | null = null;
 
-const fakeCodec = <T>(output: Output<T>, error: (m: string) => void) => {
+const fakeCodec = <T>(
+  output: Output<T>,
+  error: (m: string) => void,
+  config?: unknown,
+) => {
   if (createError) {
     throw createError;
   }
@@ -41,6 +47,7 @@ const fakeCodec = <T>(output: Output<T>, error: (m: string) => void) => {
     setColorSpace: jest.fn(),
     maxFrameDelay: 3,
     hardwareAccelerated: false,
+    config,
   };
   made.push(codec as FakeCodec<unknown>);
   return codec;
@@ -54,10 +61,10 @@ const mockNative = {
     e: (m: string) => void,
   ) => fakeCodec(o, e),
   createVideoDecoder: (
-    _c: unknown,
+    c: unknown,
     o: Output<unknown>,
     e: (m: string) => void,
-  ) => fakeCodec(o, e),
+  ) => fakeCodec(o, e, c),
   createAudioEncoder: (
     _c: unknown,
     o: Output<unknown>,
@@ -304,6 +311,22 @@ describe("VideoDecoder", () => {
     const flushed = decoder.flush();
     decoder.close();
     expect(await settles(flushed)).toBe("AbortError");
+  });
+
+  it("passes hardwareAcceleration's preference to the native decoder", () => {
+    const decoder = new VideoDecoder({ output: jest.fn(), error: jest.fn() });
+    const preferences = [
+      "prefer-software",
+      "prefer-hardware",
+      "no-preference",
+    ] as const;
+    const passed = preferences.map((hardwareAcceleration) => {
+      decoder.configure({ ...DECODER_CONFIG, hardwareAcceleration });
+      return (last().config as { hardwareAcceleration?: string })
+        .hardwareAcceleration;
+    });
+    decoder.close();
+    expect(passed).toEqual(["prefer-software", "prefer-hardware", undefined]);
   });
 
   it("closes the native decoder on a native error", () => {

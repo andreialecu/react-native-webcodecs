@@ -683,6 +683,10 @@ export interface VideoDecoderConfig {
   // importExternalTexture or copyExternalImageToTexture. By default, "BGRA"
   // on iOS and "NV12" on Android.
   outputFormat?: "BGRA" | "NV12";
+  // On Android, "prefer-software" decodes on a software decoder and
+  // "prefer-hardware" never does; iOS leaves the choice to VideoToolbox.
+  hardwareAcceleration?:
+    "no-preference" | "prefer-hardware" | "prefer-software";
   [key: string]: unknown;
 }
 
@@ -697,6 +701,11 @@ const toNativeDecoderConfig = (config: VideoDecoderConfig) => {
     codedWidth: config.codedWidth,
     codedHeight: config.codedHeight,
     pixelFormat: config.outputFormat,
+    hardwareAcceleration:
+      config.hardwareAcceleration === "prefer-software" ||
+      config.hardwareAcceleration === "prefer-hardware"
+        ? config.hardwareAcceleration
+        : undefined,
   };
 };
 

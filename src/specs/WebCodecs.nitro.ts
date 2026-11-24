@@ -107,6 +107,9 @@ export interface NativeVideoDecoderConfig {
   codedHeight?: number;
   // "BGRA" (default) or "NV12"
   pixelFormat?: string;
+  // WebCodecs' "prefer-software" or "prefer-hardware"; none: the platform's
+  // choice. Android picks the decoder by it; iOS ignores it.
+  hardwareAcceleration?: string;
 }
 
 export interface NativeDecodedFrame {

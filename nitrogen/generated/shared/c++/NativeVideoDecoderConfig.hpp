@@ -46,10 +46,11 @@ namespace margelo::nitro::webcodecs {
     std::optional<double> codedWidth     SWIFT_PRIVATE;
     std::optional<double> codedHeight     SWIFT_PRIVATE;
     std::optional<std::string> pixelFormat     SWIFT_PRIVATE;
+    std::optional<std::string> hardwareAcceleration     SWIFT_PRIVATE;
 
   public:
     NativeVideoDecoderConfig() = default;
-    explicit NativeVideoDecoderConfig(std::string codec, std::optional<std::shared_ptr<ArrayBuffer>> description, std::optional<double> codedWidth, std::optional<double> codedHeight, std::optional<std::string> pixelFormat): codec(codec), description(description), codedWidth(codedWidth), codedHeight(codedHeight), pixelFormat(pixelFormat) {}
+    explicit NativeVideoDecoderConfig(std::string codec, std::optional<std::shared_ptr<ArrayBuffer>> description, std::optional<double> codedWidth, std::optional<double> codedHeight, std::optional<std::string> pixelFormat, std::optional<std::string> hardwareAcceleration): codec(codec), description(description), codedWidth(codedWidth), codedHeight(codedHeight), pixelFormat(pixelFormat), hardwareAcceleration(hardwareAcceleration) {}
 
   public:
     friend bool operator==(const NativeVideoDecoderConfig& lhs, const NativeVideoDecoderConfig& rhs) = default;
@@ -69,7 +70,8 @@ namespace margelo::nitro {
         JSIConverter<std::optional<std::shared_ptr<ArrayBuffer>>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "description"))),
         JSIConverter<std::optional<double>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "codedWidth"))),
         JSIConverter<std::optional<double>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "codedHeight"))),
-        JSIConverter<std::optional<std::string>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "pixelFormat")))
+        JSIConverter<std::optional<std::string>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "pixelFormat"))),
+        JSIConverter<std::optional<std::string>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "hardwareAcceleration")))
       );
     }
     static inline jsi::Value toJSI(jsi::Runtime& runtime, const margelo::nitro::webcodecs::NativeVideoDecoderConfig& arg) {
@@ -79,6 +81,7 @@ namespace margelo::nitro {
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "codedWidth"), JSIConverter<std::optional<double>>::toJSI(runtime, arg.codedWidth));
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "codedHeight"), JSIConverter<std::optional<double>>::toJSI(runtime, arg.codedHeight));
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "pixelFormat"), JSIConverter<std::optional<std::string>>::toJSI(runtime, arg.pixelFormat));
+      obj.setProperty(runtime, PropNameIDCache::get(runtime, "hardwareAcceleration"), JSIConverter<std::optional<std::string>>::toJSI(runtime, arg.hardwareAcceleration));
       return obj;
     }
     static inline bool canConvert(jsi::Runtime& runtime, const jsi::Value& value) {
@@ -94,6 +97,7 @@ namespace margelo::nitro {
       if (!JSIConverter<std::optional<double>>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "codedWidth")))) return false;
       if (!JSIConverter<std::optional<double>>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "codedHeight")))) return false;
       if (!JSIConverter<std::optional<std::string>>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "pixelFormat")))) return false;
+      if (!JSIConverter<std::optional<std::string>>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "hardwareAcceleration")))) return false;
       return true;
     }
   };

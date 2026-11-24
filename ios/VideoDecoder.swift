@@ -293,6 +293,8 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
       kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any],
       kCVPixelBufferMetalCompatibilityKey: true,
     ]
+    // config.hardwareAcceleration is left to VideoToolbox, which picks the
+    // decoder (no decoder specification).
     var session: VTDecompressionSession?
     let status = VTDecompressionSessionCreate(
       allocator: kCFAllocatorDefault, formatDescription: format, decoderSpecification: nil,

@@ -12,6 +12,7 @@
 
 #include "HybridNativeVideoDecoderSpec.hpp"
 #include "NativeDecodedFrame.hpp"
+#include "Capabilities.hpp"
 #include "NativeVideoDecoderConfig.hpp"
 #include "Surface.hpp"
 #include "VideoEncoder.hpp"
@@ -66,11 +67,6 @@ public:
     ANativeWindow* window = nullptr;
     AImageReader_getWindow(_reader, &window);
 
-    _codec = AMediaCodec_createDecoderByType(mime.c_str());
-    if (!_codec) {
-      _readerOwner.reset();
-      throw domError("NotSupportedError", "no decoder for " + config.codec);
-    }
     AMediaFormat* format = AMediaFormat_new();
     AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime.c_str());
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
@@ -84,17 +80,56 @@ public:
     auto csd1 = csd(_sets.pps[0]);
     AMediaFormat_setBuffer(format, "csd-0", csd0.data(), csd0.size());
     AMediaFormat_setBuffer(format, "csd-1", csd1.data(), csd1.size());
-    status = AMediaCodec_configure(_codec, format, window, nullptr, 0);
-    AMediaFormat_delete(format);
-    if (status == AMEDIA_OK) {
-      status = AMediaCodec_start(_codec);
+
+    // The decoders to try, by name: those hardwareAcceleration prefers
+    // first, then the others, each in the platform's order. One that fails
+    // to configure or start (out of instances, a level it refuses) gives way
+    // to the next; with no list, the platform's choice.
+    std::vector<std::string> names;
+    std::string preference = config.hardwareAcceleration.value_or("");
+    try {
+      names = JCapabilities::findVideoDecoders(mime, width, height, preference);
+      if (!preference.empty()) {
+        for (auto& name : JCapabilities::findVideoDecoders(mime, width, height, "")) {
+          if (std::find(names.begin(), names.end(), name) == names.end()) {
+            names.push_back(name);
+          }
+        }
+      }
+    } catch (const std::exception& e) {
+      WC_ERR("video decoder: MediaCodecList failed (%s); using the platform's decoder", e.what());
+      names.clear();
     }
-    if (status != AMEDIA_OK) {
-      AMediaCodec_delete(_codec);
-      _codec = nullptr;
+    if (names.empty()) {
+      names.push_back("");
+    }
+    status = AMEDIA_ERROR_UNKNOWN;
+    std::string tried;
+    for (auto& name : names) {
+      AMediaCodec* codec = name.empty() ? AMediaCodec_createDecoderByType(mime.c_str()) : AMediaCodec_createCodecByName(name.c_str());
+      std::string label = name.empty() ? "the default decoder" : name;
+      tried += (tried.empty() ? "" : ", ") + label;
+      if (!codec) {
+        WC_ERR("video decoder: could not create %s", label.c_str());
+        continue;
+      }
+      status = AMediaCodec_configure(codec, format, window, nullptr, 0);
+      if (status == AMEDIA_OK) {
+        status = AMediaCodec_start(codec);
+      }
+      if (status == AMEDIA_OK) {
+        _codec = codec;
+        WC_LOG("video decoder: %s", label.c_str());
+        break;
+      }
+      WC_ERR("video decoder: %s failed to start (%d)", label.c_str(), status);
+      AMediaCodec_delete(codec);
+    }
+    AMediaFormat_delete(format);
+    if (!_codec) {
       _readerOwner.reset();
       _reader = nullptr;
-      throw domError("NotSupportedError", "MediaCodec decoder failed to start (" + std::to_string(status) + ")");
+      throw domError("NotSupportedError", "no decoder for " + config.codec + " started (" + std::to_string(status) + "; tried " + tried + ")");
     }
 
     startDrain();

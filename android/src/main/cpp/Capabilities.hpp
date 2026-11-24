@@ -3,7 +3,9 @@
 #include <fbjni/fbjni.h>
 
 #include <optional>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace margelo::nitro::webcodecs {
 
@@ -33,6 +35,31 @@ struct JCapabilities : facebook::jni::JavaClass<JCapabilities> {
       }
     });
     return name;
+  }
+
+  // The decoders for `mime` that take this size, in the platform's order:
+  // with "prefer-software" only software ones, with "prefer-hardware" none
+  // of those.
+  static std::vector<std::string> findVideoDecoders(const std::string& mime, int width, int height, const std::string& preference) {
+    std::vector<std::string> names;
+    facebook::jni::ThreadScope::WithClassLoader([&] {
+      static const auto method =
+          javaClassStatic()
+              ->getStaticMethod<facebook::jni::local_ref<facebook::jni::JString>(facebook::jni::alias_ref<facebook::jni::JString>, jint,
+                                                                                 jint, facebook::jni::alias_ref<facebook::jni::JString>)>(
+                  "findVideoDecoders");
+      auto result = method(javaClassStatic(), facebook::jni::make_jstring(mime), width, height, facebook::jni::make_jstring(preference));
+      if (result) {
+        std::istringstream lines(result->toStdString());
+        std::string line;
+        while (std::getline(lines, line)) {
+          if (!line.empty()) {
+            names.push_back(line);
+          }
+        }
+      }
+    });
+    return names;
   }
 };
 
