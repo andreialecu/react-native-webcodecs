@@ -19,6 +19,12 @@ struct HardwareBufferRef {
   HardwareBufferRef(AHardwareBuffer* buffer, std::function<void(AHardwareBuffer*)> recycle)
       : buffer(buffer), recycle(std::move(recycle)) {}
   HardwareBufferRef(const HardwareBufferRef&) = delete;
+  // Someone else's buffer (wrapSurface), only referenced here: its
+  // producer may reuse it whenever it likes. A pool's or a decoder's is
+  // not reused while referenced.
+  bool foreign() const {
+    return !recycle;
+  }
   HardwareBufferRef& operator=(const HardwareBufferRef&) = delete;
   ~HardwareBufferRef() {
     if (recycle) {

@@ -2364,6 +2364,130 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(run.state).toBe("closed");
   }, 120000);
 
+  // A VideoFrame made from a foreign handle (a camera's AHardwareBuffer)
+  // only references the buffer: its producer may write the next picture
+  // into it as soon as encode() returns. Each frame must be read as it was
+  // at encode(), even when the encoder is behind. A surface pool stands in
+  // for the producer: a released buffer is the next one acquire() hands
+  // out. Debug builds only: every draw waits 300 ms first, as behind a
+  // backlog.
+  it("encodes a wrapped surface as it was at encode(), though its producer reuses the buffer (Android fault)", async () => {
+    if (client.OS !== "android" || !probes()) {
+      return;
+    }
+    setFault("venc-slow-draw:300");
+    let run: any;
+    try {
+      run = (await client.eval(({ device, mediabunny: mb, webcodecs: wc }) => {
+        const fill = (surface: any, rgba: number[]) => {
+          const buffer = RNWebGPU.createNativeBufferFromPointer(
+            surface.pixelBuffer,
+          );
+          const memory = device.importSharedTextureMemory({ source: buffer });
+          const texture = memory.createTexture();
+          memory.beginAccess(texture, false);
+          const encoder = device.createCommandEncoder();
+          const pass = encoder.beginRenderPass({
+            colorAttachments: [
+              {
+                view: texture.createView(),
+                clearValue: rgba,
+                loadOp: "clear",
+                storeOp: "store",
+              },
+            ],
+          });
+          pass.end();
+          device.queue.submit([encoder.finish()]);
+          (memory as any).endAccess(texture);
+          texture.destroy();
+          memory.destroy();
+          buffer.release();
+          return device.queue.onSubmittedWorkDone();
+        };
+        const target = new mb.BufferTarget();
+        const output = new mb.Output({
+          format: new mb.Mp4OutputFormat(),
+          target,
+        });
+        const source = new mb.EncodedVideoPacketSource("avc");
+        output.addVideoTrack(source, { frameRate: 10 });
+        const errors: string[] = [];
+        const sameBuffer: boolean[] = [];
+        let written = Promise.resolve();
+        const encoder = new wc.VideoEncoder({
+          output: (chunk: any, meta: any) => {
+            const data = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(data);
+            const packet = new mb.EncodedPacket(
+              data,
+              chunk.type,
+              chunk.timestamp / 1e6,
+              (chunk.duration || 0) / 1e6,
+            );
+            written = written.then(() => source.add(packet, meta));
+          },
+          error: (e: any) => errors.push(`${e.name}: ${e.message}`),
+        });
+        encoder.configure({ codec: "avc1.42001f", width: 128, height: 128 });
+        const pool = wc.createSurfacePool(128, 128);
+        const frameAt = (i: number): Promise<void> => {
+          const surface = pool.acquire();
+          const { handle } = surface;
+          return fill(surface, [1, 0, 0, 1]).then(() => {
+            const frame = new wc.VideoFrame(
+              { handle },
+              { timestamp: i * 100000, duration: 100000 },
+            );
+            // The producer has the buffer back...
+            surface.release();
+            encoder.encode(frame, { keyFrame: i === 0 });
+            frame.close();
+            // ...and writes its next picture into it.
+            const next = pool.acquire();
+            sameBuffer.push(next.handle === handle);
+            return fill(next, [0, 1, 0, 1]).then(() => next.release());
+          });
+        };
+        const frames = (i: number): Promise<void> =>
+          i === 3 ? Promise.resolve() : frameAt(i).then(() => frames(i + 1));
+        return output
+          .start()
+          .then(() => frames(0))
+          .then(() => encoder.flush())
+          .then(() => written)
+          .then(() => output.finalize())
+          .then(() => {
+            encoder.close();
+            return {
+              errors,
+              sameBuffer,
+              path: wc.writeFile("e2e-wrapped.mp4", target.buffer),
+            };
+          })
+          .catch((e: any) => ({
+            errors: errors.concat([`${e && e.name}: ${e && e.message}`]),
+            sameBuffer,
+            path: "",
+          }));
+      })) as any;
+    } finally {
+      setFault("");
+    }
+    console.log(`wrapped: ${JSON.stringify(run)}`);
+    expect(run.errors).toEqual([]);
+    // Otherwise the producer did not reuse the buffer, and this shows nothing.
+    expect(run.sameBuffer).toEqual([true, true, true]);
+    const local = copyLocal(run.path);
+    const pixels = [0, 0.1, 0.2].map((t) => pixel(local, t));
+    console.log(`wrapped pixels: ${JSON.stringify(pixels)}`);
+    pixels.forEach((p) => {
+      expect(p[0]).toBeGreaterThan(240);
+      expect(p[1]).toBeLessThan(15);
+      expect(p[2]).toBeLessThan(15);
+    });
+  }, 120000);
+
   it("releases the old VideoEncoder codec before configure() makes a new one (Android fault)", async () => {
     if (client.OS !== "android") {
       return;

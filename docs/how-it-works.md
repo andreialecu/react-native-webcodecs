@@ -33,7 +33,11 @@ and `RGBA16F` (half float, for HDR). Android has no `NV12` pools, and its
 8-bit ones are RGBA.
 
 `new VideoFrame({ handle }, init)` wraps any surface the app already has,
-such as a camera frame, by its handle.
+such as a camera frame, by its handle. The frame only references that
+surface, and its producer may write into it again. On Android, `encode()`
+returns once the frame has been read (after the frames queued before it),
+so the producer can reuse the buffer from then on; pool and decoder
+surfaces are not reused while a frame holds them, so they never wait.
 
 ## Fences
 

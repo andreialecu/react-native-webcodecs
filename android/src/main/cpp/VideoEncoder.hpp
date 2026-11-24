@@ -64,12 +64,41 @@ constexpr auto kShutdownTimeout = std::chrono::milliseconds(2000);
 // stream (Media3 waits 100 ms).
 constexpr auto kEndOfStreamDrainTimeout = std::chrono::milliseconds(200);
 
+// How long encode() waits for a frame from a foreign buffer to be read
+// (see FrameRead): behind the frames queued before it, and its fence.
+constexpr auto kForeignReadTimeout = std::chrono::milliseconds(10000);
+
+// Set once a frame's buffer has been read (or never will be): when the GL
+// thread signals it, or at the latest when the task holding it is gone.
+class FrameRead {
+public:
+  FrameRead() : _future(_promise.get_future()) {}
+  ~FrameRead() {
+    signal();
+  }
+  void signal() {
+    if (!_signaled.exchange(true)) {
+      _promise.set_value();
+    }
+  }
+  bool waitFor(std::chrono::milliseconds timeout) {
+    return _future.wait_for(timeout) == std::future_status::ready;
+  }
+
+private:
+  std::promise<void> _promise;
+  std::future<void> _future;
+  std::atomic<bool> _signaled{false};
+};
+
 // Debug builds only: a fault the e2e tests make the encoder act out, from
 // `adb shell setprop debug.webcodecs.fault <value>`, read when a codec starts:
 //   venc-no-eos             the end of stream never comes out
 //   venc-stall-output:<s>   no output is taken, and <s> s without it is a stall
 //   venc-slow-stop:<ms>     stopping the codec takes <ms> ms longer
 //   venc-fence-hang         every frame's GPU fence is one that never signals
+//   venc-slow-draw:<ms>     each frame waits <ms> ms on the GL thread before
+//                           it is read (a busy encoder's backlog)
 // Release builds (NDEBUG) never read it.
 struct EncoderFault {
   bool noEndOfStream = false;
@@ -80,6 +109,8 @@ struct EncoderFault {
   // Each frame's fence is replaced by the read end of a pipe nothing is
   // written to: a fence that never signals (a hung GPU).
   bool fenceHang = false;
+  // Each frame waits this long on the GL thread before it is read.
+  int slowDrawMs = 0;
 
   static EncoderFault read() {
     EncoderFault fault;
@@ -98,6 +129,8 @@ struct EncoderFault {
       fault.stallOutputSeconds = std::max(1, argument("venc-stall-output:"));
     } else if (text.rfind("venc-slow-stop:", 0) == 0) {
       fault.slowStopMs = std::max(0, argument("venc-slow-stop:"));
+    } else if (text.rfind("venc-slow-draw:", 0) == 0) {
+      fault.slowDrawMs = std::max(0, argument("venc-slow-draw:"));
     } else if (text.rfind("venc-draw-fail:", 0) == 0) {
       fault.drawFailAt = std::max(1, argument("venc-draw-fail:"));
     }
@@ -262,7 +295,14 @@ public:
     uint32_t visibleWidth = native->visibleWidth();
     uint32_t visibleHeight = native->visibleHeight();
     int64_t ts = static_cast<int64_t>(timestamp);
-    _gl.post([this, ref, fence, visibleWidth, visibleHeight, ts, duration, keyFrame]() mutable {
+    // A foreign buffer (wrapSurface: a camera's, say) is only referenced:
+    // its producer may write the next picture into it once encode()
+    // returns. So encode() returns once it has been read. Pool and decoder
+    // buffers are not reused while the encoder holds them.
+    std::shared_ptr<FrameRead> read = ref->foreign() ? std::make_shared<FrameRead>() : nullptr;
+    // The task's copy: signalled after the read, or when the task is gone.
+    std::shared_ptr<FrameRead> readByTask = read;
+    _gl.post([this, ref, fence, visibleWidth, visibleHeight, ts, duration, keyFrame, read = std::move(readByTask)]() mutable {
       if (_failed) {
         if (fence >= 0) {
           ::close(fence);
@@ -324,21 +364,32 @@ public:
             _faultPipes.push_back(ends[1]);
           }
         }
+        if (_fault.slowDrawMs > 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(_fault.slowDrawMs));
+        }
         if (_aspects.hdr()) {
           // Read on the CPU: a fence that does not signal in time fails the
           // frame (throws) rather than letting it be read half written.
           awaitFence(fence);
-          queueP010(ref->buffer, pts);
+          queueP010(ref->buffer, pts, read.get());
         } else {
           _blitter.waitFence(fence);
           _blitter.drawToWindow(_window, ref->buffer, visibleWidth, visibleHeight, static_cast<int>(_config.width),
-                                static_cast<int>(_config.height), pts * 1000);
+                                static_cast<int>(_config.height), pts * 1000, [&read] {
+                                  if (read) {
+                                    read->signal();
+                                  }
+                                });
         }
         _framesIn++;
       } catch (const std::exception& e) {
         fail(errorMessage("EncodingError", "encoder-failed", e.what()));
       }
     });
+    if (read && !read->waitFor(kForeignReadTimeout)) {
+      throw domError("EncodingError", "the frame was not read within " + std::to_string(kForeignReadTimeout.count()) +
+                                          " ms; its buffer may be written over before it is");
+    }
   }
 
   std::shared_ptr<Promise<void>> flush() override {
@@ -963,7 +1014,7 @@ private:
   }
 
   // HDR: a half-float surface, converted to P010 into an input buffer.
-  void queueP010(AHardwareBuffer* buffer, int64_t ptsUs) {
+  void queueP010(AHardwareBuffer* buffer, int64_t ptsUs, FrameRead* read = nullptr) {
     AHardwareBuffer_Desc desc{};
     AHardwareBuffer_describe(buffer, &desc);
     if (desc.format != AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT) {
@@ -998,6 +1049,10 @@ private:
         }
       } unlock{buffer};
       rgba16fToP010(static_cast<const uint16_t*>(src), desc.stride * 4, width, height, dst, _stride, _sliceHeight);
+    }
+    // Copied out and unlocked: its producer may have it back.
+    if (read) {
+      read->signal();
     }
     media_status_t status = AMediaCodec_queueInputBuffer(_codec, static_cast<size_t>(index), 0, size, ptsUs, 0);
     if (status != AMEDIA_OK) {

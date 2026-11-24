@@ -135,8 +135,10 @@ public:
 
   // Draws the top-left `visibleWidth` x `visibleHeight` of `source` (its
   // crop; 0: all of it) over the whole of `target` (current: window surface).
+  // `read`: called once `source` has been read, before the frame is sent
+  // (which can wait for the encoder to take an earlier one).
   void drawToWindow(EGLSurface target, AHardwareBuffer* source, uint32_t visibleWidth, uint32_t visibleHeight, int width, int height,
-                    int64_t presentationNs) {
+                    int64_t presentationNs, const std::function<void()>& read = nullptr) {
     makeCurrent(target);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     // Cleared first, though the quad covers it all: some drivers keep (and
@@ -149,6 +151,9 @@ public:
     eglPresentationTimeANDROID(_display, target, presentationNs);
     // Done reading `source` before it goes back to the pool.
     glFinish();
+    if (read) {
+      read();
+    }
     if (!eglSwapBuffers(_display, target)) {
       throw std::runtime_error("eglSwapBuffers failed (" + std::to_string(eglGetError()) + ")");
     }
