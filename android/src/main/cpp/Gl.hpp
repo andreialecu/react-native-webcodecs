@@ -10,6 +10,8 @@
 #include <android/native_window.h>
 #include <unistd.h>
 
+#include <cstring>
+
 #include "Common.hpp"
 #include "Fence.hpp"
 
@@ -32,32 +34,51 @@ public:
     if (_display == EGL_NO_DISPLAY || !eglInitialize(_display, nullptr, nullptr)) {
       throw std::runtime_error("eglInitialize failed");
     }
-    const EGLint attributes[] = {EGL_RED_SIZE,
-                                 8,
-                                 EGL_GREEN_SIZE,
-                                 8,
-                                 EGL_BLUE_SIZE,
-                                 8,
-                                 EGL_ALPHA_SIZE,
-                                 8,
-                                 EGL_RENDERABLE_TYPE,
-                                 EGL_OPENGL_ES3_BIT,
-                                 EGL_SURFACE_TYPE,
-                                 EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
-                                 EGL_RECORDABLE_ANDROID,
-                                 1,
-                                 EGL_NONE};
+    // A recordable window (the encoder's input surface) and a 1x1 pbuffer
+    // to be current on between windows. Some devices have no config that
+    // is both: then a window-only one, with no surface between windows
+    // (EGL_KHR_surfaceless_context).
     EGLint count = 0;
-    if (!eglChooseConfig(_display, attributes, &_config, 1, &count) || count == 0) {
-      throw std::runtime_error("eglChooseConfig failed");
+    for (EGLint surfaceType : {EGL_WINDOW_BIT | EGL_PBUFFER_BIT, EGL_WINDOW_BIT}) {
+      const EGLint attributes[] = {EGL_RED_SIZE,
+                                   8,
+                                   EGL_GREEN_SIZE,
+                                   8,
+                                   EGL_BLUE_SIZE,
+                                   8,
+                                   EGL_ALPHA_SIZE,
+                                   8,
+                                   EGL_RENDERABLE_TYPE,
+                                   EGL_OPENGL_ES3_BIT,
+                                   EGL_SURFACE_TYPE,
+                                   surfaceType,
+                                   EGL_RECORDABLE_ANDROID,
+                                   1,
+                                   EGL_NONE};
+      if (eglChooseConfig(_display, attributes, &_config, 1, &count) && count > 0) {
+        break;
+      }
+    }
+    if (count == 0) {
+      throw std::runtime_error("eglChooseConfig found no recordable ES 3 config (" + std::to_string(eglGetError()) + ")");
     }
     const EGLint contextAttributes[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
     _context = eglCreateContext(_display, _config, EGL_NO_CONTEXT, contextAttributes);
     if (_context == EGL_NO_CONTEXT) {
-      throw std::runtime_error("eglCreateContext failed");
+      throw std::runtime_error("eglCreateContext failed (" + std::to_string(eglGetError()) + ")");
     }
     const EGLint pbufferAttributes[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
     _pbuffer = eglCreatePbufferSurface(_display, _config, pbufferAttributes);
+    if (_pbuffer == EGL_NO_SURFACE) {
+      EGLint error = eglGetError();
+      const char* extensions = eglQueryString(_display, EGL_EXTENSIONS);
+      if (!extensions || !std::strstr(extensions, "EGL_KHR_surfaceless_context")) {
+        throw std::runtime_error("eglCreatePbufferSurface failed (" + std::to_string(error) +
+                                 "), and EGL has no surfaceless contexts");
+      }
+      // Current with no surface (makeCurrent(EGL_NO_SURFACE)) instead.
+      WC_LOG("eglCreatePbufferSurface failed (%d): surfaceless context", error);
+    }
     makeCurrent(_pbuffer);
     buildProgram();
   }
@@ -81,7 +102,7 @@ public:
 
   void makeCurrent(EGLSurface surface) {
     if (!eglMakeCurrent(_display, surface, surface, _context)) {
-      throw std::runtime_error("eglMakeCurrent failed");
+      throw std::runtime_error("eglMakeCurrent failed (" + std::to_string(eglGetError()) + ")");
     }
   }
 
