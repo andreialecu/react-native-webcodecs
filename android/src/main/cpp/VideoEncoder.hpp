@@ -46,6 +46,9 @@ inline bool isCodecError(ssize_t index) {
 // Frames in the encoder with no output for this long: it is stuck.
 constexpr auto kStallTimeout = std::chrono::seconds(20);
 
+// How long a key frame request waits for the frames before it to come out.
+constexpr auto kKeyFrameDrainTimeout = std::chrono::milliseconds(200);
+
 inline std::string describeCodecStatus(media_status_t status, const std::string& what, const std::string& prefix) {
   // The system takes a codec back from an app in the background when another
   // needs it (MediaCodec.CodecException.ERROR_RECLAIMED).
@@ -276,6 +279,19 @@ public:
           }
         }
         if (keyFrame && _framesIn > 0) {
+          // request-sync applies to the next frame the encoder takes, which
+          // may be one already drawn and still queued: first let every frame
+          // drawn come out. Bounded, for encoders that hold frames until
+          // more come (the request then is best effort, as before).
+          {
+            std::unique_lock<std::mutex> lock(_mutex);
+            bool drained = _cv.wait_for(lock, kKeyFrameDrainTimeout,
+                                        [this] { return _framesOut + _framesSkipped >= _framesIn || _failed; });
+            if (!drained) {
+              WC_LOG("video encoder: %lld frame(s) still in the encoder at a key frame request",
+                     static_cast<long long>(_framesIn - _framesOut - _framesSkipped));
+            }
+          }
           AMediaFormat* params = AMediaFormat_new();
           AMediaFormat_setInt32(params, "request-sync", 0);
           AMediaCodec_setParameters(_codec, params);
@@ -634,6 +650,7 @@ private:
       _eos = false;
       _draining = true;
       _timestamps.clear();
+      _framesSkipped = 0;
     }
     _drain = std::thread([this, codec = _codec] { drainLoop(codec); });
   }
@@ -847,6 +864,7 @@ private:
     std::lock_guard<std::mutex> lock(_mutex);
     size_t skipped = 0;
     auto frame = _timestamps.take(ptsUs, skipped);
+    _framesSkipped += static_cast<int64_t>(skipped);
     if (!frame.has_value()) {
       return {ptsUs, ptsUs, 0};
     }
@@ -862,7 +880,7 @@ private:
       return;
     }
     std::vector<uint8_t> chunk(data, data + size);
-    _framesOut++;
+    frameOut();
     _output(NativeEncodedChunk(ArrayBuffer::move(std::move(chunk)), static_cast<double>(frame.realTs), frame.duration, key,
                                std::nullopt));
   }
@@ -898,8 +916,17 @@ private:
     if (_failed) {
       return;
     }
-    _framesOut++;
+    frameOut();
     _output(NativeEncodedChunk(ArrayBuffer::move(std::move(avcc)), static_cast<double>(frame.realTs), frame.duration, key, description));
+  }
+
+  // Counts an output, and wakes a key frame request waiting for it.
+  void frameOut() {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _framesOut++;
+    }
+    _cv.notify_all();
   }
 
   void fail(const std::string& message) {
@@ -926,6 +953,8 @@ private:
   std::condition_variable _cv;
   // Frames drawn and not yet output, in draw order.
   TimestampQueue _timestamps;
+  // Frames the codec dropped (found when a later one came out).
+  int64_t _framesSkipped = 0;
   bool _eos = false;
   bool _draining = false;
   std::string _failure;

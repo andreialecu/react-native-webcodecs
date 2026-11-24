@@ -1754,6 +1754,72 @@ describe("react-native-webcodecs + Mediabunny", () => {
     }
   }, 60000);
 
+  it("puts key frames exactly where requested", async () => {
+    if (!supported()) {
+      return;
+    }
+    const keys = [0, 7, 20, 33, 50, 51, 77];
+    const sizes = [
+      [64, 64],
+      [1280, 720],
+    ];
+    const result = (await client.eval(
+      ({ webcodecs: wc, keys: wanted, sizes: all }) => {
+        const encodeAt = (width: number, height: number) => {
+          const types: Record<string, string> = {};
+          const errors: string[] = [];
+          const encoder = new wc.VideoEncoder({
+            output: (chunk: any) => {
+              types[String(chunk.timestamp)] = chunk.type;
+            },
+            error: (e: any) => errors.push(String(e)),
+          });
+          encoder.configure({ codec: "avc1.42001f", width, height });
+          const pool = wc.createSurfacePool(width, height);
+          // All queued at once, without waiting on the encoder.
+          for (let i = 0; i < 90; i++) {
+            const frame = new wc.VideoFrame(pool.acquire(), {
+              timestamp: i * 33333,
+            });
+            encoder.encode(frame, { keyFrame: wanted.indexOf(i) >= 0 });
+            frame.close();
+          }
+          return encoder.flush().then(
+            () => {
+              encoder.close();
+              return { types, errors };
+            },
+            (e: any) => {
+              encoder.close();
+              return { types, errors: errors.concat([String(e)]) };
+            },
+          );
+        };
+        const runs: any[] = [];
+        return all
+          .reduce(
+            (p: Promise<void>, size: number[]) =>
+              p.then(() =>
+                encodeAt(size[0], size[1]).then((r: any) => {
+                  runs.push(r);
+                }),
+              ),
+            Promise.resolve(),
+          )
+          .then(() => runs);
+      },
+      { keys, sizes },
+    )) as any;
+    result.forEach((run: any) => {
+      expect(run.errors).toEqual([]);
+      const keyAt = Array.from({ length: 90 }, (_, i) =>
+        run.types[String(i * 33333)] === "key" ? i : -1,
+      ).filter((i) => i >= 0);
+      expect(keyAt).toEqual(keys);
+      expect(Object.keys(run.types).length).toBe(90);
+    });
+  }, 120000);
+
   it("encodes every frame when timestamps repeat or go backwards", async () => {
     if (!supported()) {
       return;
