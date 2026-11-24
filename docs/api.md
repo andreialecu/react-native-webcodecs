@@ -46,9 +46,14 @@ How each platform answers:
   prepares it to encode (which allocates what it needs), and closes it. Sizes
   above the codec's highest level are refused before that, since
   VideoToolbox would only fail at the first frame.
-- **Android** asks `MediaCodecList` for an encoder that takes the size,
-  frame rate, bitrate and profile, with the input the encoder will use (a
-  surface, or P010 buffers for Main 10, which HDR needs). The encoder that
+- **Android** asks `MediaCodecList` for an encoder that takes the size and
+  profile, with the input the encoder will use (a surface, or P010 buffers
+  for Main 10, which HDR needs), a hardware one before a software one. As in
+  Media3, sizes are read leniently (also aligned to the encoder's alignment,
+  swapped, and 1920x1080 or 3840x2160 when the device's camera records
+  them), and the frame rate and bitrate are hints: the bitrate, or the
+  default of width × height × fps × 0.1, is clamped into the encoder's
+  range, and the frame rate is floored, and ignored below 1. The encoder that
   answered is the one `configure` creates. An H.264 profile no encoder lists
   is a preference rather than a requirement: the encoder's default is used,
   and the output's `description` says which. Android 10 (API 29) or later.

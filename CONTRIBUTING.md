@@ -39,7 +39,9 @@ or pick "My Mac (Designed for iPad)" in Xcode and run it from there.
 ## Testing
 
 **Unit tests** (`yarn test:unit`, `src/__tests__/unit`) cover the
-`WritableStream` and Mediabunny writing through it, in Node.
+`WritableStream` and Mediabunny writing through it, in Node. `yarn test:jvm`
+runs the JVM tests of the Android encoder rules (`EncoderRules.java`, under
+`android/src/test/java`) through the example app's Gradle.
 
 **End-to-end tests** (`src/__tests__/WebCodecs.spec.ts`) run on a simulator
 or emulator with the example app, and check the files with ffprobe and
