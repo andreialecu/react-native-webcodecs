@@ -1,14 +1,17 @@
 package com.margelo.nitro.webcodecs;
 
+import android.media.CamcorderProfile;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
 import android.os.Build;
-import android.util.Range;
 
 import androidx.annotation.Keep;
 import androidx.annotation.Nullable;
 
-// What the device's encoders can do, from MediaCodecList: the NDK has no
+import java.util.ArrayList;
+import java.util.List;
+
+// What the device's codecs can do, from MediaCodecList: the NDK has no
 // capability queries before API 36. Called from C++ (VideoEncoder.hpp), for
 // VideoEncoder.isConfigSupported() and to create the encoder that answered,
 // so the two agree.
@@ -17,16 +20,92 @@ public final class Capabilities {
   private Capabilities() {}
 
   /**
-   * The name of the first encoder for `mime` (in the platform's order, as
-   * MediaCodec.createEncoderByType picks) that takes frames of this size, at
-   * this frame rate and bitrate, in this profile and input color format; or
-   * null when none does. `frameRate`, `bitrate` and `profile` are ignored
-   * when 0 or less.
+   * The name of the encoder for `mime` that takes frames of this size, in
+   * this profile (ignored when 0 or less; when `profileOptional`, dropped
+   * when no encoder takes it) and input color format; or null when none
+   * does. Encoders that take the size as they say come before those only
+   * the lenient reading (as in Media3: see EncoderRules.sizeSupported) lets
+   * through; in each, the first hardware one in the platform's order (the
+   * order MediaCodec.createEncoderByType tries), else the first software
+   * one: see EncoderRules.choose. The frame rate and bitrate are hints, as
+   * in Media3: they refuse no encoder (see videoBitrate).
    */
   @Keep
   @Nullable
-  public static String findVideoEncoder(
-      String mime, int width, int height, double frameRate, int bitrate, int profile, int colorFormat) {
+  public static String findVideoEncoder(String mime, int width, int height, int profile, boolean profileOptional, int colorFormat) {
+    return EncoderRules.choose(videoEncoders(mime), width, height, profile, profileOptional, colorFormat, Capabilities::camcorderHasHeight);
+  }
+
+  /**
+   * Every encoder that may take the config, best first (findVideoEncoder's
+   * answer first), newline-separated: see EncoderRules.candidates. When
+   * configure() fails on one, the next is tried.
+   */
+  @Keep
+  public static String findVideoEncoders(String mime, int width, int height, int profile, boolean profileOptional, int colorFormat) {
+    return String.join("\n",
+        EncoderRules.candidates(videoEncoders(mime), width, height, profile, profileOptional, colorFormat, Capabilities::camcorderHasHeight));
+  }
+
+  // Whether the device records 1080p (1080) or 4K (2160) video, by its
+  // CamcorderProfile: Media3's cross-check for encoders that list fewer rows
+  // than they take. False on devices with no camera.
+  private static boolean camcorderHasHeight(int height) {
+    int quality;
+    if (height == 1080) {
+      quality = CamcorderProfile.QUALITY_1080P;
+    } else if (height == 2160) {
+      quality = CamcorderProfile.QUALITY_2160P;
+    } else {
+      return false;
+    }
+    try {
+      return CamcorderProfile.hasProfile(quality);
+    } catch (RuntimeException e) {
+      return false;
+    }
+  }
+
+  /**
+   * The bitrate to configure the encoder `name` with: `requested`, or when
+   * 0 or less width * height * fps * 0.1, clamped into the encoder's range
+   * when it lists one. `frameRate` is floored, and ignored below 1.
+   */
+  @Keep
+  public static int videoBitrate(String name, String mime, double requested, int width, int height, double frameRate) {
+    int lower = 1;
+    int upper = Integer.MAX_VALUE;
+    for (EncoderRules.Encoder encoder : videoEncoders(mime)) {
+      if (encoder.name().equals(name)) {
+        lower = encoder.bitrateLower();
+        upper = encoder.bitrateUpper();
+        break;
+      }
+    }
+    return EncoderRules.bitrate(requested, width, height, frameRate, lower, upper);
+  }
+
+  /**
+   * The H.264 profile and level (MediaCodecInfo.CodecProfileLevel) to give
+   * the encoder `name`, as (profile << 32) | level: see
+   * EncoderRules.avcProfile and avcLevel. 0 when the encoder lists no
+   * profile that will do, or is not found: it then gets neither.
+   */
+  @Keep
+  public static long avcProfileLevel(String name, String mime, int profile, int levelIdc, int width, int height, double frameRate) {
+    for (EncoderRules.Encoder encoder : videoEncoders(mime)) {
+      if (encoder.name().equals(name)) {
+        int chosen = EncoderRules.avcProfile(encoder, profile);
+        int level = EncoderRules.avcLevel(encoder, chosen, levelIdc, width, height, frameRate);
+        return level > 0 ? ((long) chosen << 32) | level : 0;
+      }
+    }
+    return 0;
+  }
+
+  // The encoders for `mime`, in the platform's order, aliases left out.
+  private static List<EncoderRules.Encoder> videoEncoders(String mime) {
+    List<EncoderRules.Encoder> encoders = new ArrayList<>();
     MediaCodecInfo[] infos = new MediaCodecList(MediaCodecList.REGULAR_CODECS).getCodecInfos();
     for (MediaCodecInfo info : infos) {
       if (!info.isEncoder()) {
@@ -44,60 +123,141 @@ public final class Capabilities {
       } catch (IllegalArgumentException e) {
         continue;
       }
-      if (fits(caps, width, height, frameRate, bitrate, profile, colorFormat)) {
-        return info.getName();
+      if (caps.getVideoCapabilities() == null) {
+        continue;
       }
+      encoders.add(new VideoEncoder(info, caps));
     }
-    return null;
+    return encoders;
+  }
+
+  // MediaCodecInfo's capabilities, as EncoderRules reads them.
+  private static final class VideoEncoder implements EncoderRules.Encoder {
+    private final MediaCodecInfo info;
+    private final MediaCodecInfo.CodecCapabilities caps;
+    private final MediaCodecInfo.VideoCapabilities video;
+
+    VideoEncoder(MediaCodecInfo info, MediaCodecInfo.CodecCapabilities caps) {
+      this.info = info;
+      this.caps = caps;
+      this.video = caps.getVideoCapabilities();
+    }
+
+    @Override
+    public String name() {
+      return info.getName();
+    }
+
+    @Override
+    public boolean isSizeSupported(int width, int height) {
+      return video.isSizeSupported(width, height);
+    }
+
+    @Override
+    public boolean hardware() {
+      return !isSoftwareOnly(info);
+    }
+
+    @Override
+    public int widthAlignment() {
+      return video.getWidthAlignment();
+    }
+
+    @Override
+    public int heightAlignment() {
+      return video.getHeightAlignment();
+    }
+
+    @Override
+    public int bitrateLower() {
+      return video.getBitrateRange().getLower();
+    }
+
+    @Override
+    public int bitrateUpper() {
+      return video.getBitrateRange().getUpper();
+    }
+
+    @Override
+    public int[] profiles() {
+      int[] profiles = new int[caps.profileLevels.length];
+      for (int i = 0; i < profiles.length; i++) {
+        profiles[i] = caps.profileLevels[i].profile;
+      }
+      return profiles;
+    }
+
+    @Override
+    public int[] levels() {
+      int[] levels = new int[caps.profileLevels.length];
+      for (int i = 0; i < levels.length; i++) {
+        levels[i] = caps.profileLevels[i].level;
+      }
+      return levels;
+    }
+
+    @Override
+    public int[] colorFormats() {
+      return caps.colorFormats;
+    }
+  }
+
+  /**
+   * The decoders for `mime` that take pictures of this size (either way
+   * round), newline-separated, in the platform's order (the order
+   * MediaCodec.createDecoderByType tries them in), aliases left out. With
+   * `preference` "prefer-software", software decoders only; with
+   * "prefer-hardware", all but the software ones; otherwise all.
+   */
+  @Keep
+  public static String findVideoDecoders(String mime, int width, int height, String preference) {
+    boolean software = "prefer-software".equals(preference);
+    boolean hardware = "prefer-hardware".equals(preference);
+    StringBuilder names = new StringBuilder();
+    MediaCodecInfo[] infos = new MediaCodecList(MediaCodecList.REGULAR_CODECS).getCodecInfos();
+    for (MediaCodecInfo info : infos) {
+      if (info.isEncoder()) {
+        continue;
+      }
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && info.isAlias()) {
+        continue;
+      }
+      if (!supportsType(info, mime)) {
+        continue;
+      }
+      boolean isSoftware = isSoftwareOnly(info);
+      if ((software && !isSoftware) || (hardware && isSoftware)) {
+        continue;
+      }
+      MediaCodecInfo.VideoCapabilities video;
+      try {
+        video = info.getCapabilitiesForType(mime).getVideoCapabilities();
+      } catch (IllegalArgumentException e) {
+        continue;
+      }
+      if (video != null && width > 0 && height > 0
+          && !video.isSizeSupported(width, height) && !video.isSizeSupported(height, width)) {
+        continue;
+      }
+      if (names.length() > 0) {
+        names.append('\n');
+      }
+      names.append(info.getName());
+    }
+    return names.toString();
+  }
+
+  private static boolean isSoftwareOnly(MediaCodecInfo info) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      return info.isSoftwareOnly();
+    }
+    String name = info.getName();
+    return name.startsWith("c2.android.") || name.startsWith("OMX.google.");
   }
 
   private static boolean supportsType(MediaCodecInfo info, String mime) {
     for (String type : info.getSupportedTypes()) {
       if (type.equalsIgnoreCase(mime)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static boolean fits(
-      MediaCodecInfo.CodecCapabilities caps,
-      int width,
-      int height,
-      double frameRate,
-      int bitrate,
-      int profile,
-      int colorFormat) {
-    MediaCodecInfo.VideoCapabilities video = caps.getVideoCapabilities();
-    if (video == null) {
-      return false;
-    }
-    boolean size = frameRate > 0
-        ? video.areSizeAndRateSupported(width, height, frameRate)
-        : video.isSizeSupported(width, height);
-    if (!size) {
-      return false;
-    }
-    if (bitrate > 0) {
-      Range<Integer> range = video.getBitrateRange();
-      if (!range.contains(bitrate)) {
-        return false;
-      }
-    }
-    if (profile > 0) {
-      boolean found = false;
-      for (MediaCodecInfo.CodecProfileLevel level : caps.profileLevels) {
-        if (level.profile == profile) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        return false;
-      }
-    }
-    for (int format : caps.colorFormats) {
-      if (format == colorFormat) {
         return true;
       }
     }

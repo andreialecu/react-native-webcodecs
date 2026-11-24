@@ -39,7 +39,12 @@ or pick "My Mac (Designed for iPad)" in Xcode and run it from there.
 ## Testing
 
 **Unit tests** (`yarn test:unit`, `src/__tests__/unit`) cover the
-`WritableStream` and Mediabunny writing through it, in Node.
+`WritableStream` and Mediabunny writing through it, in Node. `yarn test:jvm`
+runs the JVM tests of the Android encoder rules (`EncoderRules.java`, under
+`android/src/test/java`) through the example app's Gradle. `yarn test:cpp`
+builds the host tests of the Android C++ helpers that need no NDK
+(`android/src/test/cpp/*_test.cpp`) with clang, under AddressSanitizer and
+UndefinedBehaviorSanitizer, and runs them.
 
 **End-to-end tests** (`src/__tests__/WebCodecs.spec.ts`) run on a simulator
 or emulator with the example app, and check the files with ffprobe and
@@ -49,6 +54,14 @@ ffmpeg on the host:
    on its Tests screen.
 2. Launch the app on a simulator or emulator.
 3. At the repository root, run `yarn test`.
+
+To share the machine with other projects, start Metro on another port
+(`yarn start --port 8102`) and give Metro and `yarn test` the same
+`E2E_PORT` (for example `E2E_PORT=4300`, with Metro's `--reset-cache`).
+The app reaches the test server on `localhost`, through `adb reverse` on
+Android; where that does not work, start Metro with
+`E2E_ANDROID_HOST=10.0.2.2` (the emulator's address for this machine). With
+several Android devices attached, set `ANDROID_SERIAL` for `yarn test`.
 
 They cover:
 

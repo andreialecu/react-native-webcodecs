@@ -3,8 +3,26 @@ import { AppState, Text, View } from "react-native";
 // Installs navigator.gpu.
 import "react-native-webgpu";
 
+import { supportedCodecs } from "./Compress/codecs";
+import { compress, openSource } from "./Compress/compress";
+import * as settings from "./Compress/settings";
 import { serve } from "./serve";
 import { useClient } from "./useClient";
+import { loadCardAssets, loadSound, makeCard } from "./VideoExport/lottieCard";
+import { exportVideo } from "./VideoExport/export";
+
+// The example's own code, for the e2e tests of its screens: they run what
+// the app runs, not copies of it.
+const example = {
+  exportVideo,
+  loadCardAssets,
+  makeCard,
+  loadSound,
+  openSource,
+  compress,
+  supportedCodecs,
+  settings,
+};
 
 // The app's side of the e2e tests (src/__tests__): the
 // host sends functions as source, run here with a WebGPU device and the
@@ -64,6 +82,7 @@ export const Tests = () => {
               mediabunny: require("mediabunny"),
               webcodecs: require("react-native-webcodecs"),
               AppState,
+              example,
               ...params.ctx,
             },
           }),

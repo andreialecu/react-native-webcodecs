@@ -30,20 +30,31 @@ public:
     if (width <= 0 || height <= 0) {
       throw domError("TypeError", "invalid size");
     }
-    return std::make_shared<HybridNativeSurfacePool>(
-        static_cast<uint32_t>(width), static_cast<uint32_t>(height),
-        format == "RGBA16F" ? AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT : AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM);
+    uint32_t w = static_cast<uint32_t>(width);
+    uint32_t h = static_cast<uint32_t>(height);
+    uint32_t native = format == "RGBA16F" ? AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT : AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+    // Half floats are read on the CPU (HDR, to P010): some GPUs cannot make
+    // such buffers. Said here, not at the first frame.
+    if (native == AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT && !poolFormatSupported(w, h, native)) {
+      throw domError("NotSupportedError", "this device cannot make RGBA16F surfaces the CPU can read");
+    }
+    return std::make_shared<HybridNativeSurfacePool>(w, h, native);
   }
 
   bool isVideoEncoderConfigSupported(const NativeVideoEncoderConfig& config) override {
     if (config.width <= 0 || config.height <= 0 || !videoEncodingAvailable()) {
       return false;
     }
-    // MediaCodecList: an encoder that takes this size, frame rate, bitrate
-    // and profile, from a surface (8-bit) or P010 buffers (Main 10, which
-    // HDR export uses), as the encoder will be created.
+    // MediaCodecList: an encoder that takes this size and profile, from a
+    // surface (8-bit) or P010 buffers (Main 10, which HDR export uses), as
+    // the encoder will be created. The frame rate and bitrate are hints.
     if (config.codec == "avc" || config.codec == "av1") {
       bool tenBit = config.profile.value_or("") == "main10";
+      // Main 10 is fed from an RGBA16F pool, read on the CPU.
+      if (tenBit && !poolFormatSupported(static_cast<uint32_t>(config.width), static_cast<uint32_t>(config.height),
+                                         AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT)) {
+        return false;
+      }
       return findVideoEncoder(config, tenBit).has_value();
     }
     return false;
@@ -107,6 +118,7 @@ public:
 
   std::string writeFile(const std::string& path, const std::shared_ptr<ArrayBuffer>& data) override {
     std::string resolved = resolveFilePath(path);
+    makeParentDirectories(resolved);
     int fd = ::open(resolved.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) {
       throw domError("NotFoundError", "cannot write " + resolved + " (" + std::to_string(errno) + ")");

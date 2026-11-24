@@ -18,7 +18,7 @@ public extension NativeVideoEncoderConfig {
   /**
    * Create a new instance of `NativeVideoEncoderConfig`.
    */
-  init(codec: String, width: Double, height: Double, bitrate: Double?, framerate: Double?, realtime: Bool, profile: String?) {
+  init(codec: String, width: Double, height: Double, bitrate: Double?, framerate: Double?, realtime: Bool, profile: String?, level: Double?) {
     self.init(std.string(codec), width, height, { () -> bridge.std__optional_double_ in
       if let __unwrappedValue = bitrate {
         return bridge.create_std__optional_double_(__unwrappedValue)
@@ -34,6 +34,12 @@ public extension NativeVideoEncoderConfig {
     }(), realtime, { () -> bridge.std__optional_std__string_ in
       if let __unwrappedValue = profile {
         return bridge.create_std__optional_std__string_(std.string(__unwrappedValue))
+      } else {
+        return .init()
+      }
+    }(), { () -> bridge.std__optional_double_ in
+      if let __unwrappedValue = level {
+        return bridge.create_std__optional_double_(__unwrappedValue)
       } else {
         return .init()
       }
@@ -90,6 +96,18 @@ public extension NativeVideoEncoderConfig {
       if bridge.has_value_std__optional_std__string_(self.__profile) {
         let __unwrapped = bridge.get_std__optional_std__string_(self.__profile)
         return String(__unwrapped)
+      } else {
+        return nil
+      }
+    }()
+  }
+  
+  @inline(__always)
+  var level: Double? {
+    return { () -> Double? in
+      if bridge.has_value_std__optional_double_(self.__level) {
+        let __unwrapped = bridge.get_std__optional_double_(self.__level)
+        return __unwrapped
       } else {
         return nil
       }

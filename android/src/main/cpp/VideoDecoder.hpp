@@ -12,6 +12,7 @@
 
 #include "HybridNativeVideoDecoderSpec.hpp"
 #include "NativeDecodedFrame.hpp"
+#include "Capabilities.hpp"
 #include "NativeVideoDecoderConfig.hpp"
 #include "Surface.hpp"
 #include "VideoEncoder.hpp"
@@ -66,15 +67,18 @@ public:
     ANativeWindow* window = nullptr;
     AImageReader_getWindow(_reader, &window);
 
-    _codec = AMediaCodec_createDecoderByType(mime.c_str());
-    if (!_codec) {
-      _readerOwner.reset();
-      throw domError("NotSupportedError", "no decoder for " + config.codec);
-    }
     AMediaFormat* format = AMediaFormat_new();
     AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime.c_str());
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height);
+    // Room for a key frame of the size (Media3's: 3/4 of a byte per pixel
+    // of the 16-aligned picture); Codec2 takes the larger of this and its
+    // own, others may default to less.
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, maxInputSize(width, height));
+    // No picture dropped by the surface when the reader is behind (the
+    // default from Android 10). Our drain renders one picture at a time
+    // and waits for it, so none should be; older releases ignore the key.
+    AMediaFormat_setInt32(format, "allow-frame-drop", 0);
     auto csd = [](const std::vector<uint8_t>& unit) {
       std::vector<uint8_t> out = {0, 0, 0, 1};
       out.insert(out.end(), unit.begin(), unit.end());
@@ -84,17 +88,56 @@ public:
     auto csd1 = csd(_sets.pps[0]);
     AMediaFormat_setBuffer(format, "csd-0", csd0.data(), csd0.size());
     AMediaFormat_setBuffer(format, "csd-1", csd1.data(), csd1.size());
-    status = AMediaCodec_configure(_codec, format, window, nullptr, 0);
-    AMediaFormat_delete(format);
-    if (status == AMEDIA_OK) {
-      status = AMediaCodec_start(_codec);
+
+    // The decoders to try, by name: those hardwareAcceleration prefers
+    // first, then the others, each in the platform's order. One that fails
+    // to configure or start (out of instances, a level it refuses) gives way
+    // to the next; with no list, the platform's choice.
+    std::vector<std::string> names;
+    std::string preference = config.hardwareAcceleration.value_or("");
+    try {
+      names = JCapabilities::findVideoDecoders(mime, width, height, preference);
+      if (!preference.empty()) {
+        for (auto& name : JCapabilities::findVideoDecoders(mime, width, height, "")) {
+          if (std::find(names.begin(), names.end(), name) == names.end()) {
+            names.push_back(name);
+          }
+        }
+      }
+    } catch (const std::exception& e) {
+      WC_ERR("video decoder: MediaCodecList failed (%s); using the platform's decoder", e.what());
+      names.clear();
     }
-    if (status != AMEDIA_OK) {
-      AMediaCodec_delete(_codec);
-      _codec = nullptr;
+    if (names.empty()) {
+      names.push_back("");
+    }
+    status = AMEDIA_ERROR_UNKNOWN;
+    std::string tried;
+    for (auto& name : names) {
+      AMediaCodec* codec = name.empty() ? AMediaCodec_createDecoderByType(mime.c_str()) : AMediaCodec_createCodecByName(name.c_str());
+      std::string label = name.empty() ? "the default decoder" : name;
+      tried += (tried.empty() ? "" : ", ") + label;
+      if (!codec) {
+        WC_ERR("video decoder: could not create %s", label.c_str());
+        continue;
+      }
+      status = AMediaCodec_configure(codec, format, window, nullptr, 0);
+      if (status == AMEDIA_OK) {
+        status = AMediaCodec_start(codec);
+      }
+      if (status == AMEDIA_OK) {
+        _codec = codec;
+        WC_LOG("video decoder: %s", label.c_str());
+        break;
+      }
+      WC_ERR("video decoder: %s failed to start (%d)", label.c_str(), status);
+      AMediaCodec_delete(codec);
+    }
+    AMediaFormat_delete(format);
+    if (!_codec) {
       _readerOwner.reset();
       _reader = nullptr;
-      throw domError("NotSupportedError", "MediaCodec decoder failed to start (" + std::to_string(status) + ")");
+      throw domError("NotSupportedError", "no decoder for " + config.codec + " started (" + std::to_string(status) + "; tried " + tried + ")");
     }
 
     startDrain();
@@ -145,6 +188,22 @@ public:
       return promise;
     }
     _input.post([this, promise] {
+      // Nothing since configure() or the last flush: nothing to wait for,
+      // and no end of stream (some decoders mishandle one as the first
+      // input) or codec flush.
+      if (_queuedSinceFlush == 0) {
+        if (_failed) {
+          std::string failure;
+          {
+            std::lock_guard<std::mutex> lock(_mutex);
+            failure = _failure;
+          }
+          promise->reject(std::make_exception_ptr(std::runtime_error(failure)));
+        } else {
+          promise->resolve();
+        }
+        return;
+      }
       if (!_failed) {
         queueInput(nullptr, 0, 0, kBufferFlagEndOfStream);
       }
@@ -159,6 +218,10 @@ public:
         if (_eos && (_delivered >= _rendered || now - _lastImage > std::chrono::seconds(1))) {
           ended = true;
           break;
+        }
+        if (_heldByJs) {
+          // Not stuck: waiting for JS to close a frame.
+          flushStart = now;
         }
         if (now - std::max(flushStart, _lastImage) > std::chrono::seconds(10)) {
           break;
@@ -191,6 +254,7 @@ public:
         _acquired = 0;
         _durations.clear();
       }
+      _queuedSinceFlush = 0;
       startDrain();
       promise->resolve();
     });
@@ -202,6 +266,11 @@ public:
   }
 
 private:
+  static int32_t maxInputSize(int32_t width, int32_t height) {
+    int64_t pixels = static_cast<int64_t>((width + 15) / 16) * ((height + 15) / 16) * 256;
+    return static_cast<int32_t>(std::min<int64_t>(pixels * 3 / 4, INT32_MAX));
+  }
+
   void startDrain() {
     {
       std::lock_guard<std::mutex> lock(_mutex);
@@ -220,6 +289,11 @@ private:
       if (index >= 0 || index != AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
         break;
       }
+      // Stalled by JS holding every picture: wait for it as long as it
+      // takes, as the drain does.
+      if (_heldByJs) {
+        tries = 0;
+      }
     }
     if (index < 0 || index == kErrorInsufficientResource || index == kErrorReclaimed) {
       fail(index == AMEDIACODEC_INFO_TRY_AGAIN_LATER
@@ -230,7 +304,9 @@ private:
     size_t capacity = 0;
     uint8_t* buffer = AMediaCodec_getInputBuffer(_codec, index, &capacity);
     if (!buffer || size > capacity) {
-      fail(errorMessage("EncodingError", "decoder-failed", "chunk larger than the input buffer"));
+      fail(errorMessage("EncodingError", "decoder-failed",
+                        "chunk larger than the input buffer (" + std::to_string(size) + " > " + std::to_string(capacity) +
+                            " bytes)"));
       return;
     }
     if (size > 0) {
@@ -239,6 +315,8 @@ private:
     media_status_t status = AMediaCodec_queueInputBuffer(_codec, index, 0, size, ts, flags);
     if (status != AMEDIA_OK) {
       fail(describeCodecStatus(status, "decoder", "decoder"));
+    } else if ((flags & kBufferFlagEndOfStream) == 0) {
+      _queuedSinceFlush++;
     }
   }
 
@@ -313,8 +391,16 @@ private:
   // On the drain thread.
   void waitAcquired() {
     auto start = std::chrono::steady_clock::now();
+    struct Held {
+      std::atomic<bool>& flag;
+      ~Held() {
+        flag = false;
+      }
+    } held{_heldByJs};
     while (draining() && !_failed) {
-      if (tryAcquire() == AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED) {
+      bool full = tryAcquire() == AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED;
+      _heldByJs = full;
+      if (full) {
         // JS holds every picture: wait for it to close one, as a web
         // decoder stalls until frames are closed.
         start = std::chrono::steady_clock::now();
@@ -352,13 +438,24 @@ private:
       return;
     }
     AImage_getTimestamp(image, &timestampNs);
+    // The picture's size: the buffer can be larger (c2.android's decoders
+    // pad the width to 128), the image is its crop.
+    int32_t visibleWidth = 0;
+    int32_t visibleHeight = 0;
+    AImage_getWidth(image, &visibleWidth);
+    AImage_getHeight(image, &visibleHeight);
     int64_t pts = (timestampNs + 500) / 1000;
     double duration = takeDuration(pts);
     // The image goes back to the reader (kept alive meanwhile) when the last
     // reference dies.
     auto owner = _readerOwner;
     auto ref = std::make_shared<HardwareBufferRef>(source, [owner, image](AHardwareBuffer*) { AImage_delete(image); });
-    _output(NativeDecodedFrame(std::make_shared<HybridNativeSurface>(ref), static_cast<double>(pts), duration));
+    // The format is the decoder's 4:2:0 layout: YCbCr_420_888 (NV12 here),
+    // YV12 (c2.android) or a vendor's private one, all "NV12" to JS. The
+    // picture is sampled through the buffer's own YCbCr conversion.
+    auto surface = std::make_shared<HybridNativeSurface>(ref, -1, static_cast<uint32_t>(std::max(visibleWidth, 0)),
+                                                         static_cast<uint32_t>(std::max(visibleHeight, 0)), "NV12");
+    _output(NativeDecodedFrame(surface, static_cast<double>(pts), duration));
     countDelivered();
   }
 
@@ -460,7 +557,11 @@ private:
   std::atomic<bool> _closed{false};
   std::atomic<bool> _reported{false};
   std::atomic<bool> _shutdown{false};
+  // The drain waits for JS to close a frame (every picture is taken).
+  std::atomic<bool> _heldByJs{false};
   std::thread _drain;
+  // Chunks queued since configure() or the last flush (the input thread's).
+  int64_t _queuedSinceFlush = 0;
 
   SerialQueue _input{"wc-vdec-input"};
   SerialQueue _deliver{"wc-vdec-out"};

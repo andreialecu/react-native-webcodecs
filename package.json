@@ -23,6 +23,8 @@
   "scripts": {
     "test": "NODE_OPTIONS='--experimental-require-module' jest -i",
     "test:unit": "jest -c jest.unit.config.js",
+    "test:cpp": "scripts/test-cpp.sh",
+    "test:jvm": "cd example/android && ./gradlew :react-native-webcodecs:testDebugUnitTest -PreactNativeArchitectures=arm64-v8a",
     "lint": "eslint . --ext .ts,.tsx --max-warnings 0 --cache --fix && yarn example lint",
     "tsc": "tsc --noEmit && yarn example tsc",
     "build": "bob build",

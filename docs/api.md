@@ -46,9 +46,15 @@ How each platform answers:
   prepares it to encode (which allocates what it needs), and closes it. Sizes
   above the codec's highest level are refused before that, since
   VideoToolbox would only fail at the first frame.
-- **Android** asks `MediaCodecList` for an encoder that takes the size,
-  frame rate, bitrate and profile, with the input the encoder will use (a
-  surface, or P010 buffers for Main 10, which HDR needs). The encoder that
+- **Android** asks `MediaCodecList` for an encoder that takes the size and
+  profile, with the input the encoder will use (a surface, or P010 buffers
+  for Main 10, which HDR needs), a hardware one before a software one. As in
+  Media3, sizes are read leniently (even sizes also aligned up to the encoder's
+  alignment, swapped, and 1920x1080 or 3840x2160 when the device's camera records
+  them), though an encoder that takes the size as it says, hardware or
+  software, comes before one only that reading lets through; the frame rate and bitrate are hints: the bitrate, or the
+  default of width × height × fps × 0.1, is clamped into the encoder's
+  range, and the frame rate is floored, and ignored below 1. The encoder that
   answered is the one `configure` creates. An H.264 profile no encoder lists
   is a preference rather than a requirement: the encoder's default is used,
   and the output's `description` says which. Android 10 (API 29) or later.
@@ -63,7 +69,7 @@ do.
 | :-- | :-- | :-- |
 | `VideoEncoder` | `configure`, `encode` (with `keyFrame`), `flush`, `reset`, `close`, `state`, `encodeQueueSize`, `dequeue` and `ondequeue`, `isConfigSupported`. Config: `codec`, `width`, `height`, `bitrate`, `framerate`, `latencyMode`. Output metadata: `decoderConfig` with `description` and `colorSpace`. | `hardwareAcceleration`, `bitrateMode`, `scalabilityMode` (SVC), `alpha`, `contentHint`, `displayWidth`/`displayHeight`; per-frame encode options other than `keyFrame`; Annex B output (`avc.format`/`hevc.format: "annexb"` is reported unsupported). |
 | `VideoDecoder` | `configure`, `decode`, `flush`, `reset`, `close`, `state`, `decodeQueueSize`, `dequeue`, `isConfigSupported`. Config: `codec`, `description`, `codedWidth`, `codedHeight`, `colorSpace`. | Streams without a `description` (Annex B), `hardwareAcceleration`, `optimizeForLatency`, `rotation`, `flip`, `displayAspectWidth`/`Height`. |
-| `AudioEncoder` | The same members as `VideoEncoder`. Config: `codec`, `sampleRate`, `numberOfChannels`, `bitrate`. | Codec-specific options (`aac.format`, Opus, FLAC). Android takes 1 or 2 channels. |
+| `AudioEncoder` | The same members as `VideoEncoder`. Config: `codec`, `sampleRate`, `numberOfChannels`, `bitrate`. | Codec-specific options (`aac.format`, Opus, FLAC). AAC-LC only, in 1 or 2 channels; iOS also only at the standard AAC sample rates (8 to 96 kHz). |
 | `AudioDecoder` | The same members as `VideoDecoder`. Output: `f32` interleaved. | Other output formats (convert with `AudioData.copyTo`). |
 | `VideoFrame` | From another `VideoFrame` or a native surface; `format`, `codedWidth`/`Height`, `codedRect`, `visibleRect`, `displayWidth`/`Height`, `timestamp`, `duration`, `colorSpace`, `clone`, `close`. | Frames from pixels in memory (`BufferSource`), `ImageBitmap`, a canvas or an image; `copyTo`, `allocationSize`, `metadata()`; cropping (`visibleRect` is the whole frame); `rotation` is always 0 and `flip` false. |
 | `AudioData` | From samples in memory; `u8`, `s16`, `s32`, `f32`, interleaved and planar; `copyTo` (with format conversion), `allocationSize`, `clone`, `close`. | `transfer`. |
@@ -77,17 +83,19 @@ do.
 | --- | --- |
 | `VideoFrame` | `new VideoFrame(surface, init)` from a pool surface or `{ handle }` (any native surface, such as a camera frame). `init.fence`: a React Native WebGPU `endAccess()` fence, or `{ handle, value }`. `pixelBuffer` and `nativeHandle` give the native buffer back. |
 | `VideoDecoder` | `outputFormat: "BGRA" \| "NV12"` in the config (iOS: both, default BGRA; Android: NV12). |
-| `createSurfacePool(width, height, format?)` | Recycled GPU surfaces to draw frames into: `"BGRA"` (default), `"NV12"`, or `"RGBA16F"` (half float, for HDR). |
+| `createSurfacePool(width, height, format?)` | Recycled GPU surfaces to draw frames into: `"BGRA"` (default), `"NV12"`, or `"RGBA16F"` (half float, for HDR). On Android, `"BGRA"` gives RGBA surfaces (the frames' `format` says `"RGBA"`), and `"NV12"` is not supported. |
 | `createFileWritable(path)` | `{ writable, path, remove() }`: a `WritableStream` for Mediabunny's `StreamTarget`, written natively at the positions it asks for. |
 | `fileSourceOptions(path)` | Options for Mediabunny's `CustomSource`, read natively. |
 | `withBackgroundTask(fn)` | Runs `fn` with the app kept alive in the background (an iOS background task). |
-| `writeFile`, `removeFile`, `resolvePath` | A relative path is in the app's cache directory; `file://` URLs are paths. |
+| `writeFile`, `removeFile`, `resolvePath` | A relative path is in the app's cache directory; `file://` URLs are paths. Writing creates the missing directories. |
 | `installWebCodecs()` | Installs the classes, `DOMException` and `WritableStream` on `globalThis` where missing. |
 
 ## Errors
 
 Errors are `DOMException`s with the WebCodecs names (`NotSupportedError`,
-`InvalidStateError`, `EncodingError`, `NotFoundError`, `DataError`), and a
+`InvalidStateError`, `EncodingError`, `NotFoundError`, `NotReadableError`,
+`DataError`, `AbortError` for a `flush()` that `reset()` or `close()` cut
+short), and a
 string `code` where there is more to say:
 
 - `interrupted`: the app went to the background while a codec was in use
@@ -98,10 +106,11 @@ string `code` where there is more to say:
 ## Backgrounding
 
 iOS takes the hardware codecs away from an app in the background
-(VideoToolbox then fails with `kVTInvalidSessionErr`). A codec in use when
-the app goes to the background therefore fails with `interrupted` right
-away, rather than on a later frame, unless a `withBackgroundTask()` is
-running. In that case, the app keeps running for as long as iOS grants, and
+(VideoToolbox then fails with `kVTInvalidSessionErr`). A configured video
+encoder or decoder therefore fails with `interrupted` as soon as the app
+goes to the background, rather than on a later frame, unless a
+`withBackgroundTask()` is running. Configure codecs when you need them,
+and close them when done. In that case, the app keeps running for as long as iOS grants, and
 the codecs keep going. Wrap `finalize()` in it so that an export the user
 leaves near the end still completes.
 

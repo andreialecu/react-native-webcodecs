@@ -6,7 +6,13 @@ import { Platform } from "react-native";
 // "adb reverse tcp:<port> tcp:<port>" (as the RN CLI does for Metro on 8081),
 // which covers the emulator and a physical device alike. Only a device that
 // cannot be reached over adb needs this machine's LAN IP here instead.
-const HOST = "localhost";
+// E2E_ANDROID_HOST (inlined like E2E_PORT) replaces it on Android when adb
+// reverse is not available: 10.0.2.2 is the emulator's address for this
+// machine.
+const HOST =
+  Platform.OS === "android" && process.env.E2E_ANDROID_HOST
+    ? process.env.E2E_ANDROID_HOST
+    : "localhost";
 // E2E_PORT is inlined at bundle time (transform-inline-environment-variables),
 // so CI can run the test server on another port than other projects sharing
 // the machine. Kept in sync with TEST_SERVER_PORT in the jest config, which

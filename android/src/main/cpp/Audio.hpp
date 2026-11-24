@@ -6,7 +6,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <initializer_list>
+#include <optional>
 
+#include "AudioRules.hpp"
 #include "Common.hpp"
 #include "HybridNativeAudioDecoderSpec.hpp"
 #include "HybridNativeAudioEncoderSpec.hpp"
@@ -25,20 +28,25 @@ public:
     stop();
   }
 
-  void start(AMediaFormat* format, bool encoder, const std::string& mime) {
+  // Starts the first of `names` that exists and takes `format`, else the
+  // platform's default for `mime`. Returns the codec's name ("" when the
+  // platform does not tell it).
+  std::string start(AMediaFormat* format, bool encoder, const std::string& mime,
+                    std::initializer_list<const char*> names = {}) {
+    for (const char* name : names) {
+      if ((_codec = AMediaCodec_createCodecByName(name)) && configureAndStart(format, encoder) == AMEDIA_OK) {
+        return name;
+      }
+    }
     _codec = encoder ? AMediaCodec_createEncoderByType(mime.c_str()) : AMediaCodec_createDecoderByType(mime.c_str());
     if (!_codec) {
       throw domError("NotSupportedError", "no MediaCodec for " + mime);
     }
-    media_status_t status = AMediaCodec_configure(_codec, format, nullptr, nullptr, encoder ? AMEDIACODEC_CONFIGURE_FLAG_ENCODE : 0);
-    if (status == AMEDIA_OK) {
-      status = AMediaCodec_start(_codec);
-    }
+    media_status_t status = configureAndStart(format, encoder);
     if (status != AMEDIA_OK) {
-      AMediaCodec_delete(_codec);
-      _codec = nullptr;
       throw domError("NotSupportedError", "MediaCodec " + mime + " failed to start (" + std::to_string(status) + ")");
     }
+    return codecName(_codec).value_or("");
   }
 
   void stop() {
@@ -93,8 +101,25 @@ public:
   }
 
 private:
+  // Configures and starts _codec; on failure, deletes it.
+  media_status_t configureAndStart(AMediaFormat* format, bool encoder) {
+    media_status_t status = AMediaCodec_configure(_codec, format, nullptr, nullptr, encoder ? AMEDIACODEC_CONFIGURE_FLAG_ENCODE : 0);
+    if (status == AMEDIA_OK) {
+      status = AMediaCodec_start(_codec);
+    }
+    if (status != AMEDIA_OK) {
+      AMediaCodec_delete(_codec);
+      _codec = nullptr;
+    }
+    return status;
+  }
+
   AMediaCodec* _codec = nullptr;
 };
+
+// flush() pads with kAacPaddingFrames frames of silence, enough to push out
+// the encoder's delay (aacEncoderDelay) and a partial last frame.
+constexpr int64_t kAacPaddingFrames = 3;
 
 // AAC-LC from f32 interleaved PCM.
 class HybridNativeAudioEncoder : public HybridNativeAudioEncoderSpec {
@@ -138,6 +163,10 @@ public:
         _codec.stop();
         start();
       }
+      if (!_firstPts.has_value()) {
+        _firstPts = ts;
+      }
+      _framesIn += static_cast<int64_t>(s16.size()) / _channels;
       const auto* bytes = reinterpret_cast<const uint8_t*>(s16.data());
       size_t size = s16.size() * sizeof(int16_t);
       // pts of a byte offset: offset / (2 * channels) / sampleRate seconds.
@@ -159,9 +188,23 @@ public:
       return promise;
     }
     _queue.post([this, promise] {
-      if (!_failed && !_ended) {
-        media_status_t status = _codec.feed(nullptr, 0, _lastPts, 0, 0, kBufferFlagEndOfStream,
-                                            [this](int64_t timeout) { return drain(timeout); });
+      // Nothing fed since start() (or since the last flush): nothing to
+      // output, so no padding and no end of stream; the codec stays as is.
+      if (!_failed && !_ended && _framesIn > 0) {
+        // What the encoder still holds (its delay, and the last partial
+        // frame) must come out before the end of stream: Codec2's AAC
+        // encoder flushes it at EOS, but MediaCodec then discards those
+        // late outputs. Silence pushes them out as ordinary frames; drain()
+        // keeps only the frames that carry input.
+        std::vector<int16_t> silence(static_cast<size_t>(kAacPaddingFrames) * 1024 * _channels, 0);
+        int64_t end = inputEndPts();
+        media_status_t status =
+            _codec.feed(reinterpret_cast<const uint8_t*>(silence.data()), silence.size() * sizeof(int16_t), end, 1000000,
+                        int64_t(2) * _channels * _sampleRate, 0, [this](int64_t timeout) { return drain(timeout); });
+        if (status == AMEDIA_OK) {
+          status = _codec.feed(nullptr, 0, end + kAacPaddingFrames * 1024 * 1000000LL / _sampleRate, 0, 0,
+                               kBufferFlagEndOfStream, [this](int64_t timeout) { return drain(timeout); });
+        }
         for (int i = 0; status == AMEDIA_OK && !_eos && i < 2000; i++) {
           status = drain(5000);
         }
@@ -193,18 +236,35 @@ private:
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_SAMPLE_RATE, _sampleRate);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_CHANNEL_COUNT, _channels);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_AAC_PROFILE, 2);  // LC
+    // The same, for encoders that read only "profile" (AACObjectLC). The
+    // literal: AMEDIAFORMAT_KEY_PROFILE is API 28, above our minimum (26).
+    AMediaFormat_setInt32(format, "profile", 2);
     double bitrate = _config.bitrate.value_or(0);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_BIT_RATE, bitrate > 0 ? static_cast<int32_t>(bitrate) : 128000);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, 64 * 1024);
+    std::string name;
     try {
-      _codec.start(format, true, "audio/mp4a-latm");
+      // FDK by name when there, whose delay is known; then the default.
+      name = _codec.start(format, true, "audio/mp4a-latm", {kAacEncoderNames[0], kAacEncoderNames[1]});
     } catch (...) {
       AMediaFormat_delete(format);
       throw;
     }
     AMediaFormat_delete(format);
+    _delay = aacEncoderDelay(name);
+    WC_LOG("audio encoder: %s (delay %lld)", name.empty() ? "?" : name.c_str(),
+           static_cast<long long>(_delay.value_or(-1)));
     _ended = false;
     _eos = false;
+    // A new stream: timed from its own first input.
+    _firstPts.reset();
+    _framesIn = 0;
+    _framesOut = 0;
+  }
+
+  // The end of the input fed since start(), in µs.
+  int64_t inputEndPts() const {
+    return _firstPts.value_or(0) + _framesIn * 1000000LL / _sampleRate;
   }
 
   void sync() {
@@ -237,16 +297,21 @@ private:
         const uint8_t* bytes = data + info.offset;
         if (info.flags & kBufferFlagCodecConfig) {
           _config_bytes.assign(bytes, bytes + info.size);
-        } else if (!_closed) {
+        } else if (!_closed && aacKeepFrame(_framesOut, _framesIn, _delay)) {
+          // (Past that, a frame holds only the silence flush() added.)
           std::optional<std::shared_ptr<ArrayBuffer>> description;
           if (!_config_bytes.empty() && _config_bytes != _sentDescription) {
             _sentDescription = _config_bytes;
             description = ArrayBuffer::copy(_config_bytes);
           }
           double duration = 1024.0 * 1e6 / _sampleRate;
-          _lastPts = info.presentationTimeUs;
-          _output(NativeEncodedChunk(ArrayBuffer::copy(bytes, info.size), static_cast<double>(info.presentationTimeUs),
-                                     duration, true, description));
+          // Timed by frame count from the first input, as on iOS: the
+          // codec's own timestamps follow the input buffers' boundaries
+          // and jump at the end of stream.
+          double pts = static_cast<double>(_firstPts.value_or(0)) +
+                       std::round(static_cast<double>(_framesOut) * 1024.0 * 1e6 / _sampleRate);
+          _framesOut++;
+          _output(NativeEncodedChunk(ArrayBuffer::copy(bytes, info.size), pts, duration, true, description));
         }
       }
       AMediaCodec_releaseOutputBuffer(_codec.get(), index, false);
@@ -280,7 +345,13 @@ private:
   AudioCodec _codec;
   std::vector<uint8_t> _config_bytes;
   std::vector<uint8_t> _sentDescription;
-  int64_t _lastPts = 0;
+  // Timing of the current stream: the first input's timestamp, the sample
+  // frames fed, and the AAC frames output.
+  std::optional<int64_t> _firstPts;
+  int64_t _framesIn = 0;
+  int64_t _framesOut = 0;
+  // The encoder's delay in sample frames, when known (FDK's).
+  std::optional<int64_t> _delay;
   bool _ended = false;
   bool _eos = false;
 
@@ -294,34 +365,21 @@ public:
                            std::function<void(const NativeDecodedAudio&)> output,
                            std::function<void(const std::string&)> error)
       : HybridObject(TAG), _output(std::move(output)), _error(std::move(error)) {
-    _sampleRate = static_cast<int32_t>(config.sampleRate);
-    _channels = static_cast<int32_t>(config.numberOfChannels);
-    std::string mime;
+    _sampleRate = _configSampleRate = static_cast<int32_t>(config.sampleRate);
+    _channels = _configChannels = static_cast<int32_t>(config.numberOfChannels);
     if (config.codec == "aac") {
-      mime = "audio/mp4a-latm";
+      _mime = "audio/mp4a-latm";
     } else if (config.codec == "mp3") {
-      mime = "audio/mpeg";
+      _mime = "audio/mpeg";
     } else {
       throw domError("NotSupportedError", "codec " + config.codec);
     }
-    AMediaFormat* format = AMediaFormat_new();
-    AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime.c_str());
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_SAMPLE_RATE, _sampleRate);
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_CHANNEL_COUNT, _channels);
-    if (config.codec == "aac") {
-      AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_IS_ADTS, 0);
-      if (config.description.has_value() && config.description.value()) {
-        auto& d = config.description.value();
-        AMediaFormat_setBuffer(format, "csd-0", d->data(), d->size());
-      }
+    // Copied: a new codec may be started on the worker thread (flush()).
+    if (_mime == "audio/mp4a-latm" && config.description.has_value() && config.description.value()) {
+      auto& d = config.description.value();
+      _csd.assign(d->data(), d->data() + d->size());
     }
-    try {
-      _codec.start(format, false, mime);
-    } catch (...) {
-      AMediaFormat_delete(format);
-      throw;
-    }
-    AMediaFormat_delete(format);
+    startCodec();
   }
 
   ~HybridNativeAudioDecoder() override {
@@ -347,6 +405,7 @@ public:
       }
       media_status_t status = _codec.feed(bytes.data(), bytes.size(), ts, 0, 0, 0, [this](int64_t t) { return drain(t); });
       if (status == AMEDIA_OK) {
+        _fedSinceFlush++;
         status = drain(0);
       }
       if (status != AMEDIA_OK) {
@@ -362,7 +421,8 @@ public:
       return promise;
     }
     _queue.post([this, promise] {
-      if (!_failed) {
+      DecoderFlush action = decoderFlushAction(_fedSinceFlush, _formatSeen);
+      if (!_failed && action != DecoderFlush::Skip) {
         _eos = false;
         media_status_t status = _codec.feed(nullptr, 0, 0, 0, 0, kBufferFlagEndOfStream, [this](int64_t t) { return drain(t); });
         for (int i = 0; status == AMEDIA_OK && !_eos && i < 2000; i++) {
@@ -370,9 +430,18 @@ public:
         }
         if (status != AMEDIA_OK) {
           fail(describeCodecStatus(status, "decoder", "decoder"));
-        } else {
+        } else if (action == DecoderFlush::Flush) {
           AMediaCodec_flush(_codec.get());
+        } else {
+          WC_LOG("audio decoder: no output format before flush, starting a new codec");
+          _codec.stop();
+          try {
+            startCodec();
+          } catch (const std::exception& e) {
+            fail(e.what());
+          }
         }
+        _fedSinceFlush = 0;
       }
       if (_failed) {
         promise->reject(std::make_exception_ptr(std::runtime_error(_failure)));
@@ -390,6 +459,31 @@ public:
   }
 
 private:
+  // A codec for the config, timed and sized from it again.
+  void startCodec() {
+    AMediaFormat* format = AMediaFormat_new();
+    AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, _mime.c_str());
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_SAMPLE_RATE, _configSampleRate);
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_CHANNEL_COUNT, _configChannels);
+    if (_mime == "audio/mp4a-latm") {
+      AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_IS_ADTS, 0);
+      if (!_csd.empty()) {
+        AMediaFormat_setBuffer(format, "csd-0", _csd.data(), _csd.size());
+      }
+    }
+    try {
+      _codec.start(format, false, _mime);
+    } catch (...) {
+      AMediaFormat_delete(format);
+      throw;
+    }
+    AMediaFormat_delete(format);
+    _sampleRate = _configSampleRate;
+    _channels = _configChannels;
+    _fedSinceFlush = 0;
+    _formatSeen = false;
+  }
+
   media_status_t drain(int64_t timeoutUs) {
     while (true) {
       AMediaCodecBufferInfo info{};
@@ -401,6 +495,7 @@ private:
         continue;
       }
       if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+        _formatSeen = true;
         AMediaFormat* format = AMediaCodec_getOutputFormat(_codec.get());
         int32_t value = 0;
         if (AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_SAMPLE_RATE, &value) && value > 0) {
@@ -418,6 +513,9 @@ private:
       timeoutUs = 0;
       size_t capacity = 0;
       uint8_t* data = AMediaCodec_getOutputBuffer(_codec.get(), index, &capacity);
+      if (data && info.size > 0) {
+        _formatSeen = true;
+      }
       if (data && info.size > 0 && !_closed) {
         // s16 interleaved → f32 interleaved.
         size_t samples = info.size / sizeof(int16_t);
@@ -454,11 +552,21 @@ private:
   std::atomic<bool> _closed{false};
   std::string _failure;
 
-  // Worker thread only.
+  // The config, for a new codec.
+  std::string _mime;
+  int32_t _configSampleRate = 44100;
+  int32_t _configChannels = 2;
+  std::vector<uint8_t> _csd;
+
+  // Worker thread only (and the constructor).
   AudioCodec _codec;
   int32_t _sampleRate = 44100;
   int32_t _channels = 2;
   bool _eos = false;
+  // Inputs fed since the codec started or was last flushed, and whether it
+  // has given an output format (or output) since it started.
+  int64_t _fedSinceFlush = 0;
+  bool _formatSeen = false;
 
   SerialQueue _queue{"wc-adec"};
 };

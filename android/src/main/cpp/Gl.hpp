@@ -10,7 +10,10 @@
 #include <android/native_window.h>
 #include <unistd.h>
 
+#include <cstring>
+
 #include "Common.hpp"
+#include "Fence.hpp"
 
 namespace margelo::nitro::webcodecs {
 
@@ -31,32 +34,51 @@ public:
     if (_display == EGL_NO_DISPLAY || !eglInitialize(_display, nullptr, nullptr)) {
       throw std::runtime_error("eglInitialize failed");
     }
-    const EGLint attributes[] = {EGL_RED_SIZE,
-                                 8,
-                                 EGL_GREEN_SIZE,
-                                 8,
-                                 EGL_BLUE_SIZE,
-                                 8,
-                                 EGL_ALPHA_SIZE,
-                                 8,
-                                 EGL_RENDERABLE_TYPE,
-                                 EGL_OPENGL_ES3_BIT,
-                                 EGL_SURFACE_TYPE,
-                                 EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
-                                 EGL_RECORDABLE_ANDROID,
-                                 1,
-                                 EGL_NONE};
+    // A recordable window (the encoder's input surface) and a 1x1 pbuffer
+    // to be current on between windows. Some devices have no config that
+    // is both: then a window-only one, with no surface between windows
+    // (EGL_KHR_surfaceless_context).
     EGLint count = 0;
-    if (!eglChooseConfig(_display, attributes, &_config, 1, &count) || count == 0) {
-      throw std::runtime_error("eglChooseConfig failed");
+    for (EGLint surfaceType : {EGL_WINDOW_BIT | EGL_PBUFFER_BIT, EGL_WINDOW_BIT}) {
+      const EGLint attributes[] = {EGL_RED_SIZE,
+                                   8,
+                                   EGL_GREEN_SIZE,
+                                   8,
+                                   EGL_BLUE_SIZE,
+                                   8,
+                                   EGL_ALPHA_SIZE,
+                                   8,
+                                   EGL_RENDERABLE_TYPE,
+                                   EGL_OPENGL_ES3_BIT,
+                                   EGL_SURFACE_TYPE,
+                                   surfaceType,
+                                   EGL_RECORDABLE_ANDROID,
+                                   1,
+                                   EGL_NONE};
+      if (eglChooseConfig(_display, attributes, &_config, 1, &count) && count > 0) {
+        break;
+      }
+    }
+    if (count == 0) {
+      throw std::runtime_error("eglChooseConfig found no recordable ES 3 config (" + std::to_string(eglGetError()) + ")");
     }
     const EGLint contextAttributes[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
     _context = eglCreateContext(_display, _config, EGL_NO_CONTEXT, contextAttributes);
     if (_context == EGL_NO_CONTEXT) {
-      throw std::runtime_error("eglCreateContext failed");
+      throw std::runtime_error("eglCreateContext failed (" + std::to_string(eglGetError()) + ")");
     }
     const EGLint pbufferAttributes[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
     _pbuffer = eglCreatePbufferSurface(_display, _config, pbufferAttributes);
+    if (_pbuffer == EGL_NO_SURFACE) {
+      EGLint error = eglGetError();
+      const char* extensions = eglQueryString(_display, EGL_EXTENSIONS);
+      if (!extensions || !std::strstr(extensions, "EGL_KHR_surfaceless_context")) {
+        throw std::runtime_error("eglCreatePbufferSurface failed (" + std::to_string(error) +
+                                 "), and EGL has no surfaceless contexts");
+      }
+      // Current with no surface (makeCurrent(EGL_NO_SURFACE)) instead.
+      WC_LOG("eglCreatePbufferSurface failed (%d): surfaceless context", error);
+    }
     makeCurrent(_pbuffer);
     buildProgram();
   }
@@ -80,36 +102,58 @@ public:
 
   void makeCurrent(EGLSurface surface) {
     if (!eglMakeCurrent(_display, surface, surface, _context)) {
-      throw std::runtime_error("eglMakeCurrent failed");
+      throw std::runtime_error("eglMakeCurrent failed (" + std::to_string(eglGetError()) + ")");
     }
   }
 
-  // GPU-side wait on a sync_fd (taken over, closed either way).
+  // Waits for a frame's sync_fd (taken over, closed either way): on the CPU
+  // first, bounded, so that a fence that never signals (a hung GPU) fails
+  // the frame (throws) instead of blocking this thread in the driver; then
+  // on the GPU, where EGL takes the fence, for drivers that order our reads
+  // through it. That one can no longer block: the fence has signalled.
   void waitFence(int fd) {
     if (fd < 0) {
       return;
     }
+    FenceWait wait = waitSyncFd(fd, kFenceTimeoutMs);
+    if (wait != FenceWait::Signaled) {
+      ::close(fd);
+      throw std::runtime_error(describeFenceWait(wait, kFenceTimeoutMs));
+    }
     const EGLint attributes[] = {EGL_SYNC_NATIVE_FENCE_FD_ANDROID, fd, EGL_NONE};
     EGLSyncKHR sync = eglCreateSyncKHR(_display, EGL_SYNC_NATIVE_FENCE_ANDROID, attributes);
     if (sync == EGL_NO_SYNC_KHR) {
-      // Not taken over: wait on the CPU instead.
+      // Not taken over; the CPU wait above was enough.
       ::close(fd);
-      glFinish();
       return;
     }
-    eglWaitSyncKHR(_display, sync, 0);
+    if (eglWaitSyncKHR(_display, sync, 0) != EGL_TRUE) {
+      WC_LOG("eglWaitSyncKHR failed (%d) on a signalled fence", eglGetError());
+    }
     eglDestroySyncKHR(_display, sync);
   }
 
-  // Draws `source` over the whole of `target` (current: window surface).
-  void drawToWindow(EGLSurface target, AHardwareBuffer* source, int width, int height, int64_t presentationNs) {
+  // Draws the top-left `visibleWidth` x `visibleHeight` of `source` (its
+  // crop; 0: all of it) over the whole of `target` (current: window surface).
+  // `read`: called once `source` has been read, before the frame is sent
+  // (which can wait for the encoder to take an earlier one).
+  void drawToWindow(EGLSurface target, AHardwareBuffer* source, uint32_t visibleWidth, uint32_t visibleHeight, int width, int height,
+                    int64_t presentationNs, const std::function<void()>& read = nullptr) {
     makeCurrent(target);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    // Cleared first, though the quad covers it all: some drivers keep (and
+    // tile-based GPUs load) the window buffer's old contents otherwise, and
+    // the encoder can be given a stale or partly drawn picture (webrtc:5147).
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
     // Window: GL's first row is the bottom of the picture.
-    draw(source, width, height, true);
+    draw(source, visibleWidth, visibleHeight, width, height, true);
     eglPresentationTimeANDROID(_display, target, presentationNs);
     // Done reading `source` before it goes back to the pool.
     glFinish();
+    if (read) {
+      read();
+    }
     if (!eglSwapBuffers(_display, target)) {
       throw std::runtime_error("eglSwapBuffers failed (" + std::to_string(eglGetError()) + ")");
     }
@@ -133,6 +177,24 @@ public:
   }
 
 private:
+  struct CropUv {
+    float scale;
+    float max;
+  };
+
+  // The texture coordinates of the first `visible` of `size` texels. A
+  // cropped edge stops one texel short of the crop, as SurfaceTexture's
+  // transform does, so filtering (and 4:2:0 chroma, at half the size)
+  // reads none of the padding.
+  static CropUv cropUv(uint32_t visible, uint32_t size) {
+    if (visible == 0 || size == 0 || visible >= size) {
+      return {1.0f, 1.0f};
+    }
+    float scale = static_cast<float>(visible) / static_cast<float>(size);
+    float max = static_cast<float>(visible > 1 ? visible - 1 : visible) / static_cast<float>(size);
+    return {scale, max};
+  }
+
   EGLImageKHR createImage(AHardwareBuffer* buffer) {
     EGLClientBuffer client = eglGetNativeClientBufferANDROID(buffer);
     const EGLint attributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
@@ -143,7 +205,11 @@ private:
     return image;
   }
 
-  void draw(AHardwareBuffer* source, int width, int height, bool flipY) {
+  void draw(AHardwareBuffer* source, uint32_t visibleWidth, uint32_t visibleHeight, int width, int height, bool flipY) {
+    AHardwareBuffer_Desc desc{};
+    AHardwareBuffer_describe(source, &desc);
+    CropUv x = cropUv(visibleWidth, desc.width);
+    CropUv y = cropUv(visibleHeight, desc.height);
     EGLImageKHR image = createImage(source);
     GLuint texture = 0;
     glGenTextures(1, &texture);
@@ -161,6 +227,8 @@ private:
     glUseProgram(_program);
     glUniform1i(_samplerLocation, 0);
     glUniform1f(_flipLocation, flipY ? 1.0f : 0.0f);
+    glUniform2f(_scaleLocation, x.scale, y.scale);
+    glUniform2f(_maxLocation, x.max, y.max);
     glBindVertexArray(_vertexArray);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
@@ -189,21 +257,25 @@ private:
     const char* vertex = R"(#version 300 es
 in vec2 aPosition;
 uniform float uFlip;
+// The visible part of the buffer (its crop, at the top left).
+uniform vec2 uScale;
 out vec2 vUv;
 void main() {
   // Texture row 0 is the top of the picture.
   float v = uFlip > 0.5 ? (1.0 - aPosition.y) * 0.5 : (1.0 + aPosition.y) * 0.5;
-  vUv = vec2((aPosition.x + 1.0) * 0.5, v);
+  vUv = vec2((aPosition.x + 1.0) * 0.5, v) * uScale;
   gl_Position = vec4(aPosition, 0.0, 1.0);
 })";
     const char* fragment = R"(#version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
 precision mediump float;
 uniform samplerExternalOES uTexture;
+// Where sampling stops: short of the padding past a crop.
+uniform vec2 uMax;
 in vec2 vUv;
 out vec4 color;
 void main() {
-  color = texture(uTexture, vUv);
+  color = texture(uTexture, min(vUv, uMax));
 })";
     GLuint vs = compile(GL_VERTEX_SHADER, vertex);
     GLuint fs = compile(GL_FRAGMENT_SHADER, fragment);
@@ -221,6 +293,8 @@ void main() {
     }
     _samplerLocation = glGetUniformLocation(_program, "uTexture");
     _flipLocation = glGetUniformLocation(_program, "uFlip");
+    _scaleLocation = glGetUniformLocation(_program, "uScale");
+    _maxLocation = glGetUniformLocation(_program, "uMax");
 
     const GLfloat quad[] = {-1, -1, 1, -1, -1, 1, 1, 1};
     glGenVertexArrays(1, &_vertexArray);
@@ -242,6 +316,8 @@ void main() {
   GLuint _vertexBuffer = 0;
   GLint _samplerLocation = -1;
   GLint _flipLocation = -1;
+  GLint _scaleLocation = -1;
+  GLint _maxLocation = -1;
 };
 
 } // namespace margelo::nitro::webcodecs

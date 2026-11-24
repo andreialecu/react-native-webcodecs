@@ -19,6 +19,12 @@ struct HardwareBufferRef {
   HardwareBufferRef(AHardwareBuffer* buffer, std::function<void(AHardwareBuffer*)> recycle)
       : buffer(buffer), recycle(std::move(recycle)) {}
   HardwareBufferRef(const HardwareBufferRef&) = delete;
+  // Someone else's buffer (wrapSurface), only referenced here: its
+  // producer may reuse it whenever it likes. A pool's or a decoder's is
+  // not reused while referenced.
+  bool foreign() const {
+    return !recycle;
+  }
   HardwareBufferRef& operator=(const HardwareBufferRef&) = delete;
   ~HardwareBufferRef() {
     if (recycle) {
@@ -45,9 +51,16 @@ inline std::string formatName(uint32_t format) {
 
 class HybridNativeSurface : public HybridNativeSurfaceSpec {
 public:
-  explicit HybridNativeSurface(std::shared_ptr<HardwareBufferRef> ref, int fence = -1)
-      : HybridObject(TAG), _ref(std::move(ref)), _fence(fence) {
+  // `visibleWidth` x `visibleHeight`: the picture in the buffer's top left
+  // when the buffer is larger (a decoder's crop; 0: all of it).
+  // `formatFallback`: the format to report when the buffer's has no name
+  // here (a decoder's YV12 or vendor-private 4:2:0 layout is its "NV12").
+  explicit HybridNativeSurface(std::shared_ptr<HardwareBufferRef> ref, int fence = -1, uint32_t visibleWidth = 0,
+                               uint32_t visibleHeight = 0, std::string formatFallback = "")
+      : HybridObject(TAG), _ref(std::move(ref)), _formatFallback(std::move(formatFallback)), _fence(fence) {
     AHardwareBuffer_describe(_ref->buffer, &_desc);
+    _visibleWidth = visibleWidth > 0 && visibleWidth < _desc.width ? visibleWidth : _desc.width;
+    _visibleHeight = visibleHeight > 0 && visibleHeight < _desc.height ? visibleHeight : _desc.height;
   }
 
   ~HybridNativeSurface() override {
@@ -62,14 +75,16 @@ public:
   uint64_t getPixelBuffer() override {
     return getHandle();
   }
+  // The picture's size: the buffer may be larger (padding past the crop).
   double getWidth() override {
-    return _desc.width;
+    return _visibleWidth;
   }
   double getHeight() override {
-    return _desc.height;
+    return _visibleHeight;
   }
   std::string getFormat() override {
-    return formatName(_desc.format);
+    std::string name = formatName(_desc.format);
+    return name == "unknown" && !_formatFallback.empty() ? _formatFallback : name;
   }
 
   // `handle` is a sync_fd the surface now owns (react-native-webgpu's
@@ -83,7 +98,7 @@ public:
   }
 
   std::shared_ptr<HybridNativeSurfaceSpec> clone() override {
-    return std::make_shared<HybridNativeSurface>(ref(), dupFence());
+    return std::make_shared<HybridNativeSurface>(ref(), dupFence(), _visibleWidth, _visibleHeight, _formatFallback);
   }
 
   void release() override {
@@ -111,6 +126,13 @@ public:
     return ref()->buffer;
   }
 
+  uint32_t visibleWidth() const {
+    return _visibleWidth;
+  }
+  uint32_t visibleHeight() const {
+    return _visibleHeight;
+  }
+
   // A copy of the fence for a consumer to wait on and close (-1: none).
   int dupFence() {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -128,6 +150,9 @@ private:
   std::mutex _mutex;
   std::shared_ptr<HardwareBufferRef> _ref;
   AHardwareBuffer_Desc _desc{};
+  uint32_t _visibleWidth = 0;
+  uint32_t _visibleHeight = 0;
+  std::string _formatFallback;
   int _fence;
 };
 
@@ -197,6 +222,30 @@ private:
 
 inline constexpr uint64_t kSurfaceUsage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
 
+// The usage a pool's buffers of `format` are allocated with.
+inline uint64_t poolUsage(uint32_t format) {
+  return format == AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT ? kSurfaceUsage | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN : kSurfaceUsage;
+}
+
+// Whether this device can make `width` x `height` buffers of `format` for a
+// pool (half floats: ones the CPU can also read, as the HDR encoder does).
+// AHardwareBuffer_isSupported is API 29, above this library's minimum (26):
+// without it, the first acquire() is what tells.
+inline bool poolFormatSupported(uint32_t width, uint32_t height, uint32_t format) {
+  using IsSupported = int (*)(const AHardwareBuffer_Desc*);
+  static auto isSupported = reinterpret_cast<IsSupported>(dlsym(RTLD_DEFAULT, "AHardwareBuffer_isSupported"));
+  if (!isSupported) {
+    return true;
+  }
+  AHardwareBuffer_Desc desc{};
+  desc.width = width;
+  desc.height = height;
+  desc.layers = 1;
+  desc.format = format;
+  desc.usage = poolUsage(format);
+  return isSupported(&desc) == 1;
+}
+
 class HybridNativeSurfacePool : public HybridNativeSurfacePoolSpec {
 public:
   // RGBA 8-bit, or half floats (AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT)
@@ -204,10 +253,7 @@ public:
   // encoder reads on the CPU (it converts them to P010).
   HybridNativeSurfacePool(uint32_t width, uint32_t height, uint32_t format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM)
       : HybridObject(TAG),
-        _state(std::make_shared<SurfacePoolState>(
-            width, height, format,
-            format == AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT ? kSurfaceUsage | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN
-                                                                 : kSurfaceUsage)) {}
+        _state(std::make_shared<SurfacePoolState>(width, height, format, poolUsage(format))) {}
 
   double getWidth() override {
     return _state->width();

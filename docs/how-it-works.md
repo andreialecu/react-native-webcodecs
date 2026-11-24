@@ -29,10 +29,15 @@ Every holder (JavaScript's `VideoFrame`, the encoder, a clone) takes its own
 reference. A pool's surface returns to the pool once the last reference is
 gone, so a long export reuses a handful of surfaces instead of allocating
 one per frame. Pools come in three formats: `BGRA` (8 bits), `NV12` (YUV)
-and `RGBA16F` (half float, for HDR).
+and `RGBA16F` (half float, for HDR). Android has no `NV12` pools, and its
+8-bit ones are RGBA.
 
 `new VideoFrame({ handle }, init)` wraps any surface the app already has,
-such as a camera frame, by its handle.
+such as a camera frame, by its handle. The frame only references that
+surface, and its producer may write into it again. On Android, `encode()`
+returns once the frame has been read (after the frames queued before it),
+so the producer can reuse the buffer from then on; pool and decoder
+surfaces are not reused while a frame holds them, so they never wait.
 
 ## Fences
 
@@ -41,14 +46,17 @@ signals once the surface is drawn. The fence is waited on natively, where
 the surface is read:
 
 - **iOS**: an `MTLSharedEvent` and the value to wait for, which
-  react-native-webgpu's `endAccess()` returns. The encoder waits for the
-  event (with a one-second guard) before handing the surface to
-  VideoToolbox.
+  react-native-webgpu's `endAccess()` returns. The encoder's queue waits
+  for the event before handing the surface to VideoToolbox. After a second
+  it gives up and encodes the surface as it is, so a draw that is never
+  submitted shows up as a stall and a wrong frame, not an error.
 - **Android**: a sync file descriptor. The encoder turns it into an EGL sync
-  and waits on the GPU (`eglWaitSyncKHR`), so even the CPU does not block.
+  and waits on the GPU (`eglWaitSyncKHR`), then copies the surface into the
+  codec's input and waits for that copy on its own thread. HDR frames are
+  read on the CPU, after waiting for the fence there.
 
-This is why the export loop has no `await` for the GPU: drawing frame *n+1*
-overlaps with encoding frame *n*.
+Either way the JavaScript thread never waits for the GPU: drawing frame
+*n+1* overlaps with encoding frame *n*.
 
 ## Encoding
 
@@ -61,8 +69,16 @@ overlaps with encoding frame *n*.
 - **Android**: a `MediaCodec` encoder in surface-input mode. An EGL context
   samples each `AHardwareBuffer` as an external texture and draws it into
   the codec's input surface (one GPU copy per frame). `max-bframes` is 0.
-  When an encoder refuses a setting (operating rate, profile, frame rate),
-  `configure` retries without it, as Media3 does. Each codec runs on its own
+  H.264's profile is set with a level, as Media3 and Chromium do: the codec
+  string's level, raised to what the size and frame rate need and capped at
+  the encoder's highest; an encoder without the profile gets the next one
+  down it lists (High, Main, Baseline). When an encoder refuses a setting,
+  `configure` retries: first with a lower operating rate, then none and at
+  most 30 fps, keeping the profile; then the same again without the profile
+  and level, as Media3 does. When an encoder takes none of them (or does
+  not start), the next one that may take the config is tried, software
+  ones included; the error names each encoder and the status of each
+  attempt. Each codec runs on its own
   worker thread. HDR is different: the encoder runs in buffer mode, and each
   half-float surface is read on the CPU and converted to P010 (10-bit
   BT.2020 YCbCr) into an input buffer, as an EGL window has no 10-bit format
@@ -96,7 +112,12 @@ numbers.
 - **Android**: an H.264 `MediaCodec` decoder writing into an `AImageReader`. Each output
   image's `AHardwareBuffer` becomes the frame's surface, with no copy, and
   stays with the decoder until JavaScript closes the frame. The reader has
-  16 images, so a decoder stalls if JavaScript keeps all of them.
+  16 images, so a decoder stalls if JavaScript keeps all of them. The
+  frame's size is the image's crop, which can be smaller than the buffer
+  (padding on the right or bottom); the encoder samples only that part.
+  `hardwareAcceleration` picks the decoder: `"prefer-software"` a
+  software one, `"prefer-hardware"` another, falling back to the rest when
+  the preferred ones fail to start.
 
 A config needs a `description`. The output frames carry the config's
 `colorSpace` (BT.709 for what it leaves out).
@@ -143,7 +164,14 @@ moves the codec to `closed` and calls its `error` callback, as on the web.
 
 **Android encoding** copies each frame once on the GPU (EGL) into
 MediaCodec's input surface. `flush()` on Android's encoder ends the stream;
-encoding after it starts a new stream, from a key frame.
+encoding after it starts a new stream, from a key frame. Frame timestamps
+must grow: MediaCodec drops a frame whose timestamp does not move forward
+(it then counts as dropped, with no output).
+
+**AAC priming.** AAC encoders put about 1600 (Android) to 2112 (iOS)
+samples of silence ahead of the sound, and nothing in the output says so
+yet: the sound of an export starts that much (33 to 44 ms at 48 kHz) after
+the video.
 
 **Android decoding** stalls while JavaScript holds all 16 output frames, as
 a web decoder does until frames are closed.

@@ -37,6 +37,10 @@ jobs:
       - name: Unit tests
         run: yarn test:unit
 
+      # The Android C++ helpers that need no NDK, under ASan and UBSan.
+      - name: C++ host tests
+        run: yarn test:cpp
+
       - name: Build the package
         run: yarn build
 

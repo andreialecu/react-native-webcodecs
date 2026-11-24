@@ -7,22 +7,27 @@
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
 #include <poll.h>
+#include <sys/system_properties.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <future>
-#include <map>
 #include <optional>
 
 #include "Capabilities.hpp"
+#include "EncoderAttempts.hpp"
 #include "Gl.hpp"
 #include "HybridNativeVideoEncoderSpec.hpp"
 #include "NativeEncodedChunk.hpp"
 #include "NativeVideoEncoderConfig.hpp"
+#include "P010.hpp"
 #include "Surface.hpp"
+#include "Timestamps.hpp"
 
 namespace margelo::nitro::webcodecs {
 
@@ -43,6 +48,117 @@ inline bool isCodecError(ssize_t index) {
 
 // Frames in the encoder with no output for this long: it is stuck.
 constexpr auto kStallTimeout = std::chrono::seconds(20);
+
+// How long a key frame request waits for the frames before it to come out.
+constexpr auto kKeyFrameDrainTimeout = std::chrono::milliseconds(200);
+
+// After the end of stream is asked for, with every frame drawn out: this long
+// with no output is the end, for encoders that never say so.
+constexpr auto kEndOfStreamQuietTimeout = std::chrono::seconds(1);
+
+// How long shutdown() waits for the GL thread to stop the codec, before it
+// stops it from its own thread (then as long again).
+constexpr auto kShutdownTimeout = std::chrono::milliseconds(2000);
+
+// How long flush() waits for the frames drawn to come out before it ends the
+// stream (Media3 waits 100 ms).
+constexpr auto kEndOfStreamDrainTimeout = std::chrono::milliseconds(200);
+
+// How long encode() waits for a frame from a foreign buffer to be read
+// (see FrameRead): behind the frames queued before it, and its fence.
+constexpr auto kForeignReadTimeout = std::chrono::milliseconds(10000);
+
+// Set once a frame's buffer has been read (or never will be): when the GL
+// thread signals it, when the task's body exits without reading it (see
+// FrameReadGuard), or at the latest when the task holding it is destroyed
+// unrun. The waiter keeps only the future: the task holds the only
+// FrameRead, so its destructor does run when the task is gone.
+class FrameRead {
+public:
+  ~FrameRead() {
+    signal();
+  }
+  std::future<void> future() {
+    return _promise.get_future();
+  }
+  void signal() {
+    if (!_signaled.exchange(true)) {
+      _promise.set_value();
+    }
+  }
+
+private:
+  std::promise<void> _promise;
+  std::atomic<bool> _signaled{false};
+};
+
+// Signals a FrameRead when the scope exits, by any path: a frame that is
+// not drawn (the encoder has failed, the draw throws) is never read.
+class FrameReadGuard {
+public:
+  explicit FrameReadGuard(FrameRead* read) : _read(read) {}
+  ~FrameReadGuard() {
+    if (_read) {
+      _read->signal();
+    }
+  }
+  FrameReadGuard(const FrameReadGuard&) = delete;
+  FrameReadGuard& operator=(const FrameReadGuard&) = delete;
+
+private:
+  FrameRead* _read;
+};
+
+// Debug builds only: a fault the e2e tests make the encoder act out, from
+// `adb shell setprop debug.webcodecs.fault <value>`, read when a codec starts:
+//   venc-no-eos             the end of stream never comes out
+//   venc-stall-output:<s>   no output is taken, and <s> s without it is a stall
+//   venc-slow-stop:<ms>     stopping the codec takes <ms> ms longer
+//   venc-fence-hang         every frame's GPU fence is one that never signals
+//   venc-slow-draw:<ms>     each frame waits <ms> ms on the GL thread before
+//                           it is read (a busy encoder's backlog)
+// Release builds (NDEBUG) never read it.
+struct EncoderFault {
+  bool noEndOfStream = false;
+  int stallOutputSeconds = 0;
+  int slowStopMs = 0;
+  // The draw of this frame (1-based) fails on the GL thread.
+  int drawFailAt = 0;
+  // Each frame's fence is replaced by the read end of a pipe nothing is
+  // written to: a fence that never signals (a hung GPU).
+  bool fenceHang = false;
+  // Each frame waits this long on the GL thread before it is read.
+  int slowDrawMs = 0;
+
+  static EncoderFault read() {
+    EncoderFault fault;
+#ifndef NDEBUG
+    char value[PROP_VALUE_MAX] = {0};
+    __system_property_get("debug.webcodecs.fault", value);
+    const std::string text(value);
+    auto argument = [&](const std::string& name) {
+      return std::atoi(text.c_str() + name.size());
+    };
+    if (text == "venc-no-eos") {
+      fault.noEndOfStream = true;
+    } else if (text == "venc-fence-hang") {
+      fault.fenceHang = true;
+    } else if (text.rfind("venc-stall-output:", 0) == 0) {
+      fault.stallOutputSeconds = std::max(1, argument("venc-stall-output:"));
+    } else if (text.rfind("venc-slow-stop:", 0) == 0) {
+      fault.slowStopMs = std::max(0, argument("venc-slow-stop:"));
+    } else if (text.rfind("venc-slow-draw:", 0) == 0) {
+      fault.slowDrawMs = std::max(0, argument("venc-slow-draw:"));
+    } else if (text.rfind("venc-draw-fail:", 0) == 0) {
+      fault.drawFailAt = std::max(1, argument("venc-draw-fail:"));
+    }
+    if (!text.empty()) {
+      WC_LOG("video encoder: fault %s", value);
+    }
+#endif
+    return fault;
+  }
+};
 
 inline std::string describeCodecStatus(media_status_t status, const std::string& what, const std::string& prefix) {
   // The system takes a codec back from an app in the background when another
@@ -102,82 +218,28 @@ struct ColorAspects {
 
 constexpr int32_t kColorFormatYuvP010 = 0x36;
 
-// The encoder MediaCodecList says takes this config (size, frame rate,
-// bitrate, profile, and the input: a surface, or P010 buffers for 10-bit
-// HDR), the first in the platform's order; none when no encoder does.
+// The encoder MediaCodecList says takes this config (size, profile, and the
+// input: a surface, or P010 buffers for 10-bit HDR); none when no encoder
+// does. Encoders that take the size as they say come first (start()
+// configures the size asked for and falls back on no other encoder), then
+// those the lenient reading lets through; in each, a hardware one before a
+// software one (Capabilities.java). The frame rate and bitrate are hints, as
+// in Media3: start() clamps the bitrate into the range of the encoder it made.
 //
 // An H.264 profile is a preference, as configure() treats it: when no encoder
 // lists it (the emulator's software encoder has no High), any encoder that
 // takes the rest will do, in its default profile, which the avcC description
 // of the output says. AV1's Main 10 is required: HDR depends on it.
 inline std::optional<std::string> findVideoEncoder(const NativeVideoEncoderConfig& config, bool hdr) {
-  auto find = [&](int32_t profile) {
-    return JCapabilities::findVideoEncoder(videoMime(config.codec), static_cast<int>(config.width), static_cast<int>(config.height),
-                                           config.framerate.value_or(0), static_cast<int>(std::min(config.bitrate.value_or(0), 2e9)),
-                                           profile, hdr ? kColorFormatYuvP010 : kColorFormatSurface);
-  };
-  int32_t profile = mediaCodecProfile(config);
-  auto name = find(profile);
-  if (!name.has_value() && config.codec == "avc" && profile > 0) {
-    name = find(0);
-  }
-  return name;
+  return JCapabilities::findVideoEncoder(videoMime(config.codec), static_cast<int>(config.width), static_cast<int>(config.height),
+                                         mediaCodecProfile(config), config.codec == "avc", hdr ? kColorFormatYuvP010 : kColorFormatSurface);
 }
 
-// Waits on the CPU for a sync fd (taken over, closed either way).
-inline void waitFenceCpu(int fd) {
-  if (fd < 0) {
-    return;
-  }
-  pollfd p{fd, POLLIN, 0};
-  ::poll(&p, 1, 1000);
-  ::close(fd);
-}
-
-// One half float (IEEE 754 binary16) to a float.
-inline float halfToFloat(uint16_t h) {
-  __fp16 value;
-  std::memcpy(&value, &h, sizeof(value));
-  return static_cast<float>(value);
-}
-
-// Converts an RGBA half-float picture holding BT.2020 R'G'B' (already
-// encoded with the transfer function, 0 to 1) to P010: 10-bit BT.2020
-// non-constant-luminance YCbCr, limited range, 4:2:0, each sample in the top
-// 10 bits of 16, then Cb and Cr interleaved. `srcStride` is in half floats,
-// `dstStride` in bytes.
-inline void rgba16fToP010(const uint16_t* src, size_t srcStride, int width, int height, uint8_t* dst, size_t dstStride,
-                          size_t sliceHeight) {
-  auto code = [](float v, float offset, float range) {
-    float c = offset + range * v + 0.5f;
-    c = c < 0.0f ? 0.0f : (c > 1023.0f ? 1023.0f : c);
-    return static_cast<uint16_t>(static_cast<uint16_t>(c) << 6);
-  };
-  uint8_t* uv = dst + dstStride * sliceHeight;
-  std::vector<float> cb(width / 2);
-  std::vector<float> cr(width / 2);
-  for (int y = 0; y < height; y += 2) {
-    std::fill(cb.begin(), cb.end(), 0.0f);
-    std::fill(cr.begin(), cr.end(), 0.0f);
-    for (int dy = 0; dy < 2 && y + dy < height; dy++) {
-      const uint16_t* row = src + (y + dy) * srcStride;
-      auto* out = reinterpret_cast<uint16_t*>(dst + (y + dy) * dstStride);
-      for (int x = 0; x < width; x++) {
-        float r = halfToFloat(row[x * 4]);
-        float g = halfToFloat(row[x * 4 + 1]);
-        float b = halfToFloat(row[x * 4 + 2]);
-        float l = 0.2627f * r + 0.6780f * g + 0.0593f * b;
-        out[x] = code(l, 64.0f, 876.0f);
-        cb[x / 2] += (b - l) / 1.8814f;
-        cr[x / 2] += (r - l) / 1.4746f;
-      }
-    }
-    auto* out = reinterpret_cast<uint16_t*>(uv + (y / 2) * dstStride);
-    for (int i = 0; i < width / 2; i++) {
-      out[i * 2] = code(cb[i] / 4.0f, 512.0f, 896.0f);
-      out[i * 2 + 1] = code(cr[i] / 4.0f, 512.0f, 896.0f);
-    }
-  }
+// Every encoder that may take this config, best first (findVideoEncoder's
+// answer first): start() tries the next when one does not start.
+inline std::vector<std::string> findVideoEncoders(const NativeVideoEncoderConfig& config, bool hdr) {
+  return JCapabilities::findVideoEncoders(videoMime(config.codec), static_cast<int>(config.width), static_cast<int>(config.height),
+                                          mediaCodecProfile(config), config.codec == "avc", hdr ? kColorFormatYuvP010 : kColorFormatSurface);
 }
 
 // H.264, or AV1, through MediaCodec. Frames are copied (GPU, EGL) into the
@@ -207,7 +269,15 @@ public:
         start();
         started->set_value("");
       } catch (const std::exception& e) {
-        started->set_value(e.what());
+        std::string message = e.what();
+        // The destructor will not run: let go of the codec and the EGL
+        // context here, on the thread that made them.
+        try {
+          stop();
+          _blitter.destroy();
+        } catch (...) {
+        }
+        started->set_value(message);
       }
     });
     std::string message = result.get();
@@ -240,12 +310,19 @@ public:
     // Taken now: JS may close the frame right after encode().
     auto ref = native->ref();
     int fence = native->dupFence();
+    uint32_t visibleWidth = native->visibleWidth();
+    uint32_t visibleHeight = native->visibleHeight();
     int64_t ts = static_cast<int64_t>(timestamp);
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _durations[ts] = duration;
-    }
-    _gl.post([this, ref, fence, ts, keyFrame] {
+    // A foreign buffer (wrapSurface: a camera's, say) is only referenced:
+    // its producer may write the next picture into it once encode()
+    // returns. So encode() returns once it has been read. Pool and decoder
+    // buffers are not reused while the encoder holds them.
+    std::shared_ptr<FrameRead> read = ref->foreign() ? std::make_shared<FrameRead>() : nullptr;
+    // encode() keeps only the future; the task owns the FrameRead.
+    std::future<void> readDone = read ? read->future() : std::future<void>();
+    _gl.post([this, ref, fence, visibleWidth, visibleHeight, ts, duration, keyFrame, read = std::move(read)]() mutable {
+      // Signalled after the read, or on whatever path leaves it unread.
+      FrameReadGuard readGuard(read.get());
       if (_failed) {
         if (fence >= 0) {
           ::close(fence);
@@ -256,27 +333,83 @@ public:
         if (_ended) {
           // After flush() (end of stream), a new codec for what comes next.
           stop();
-          start();
+          try {
+            start();
+          } catch (...) {
+            if (fence >= 0) {
+              ::close(fence);
+            }
+            throw;
+          }
         }
         if (keyFrame && _framesIn > 0) {
+          // request-sync applies to the next frame the encoder takes, which
+          // may be one already drawn and still queued: first let every frame
+          // drawn come out. Bounded, for encoders that hold frames until
+          // more come (the request then is best effort, as before).
+          {
+            std::unique_lock<std::mutex> lock(_mutex);
+            bool drained = _cv.wait_for(lock, kKeyFrameDrainTimeout,
+                                        [this] { return _framesOut + _framesSkipped >= _framesIn || _failed; });
+            if (!drained) {
+              WC_LOG("video encoder: %lld frame(s) still in the encoder at a key frame request",
+                     static_cast<long long>(_framesIn - _framesOut - _framesSkipped));
+            }
+          }
           AMediaFormat* params = AMediaFormat_new();
           AMediaFormat_setInt32(params, "request-sync", 0);
           AMediaCodec_setParameters(_codec, params);
           AMediaFormat_delete(params);
         }
+        // Recorded in draw order for this codec; the codec gets a pts that
+        // moves forward (see Timestamps.hpp), the chunk the real one.
+        int64_t pts = 0;
+        {
+          std::lock_guard<std::mutex> lock(_mutex);
+          pts = _timestamps.push(ts, duration);
+        }
+        if (_fault.drawFailAt > 0 && _framesIn + 1 == _fault.drawFailAt) {
+          if (fence >= 0) {
+            ::close(fence);
+          }
+          throw std::runtime_error("fault: the draw failed");
+        }
+        if (_fault.fenceHang) {
+          int ends[2];
+          if (::pipe(ends) == 0) {
+            if (fence >= 0) {
+              ::close(fence);
+            }
+            fence = ends[0];
+            _faultPipes.push_back(ends[1]);
+          }
+        }
+        if (_fault.slowDrawMs > 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(_fault.slowDrawMs));
+        }
         if (_aspects.hdr()) {
-          waitFenceCpu(fence);
-          queueP010(ref->buffer, ts);
+          // Read on the CPU: a fence that does not signal in time fails the
+          // frame (throws) rather than letting it be read half written.
+          awaitFence(fence);
+          queueP010(ref->buffer, pts, read.get());
         } else {
           _blitter.waitFence(fence);
-          _blitter.drawToWindow(_window, ref->buffer, static_cast<int>(_config.width), static_cast<int>(_config.height),
-                                ts * 1000);
+          _blitter.drawToWindow(_window, ref->buffer, visibleWidth, visibleHeight, static_cast<int>(_config.width),
+                                static_cast<int>(_config.height), pts * 1000, [&read] {
+                                  if (read) {
+                                    read->signal();
+                                  }
+                                });
         }
         _framesIn++;
       } catch (const std::exception& e) {
         fail(errorMessage("EncodingError", "encoder-failed", e.what()));
       }
     });
+    if (readDone.valid() && readDone.wait_for(kForeignReadTimeout) != std::future_status::ready) {
+      throw domError("EncodingError", "the frame was not read within " + std::to_string(kForeignReadTimeout.count()) +
+                                          " ms; its buffer may be written over before it is");
+    }
   }
 
   std::shared_ptr<Promise<void>> flush() override {
@@ -294,6 +427,16 @@ public:
         promise->resolve();
         return;
       }
+      if (!_aspects.hdr()) {
+        // Some encoders lose the last frame when the end of stream follows
+        // it at once (b/301603935): a short encode would then come out with
+        // no frame. As Media3 does, first let what was drawn come out, for a
+        // bounded time (encoders that hold frames until more come or the
+        // stream ends wait it out).
+        std::unique_lock<std::mutex> lock(_mutex);
+        _cv.wait_for(lock, kEndOfStreamDrainTimeout,
+                     [this] { return _framesOut + _framesSkipped >= _framesIn || _failed || _closed; });
+      }
       // MediaCodec has no flush for a surface input: end the stream (the
       // next encode() starts a new one).
       media_status_t status = _aspects.hdr() ? queueEndOfStream() : AMediaCodec_signalEndOfInputStream(_codec);
@@ -302,13 +445,42 @@ public:
         promise->reject(std::make_exception_ptr(std::runtime_error(_failure)));
         return;
       }
+      // Done when the end of stream comes out. Some encoders never output
+      // it (b/365484741): every frame drawn having come out, and nothing
+      // more for a while, is the end too. Only an encoder that outputs
+      // nothing for kStallTimeout with frames still in it has timed out:
+      // a slow one still making progress has not.
+      const auto signalled = std::chrono::steady_clock::now();
+      bool quiet = false;
+      bool stalled = false;
       std::unique_lock<std::mutex> lock(_mutex);
-      bool done = _cv.wait_for(lock, std::chrono::seconds(10), [this] { return _eos || _failed; });
+      while (!_cv.wait_for(lock, std::chrono::milliseconds(250), [this] { return _eos || _failed || _closed; })) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto since = now - std::max(_lastOutputAt, signalled);
+        if (_framesOut + _framesSkipped >= _framesIn && since >= kEndOfStreamQuietTimeout) {
+          quiet = true;
+          break;
+        }
+        if (since > kStallTimeout) {
+          stalled = true;
+          break;
+        }
+      }
       lock.unlock();
+      if (quiet) {
+        // No end of stream to end the drain thread: stop the codec, so no
+        // output comes after the flush resolves. The next encode() starts a
+        // new one.
+        WC_LOG("video encoder: no end of stream after every frame came out; stopping the codec");
+        stop();
+        for (int64_t n = _framesIn - _framesOut; n > 0 && !_failed; n--) {
+          _output(NativeEncodedChunk(ArrayBuffer::allocate(0), 0, 0, false, std::nullopt));
+        }
+      }
       _ended = true;
       if (_failed) {
         promise->reject(std::make_exception_ptr(std::runtime_error(_failure)));
-      } else if (!done) {
+      } else if (stalled) {
         promise->reject(std::make_exception_ptr(std::runtime_error(errorMessage("EncodingError", "encoder-failed", "flush timed out"))));
       } else {
         promise->resolve();
@@ -342,17 +514,15 @@ public:
         }
         stop();
         _aspects = aspects;
-        _encoderName.reset();  // HDR takes P010 buffers: maybe another encoder
+        _candidates.reset();  // HDR takes P010 buffers: maybe other encoders
+        _firstAttempt = 0;
         start();
         restarted->set_value("");
       } catch (const std::exception& e) {
-        // No codec now (an encoder without Main 10 or P010): later frames
-        // are dropped, and the caller gets the error.
-        {
-          std::lock_guard<std::mutex> lock(_mutex);
-          _failure = errorMessage("NotSupportedError", "encoder-failed", e.what());
-          _failed = true;
-        }
+        // No codec now (an encoder without Main 10 or P010): the encoder
+        // has failed, and says so through the error callback too, so that
+        // JS closes it rather than queue frames that are dropped.
+        fail(errorMessage("NotSupportedError", "encoder-failed", e.what()));
         restarted->set_value(e.what());
       }
     });
@@ -362,47 +532,94 @@ public:
     }
   }
 
+  // Synchronous, as the decoder's: the codec is let go before close()
+  // returns, so that a configure() after it (a new native encoder) does not
+  // make a second codec while this one is still there (devices with few
+  // codec instances refuse it). Bounded: see shutdown().
   void close() override {
-    _closed = true;
-    _failed = true;
-    _gl.post([this] { stop(); });
+    shutdown();
   }
 
 private:
-  // The encoder MediaCodecList says takes the config, as isConfigSupported
-  // answered; the platform's default for the type when none says so.
-  AMediaCodec* createCodec() {
-    if (!_encoderName.has_value()) {
-      _encoderName = findVideoEncoder(_config, _aspects.hdr()).value_or("");
-    }
-    if (!_encoderName->empty()) {
-      if (AMediaCodec* codec = AMediaCodec_createCodecByName(_encoderName->c_str())) {
-        return codec;
+  // The encoders MediaCodecList says may take the config, best first
+  // (isConfigSupported's answer first), looked up once; "" (the platform's
+  // default for the type) when none says so.
+  const std::vector<std::string>& candidates() {
+    if (!_candidates.has_value()) {
+      _candidates = findVideoEncoders(_config, _aspects.hdr());
+      if (_candidates->empty()) {
+        _candidates->push_back("");
       }
     }
-    return AMediaCodec_createEncoderByType(videoMime(_config.codec).c_str());
+    return *_candidates;
   }
 
-  void start() {
-    _codec = createCodec();
+  // The encoder `name`, or the type's default for "".
+  AMediaCodec* createCodec(const std::string& name) {
+    if (name.empty()) {
+      return AMediaCodec_createEncoderByType(videoMime(_config.codec).c_str());
+    }
+    return AMediaCodec_createCodecByName(name.c_str());
+  }
+
+  // The codec's name ("" when unknown). AMediaCodec_getName is API 28,
+  // above this library's minimum (26).
+  static std::string codecName(AMediaCodec* codec) {
+    using GetName = media_status_t (*)(AMediaCodec*, char**);
+    using ReleaseName = void (*)(AMediaCodec*, char*);
+    static auto getName = reinterpret_cast<GetName>(dlsym(RTLD_DEFAULT, "AMediaCodec_getName"));
+    static auto releaseName = reinterpret_cast<ReleaseName>(dlsym(RTLD_DEFAULT, "AMediaCodec_releaseName"));
+    std::string result;
+    char* name = nullptr;
+    if (getName && releaseName && getName(codec, &name) == AMEDIA_OK && name) {
+      result = name;
+      releaseName(codec, name);
+    }
+    return result;
+  }
+
+  // Makes, configures and starts the encoder `name` ("" for the type's
+  // default), from the configure attempt `firstAttempt` on. False, with the
+  // codec let go and `failure` saying why (each attempt's status), when it
+  // does not start.
+  bool startEncoder(const std::string& name, size_t firstAttempt, std::string& failure) {
+    const std::string label = name.empty() ? "the " + _config.codec + " default" : name;
+    _codec = createCodec(name);
     if (!_codec) {
-      throw std::runtime_error("no encoder for " + _config.codec);
+      failure = label + ": could not be made";
+      return false;
     }
     int32_t width = static_cast<int32_t>(_config.width);
     int32_t height = static_cast<int32_t>(_config.height);
-    double framerate = _config.framerate.value_or(30);
-    if (framerate <= 0) {
+    // Hints: the frame rate floored, and below 1 the default; the bitrate
+    // (or the default one) clamped into the range of the encoder made.
+    double framerate = std::floor(_config.framerate.value_or(0));
+    if (!(framerate >= 1)) {
       framerate = 30;
     }
-    double bitrate = _config.bitrate.value_or(0);
-    if (bitrate <= 0) {
-      bitrate = width * height * framerate * 0.1;
+    std::string encoderName = codecName(_codec);
+    if (encoderName.empty()) {
+      encoderName = name;
     }
-    // From the most to the least demanding: each attempt drops a setting some
-    // encoders refuse at configure time (as #641's writer, after Media3 and
-    // react-native-skia-video). A codec a configure failed on is in an error
+    double bitrate = JCapabilities::videoBitrate(encoderName, videoMime(_config.codec), _config.bitrate.value_or(0), width, height,
+                                                 _config.framerate.value_or(0));
+    // H.264's profile goes with a level (OMX encoders refuse a profile
+    // alone): the next profile down when the encoder does not list the one
+    // asked for, and neither when it lists none that will do. AV1's profile
+    // is always set: without it the encoder makes 8-bit streams.
+    int32_t profile = mediaCodecProfile(_config);
+    int32_t level = 0;
+    if (_config.codec == "avc" && profile > 0) {
+      auto chosen = JCapabilities::avcProfileLevel(encoderName, videoMime(_config.codec), profile,
+                                                   static_cast<int>(_config.level.value_or(0)), width, height,
+                                                   _config.framerate.value_or(0));
+      profile = chosen.profile;
+      level = chosen.level;
+    }
+    // See videoEncoderAttempts. A codec a configure failed on is in an error
     // state: each attempt makes a new one.
-    auto configure = [&](int attempt) {
+    const auto attempts = videoEncoderAttempts(level > 0, _config.realtime);
+    auto configure = [&](const EncoderAttempt& attempt) {
       AMediaFormat* format = AMediaFormat_new();
       AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, videoMime(_config.codec).c_str());
       AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
@@ -412,7 +629,7 @@ private:
       // KEY_FRAME_RATE only budgets the bitrate (the timestamps time the
       // frames); some encoders refuse a high one even when they list it.
       AMediaFormat_setFloat(format, AMEDIAFORMAT_KEY_FRAME_RATE,
-                            static_cast<float>(attempt >= 2 ? std::min(framerate, 30.0) : framerate));
+                            static_cast<float>(attempt.capFrameRate ? std::min(framerate, 30.0) : framerate));
       // Key frames come from encode({ keyFrame: true }), as on the web.
       AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, 3600);
       // WebCodecs outputs chunks in decode order: no B-frames.
@@ -425,64 +642,60 @@ private:
         AMediaFormat_setInt32(format, "priority", 0);
       } else {
         // Best effort, as fast as the encoder goes: without an operating rate
-        // some encoders pace an offline export in real time. INT32_MAX throws
-        // on some chipsets (Media3's
-        // deviceNeedsLowerOperatingRateAvoidingOverflowWorkaround), which take
-        // 1000; the last attempt asks for none.
+        // some encoders pace an offline export in real time.
         AMediaFormat_setInt32(format, "priority", 1);
-        if (attempt == 0) {
-          AMediaFormat_setInt32(format, "operating-rate", INT32_MAX);
-        } else if (attempt == 1) {
-          AMediaFormat_setInt32(format, "operating-rate", 1000);
+        if (attempt.operatingRate != kOperatingRateNone) {
+          AMediaFormat_setInt32(format, "operating-rate", attempt.operatingRate);
         }
       }
       if (_config.codec == "av1") {
         // AV1ProfileMain8, or AV1ProfileMain10 (HDR: AV1ProfileMain10HDR10
-        // is for PQ with static metadata, which HLG does not use). Always
-        // set: without it the encoder makes 8-bit streams.
-        AMediaFormat_setInt32(format, "profile", mediaCodecProfile(_config));
-      } else if (attempt < 2 && _config.profile.has_value()) {
-        AMediaFormat_setInt32(format, "profile", mediaCodecProfile(_config));
+        // is for PQ with static metadata, which HLG does not use).
+        AMediaFormat_setInt32(format, "profile", profile);
+      } else if (attempt.profile && level > 0) {
+        AMediaFormat_setInt32(format, "profile", profile);
+        AMediaFormat_setInt32(format, "level", level);
       }
       media_status_t status = AMediaCodec_configure(_codec, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
       AMediaFormat_delete(format);
       return status;
     };
     media_status_t configured = AMEDIA_ERROR_UNKNOWN;
-    for (int attempt = 0; attempt < 3; attempt++) {
-      if (attempt > 0) {
+    std::string statuses;
+    size_t attempt = std::min(firstAttempt, attempts.size() - 1);
+    for (size_t first = attempt; attempt < attempts.size(); attempt++) {
+      if (attempt > first) {
         AMediaCodec_delete(_codec);
-        _codec = createCodec();
+        _codec = createCodec(name);
         if (!_codec) {
+          statuses += ", then could not be made again";
           break;
         }
       }
-      configured = configure(attempt);
+      configured = configure(attempts[attempt]);
       if (configured == AMEDIA_OK) {
         break;
       }
+      WC_LOG("video encoder: %s refused attempt %zu (%s): %d", encoderName.c_str(), attempt,
+             describeAttempt(attempts[attempt]).c_str(), configured);
+      statuses += (statuses.empty() ? "" : ", ") + describeMediaStatus(configured) + " (" + describeAttempt(attempts[attempt]) + ")";
     }
     if (configured != AMEDIA_OK) {
       if (_codec) {
         AMediaCodec_delete(_codec);
         _codec = nullptr;
       }
-      throw std::runtime_error("the " + _config.codec + " encoder does not take " + std::to_string(width) + "x" + std::to_string(height) +
-                               " at " + std::to_string(static_cast<int64_t>(bitrate)) + " bps (" +
-                               std::to_string(configured) + ")");
+      failure = (encoderName.empty() ? label : encoderName) + " at " + std::to_string(static_cast<int64_t>(bitrate)) +
+                " bps: configure " + statuses;
+      return false;
     }
+    _firstAttempt = attempt;
+    _codecLabel = encoderName.empty() ? label : encoderName;
     // Software codecs are Codec2's c2.android.* (and OMX.google.*).
-    // AMediaCodec_getName is API 28, above this library's minimum (26).
-    using GetName = media_status_t (*)(AMediaCodec*, char**);
-    using ReleaseName = void (*)(AMediaCodec*, char*);
-    static auto getName = reinterpret_cast<GetName>(dlsym(RTLD_DEFAULT, "AMediaCodec_getName"));
-    static auto releaseName = reinterpret_cast<ReleaseName>(dlsym(RTLD_DEFAULT, "AMediaCodec_releaseName"));
-    char* name = nullptr;
-    if (getName && releaseName && getName(_codec, &name) == AMEDIA_OK && name) {
-      std::string codecName(name);
-      _hardware = codecName.rfind("c2.android.", 0) != 0 && codecName.rfind("OMX.google.", 0) != 0;
-      WC_LOG("video encoder: %s", name);
-      releaseName(_codec, name);
+    if (!encoderName.empty()) {
+      _hardware = encoderName.rfind("c2.android.", 0) != 0 && encoderName.rfind("OMX.google.", 0) != 0;
+      WC_LOG("video encoder: %s, %dx%d at %lld bps, %g fps, profile %d level %d: attempt %zu (%s)", encoderName.c_str(), width, height,
+             static_cast<long long>(bitrate), framerate, profile, level, attempt, describeAttempt(attempts[attempt]).c_str());
     }
     media_status_t status = AMEDIA_OK;
     if (!_aspects.hdr()) {
@@ -491,19 +704,58 @@ private:
       if (status != AMEDIA_OK || !window) {
         AMediaCodec_delete(_codec);
         _codec = nullptr;
-        throw std::runtime_error("AMediaCodec_createInputSurface failed (" + std::to_string(status) + ")");
+        _firstAttempt = 0;
+        failure = encoderName + ": createInputSurface " + describeMediaStatus(status);
+        return false;
       }
       _nativeWindow = window;
-      _window = _blitter.createWindowSurface(window);
+      try {
+        _window = _blitter.createWindowSurface(window);
+      } catch (const std::exception& e) {
+        stopQuietly();
+        _firstAttempt = 0;
+        failure = encoderName + ": " + e.what();
+        return false;
+      }
     }
     status = AMediaCodec_start(_codec);
     if (status != AMEDIA_OK) {
-      throw std::runtime_error("AMediaCodec_start failed (" + std::to_string(status) + ")");
+      stopQuietly();
+      _firstAttempt = 0;
+      failure = encoderName + ": start " + describeMediaStatus(status);
+      return false;
+    }
+    return true;
+  }
+
+  // Makes and starts the codec: each candidate encoder in turn (software
+  // ones included), each through the configure attempts, until one starts.
+  // The encoder and attempt that did are tried first the next time (after a
+  // flush, on a new color space).
+  void start() {
+    _fault = EncoderFault::read();
+    const auto& names = candidates();
+    std::string failures;
+    bool started = false;
+    for (size_t c = 0; c < names.size() && !started; c++) {
+      std::string failure;
+      started = startEncoder(names[c], c == 0 ? _firstAttempt : 0, failure);
+      if (started && c > 0) {
+        std::rotate(_candidates->begin(), _candidates->begin() + static_cast<std::ptrdiff_t>(c), _candidates->begin() + static_cast<std::ptrdiff_t>(c) + 1);
+      }
+      if (!started) {
+        WC_LOG("video encoder: %s", failure.c_str());
+        failures += (failures.empty() ? "" : "; ") + failure;
+      }
+    }
+    if (!started) {
+      throw std::runtime_error("no " + _config.codec + " encoder took " + std::to_string(static_cast<int64_t>(_config.width)) + "x" +
+                               std::to_string(static_cast<int64_t>(_config.height)) + " (" + failures + ")");
     }
     if (_aspects.hdr()) {
       // The layout of the input buffers: rows `stride` bytes apart, the
       // chroma plane `slice-height` rows after the luma one.
-      _stride = static_cast<size_t>(_config.width) * 2;
+      int32_t stride = 0;
       _sliceHeight = static_cast<size_t>(_config.height);
       // API 28, above this library's minimum (26).
       using GetInputFormat = AMediaFormat* (*)(AMediaCodec*);
@@ -513,25 +765,36 @@ private:
       if (input) {
         int32_t value = 0;
         if (AMediaFormat_getInt32(input, "stride", &value) && value > 0) {
-          _stride = static_cast<size_t>(value);
+          stride = value;
         }
-        if (AMediaFormat_getInt32(input, "slice-height", &value) && value > 0) {
+        // Never fewer rows than the picture has, or its chroma would land on
+        // its luma.
+        if (AMediaFormat_getInt32(input, "slice-height", &value) && value >= static_cast<int32_t>(_config.height)) {
           _sliceHeight = static_cast<size_t>(value);
         }
         AMediaFormat_delete(input);
       }
-      // A stride in pixels (some codecs) rather than bytes.
-      if (_stride < static_cast<size_t>(_config.width) * 2) {
-        _stride *= 2;
-      }
+      _stride = p010Stride(static_cast<int>(_config.width), stride);
       WC_LOG("video encoder: P010 input, stride %zu, slice height %zu", _stride, _sliceHeight);
     }
     _framesIn = 0;
+    _framesOut = 0;
     _ended = false;
     {
       std::lock_guard<std::mutex> lock(_mutex);
       _eos = false;
       _draining = true;
+      _lastOutputAt = std::chrono::steady_clock::now();
+      _timestamps.clear();
+      _framesSkipped = 0;
+    }
+    {
+      // Surface input only: that is where the GL thread can block (in
+      // eglSwapBuffers). HDR takes buffers, with bounded waits that end on
+      // _failed, and its codec is not stopped under a P010 copy.
+      std::lock_guard<std::mutex> lock(_codecMutex);
+      _liveCodec = _aspects.hdr() ? nullptr : _codec;
+      _aborted = false;
     }
     _drain = std::thread([this, codec = _codec] { drainLoop(codec); });
   }
@@ -545,24 +808,64 @@ private:
     if (_drain.joinable()) {
       _drain.join();
     }
+    {
+      std::lock_guard<std::mutex> lock(_codecMutex);
+      _liveCodec = nullptr;
+    }
     if (_window != EGL_NO_SURFACE) {
       _blitter.destroySurface(_window);
       _window = EGL_NO_SURFACE;
     }
     if (_codec) {
+      if (_fault.slowStopMs > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(_fault.slowStopMs));
+      }
       AMediaCodec_stop(_codec);
       AMediaCodec_delete(_codec);
       _codec = nullptr;
+      WC_LOG("video encoder: released %s", _codecLabel.c_str());
     }
     if (_nativeWindow) {
       ANativeWindow_release(_nativeWindow);
       _nativeWindow = nullptr;
     }
+    for (int end : _faultPipes) {
+      ::close(end);
+    }
+    _faultPipes.clear();
+  }
+
+  // stop() on a failure path, where the first error is the one to report.
+  void stopQuietly() {
+    try {
+      stop();
+    } catch (...) {
+    }
+  }
+
+  // Stops the codec from another thread than the GL thread, once: its input
+  // surface is let go, so a draw blocked waiting for the codec to take a
+  // buffer (eglSwapBuffers in dequeueBuffer) returns, and the GL thread gets
+  // to what comes next. The GL thread's stop() still deletes it. Under
+  // _codecMutex, which the drain thread holds while it reads an output
+  // buffer: stopping the codec takes its buffers back.
+  void abortCodec() {
+    std::lock_guard<std::mutex> lock(_codecMutex);
+    if (!_liveCodec || _aborted) {
+      return;
+    }
+    _aborted = true;
+    WC_LOG("video encoder: stopping %s from another thread", _codecLabel.c_str());
+    AMediaCodec_stop(_liveCodec);
   }
 
   void shutdown() {
+    if (_shutdown.exchange(true)) {
+      return;
+    }
     _closed = true;
     _failed = true;
+    _cv.notify_all();
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
     _gl.post([this, done] {
@@ -570,7 +873,18 @@ private:
       _blitter.destroy();
       done->set_value();
     });
-    future.wait();
+    if (future.wait_for(kShutdownTimeout) == std::future_status::ready) {
+      return;
+    }
+    // The GL thread is stuck (in a draw into a codec that takes nothing):
+    // stopping the codec here lets it go on.
+    WC_LOG("video encoder: not stopped after %lld ms", static_cast<long long>(kShutdownTimeout.count()));
+    abortCodec();
+    if (future.wait_for(kShutdownTimeout) != std::future_status::ready) {
+      // Left to finish on the GL thread: the destructor's ~SerialQueue
+      // waits for it, as it must while the task uses this object.
+      WC_ERR("video encoder: the GL thread is still busy");
+    }
   }
 
   bool draining() {
@@ -582,6 +896,22 @@ private:
     pthread_setname_np(pthread_self(), "wc-venc-drain");
     auto lastOutput = std::chrono::steady_clock::now();
     while (draining()) {
+      if (_fault.stallOutputSeconds > 0) {
+        // Fault: the codec's output is never taken, as if it hung.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        bool waiting = false;
+        {
+          std::lock_guard<std::mutex> lock(_mutex);
+          waiting = !_timestamps.empty();
+        }
+        if (!waiting) {
+          lastOutput = std::chrono::steady_clock::now();
+        } else if (std::chrono::steady_clock::now() - lastOutput > std::chrono::seconds(_fault.stallOutputSeconds)) {
+          fail(errorMessage("EncodingError", "encoder-failed", "timed out waiting for the encoder"), true);
+          return;
+        }
+        continue;
+      }
       AMediaCodecBufferInfo info{};
       ssize_t index = AMediaCodec_dequeueOutputBuffer(codec, &info, 10000);
       if (index == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
@@ -589,12 +919,12 @@ private:
         bool waiting = false;
         {
           std::lock_guard<std::mutex> lock(_mutex);
-          waiting = !_durations.empty();
+          waiting = !_timestamps.empty();
         }
         if (!waiting) {
           lastOutput = std::chrono::steady_clock::now();
         } else if (std::chrono::steady_clock::now() - lastOutput > kStallTimeout) {
-          fail(errorMessage("EncodingError", "encoder-failed", "timed out waiting for the encoder"));
+          fail(errorMessage("EncodingError", "encoder-failed", "timed out waiting for the encoder"), true);
           return;
         }
         continue;
@@ -603,6 +933,10 @@ private:
         continue;
       }
       lastOutput = std::chrono::steady_clock::now();
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _lastOutputAt = lastOutput;
+      }
       if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
         AMediaFormat* format = AMediaCodec_getOutputFormat(codec);
         void* sps = nullptr;
@@ -620,7 +954,15 @@ private:
         continue;
       }
       if (isCodecError(index)) {
-        fail(describeCodecStatus(static_cast<media_status_t>(index), "encoder", "encoder"));
+        fail(describeCodecStatus(static_cast<media_status_t>(index), "encoder", "encoder"), true);
+        return;
+      }
+      // From the buffer to its release, the codec is not stopped from another
+      // thread (abortCodec), which would take the buffer back mid-copy. No
+      // fail() in here: abortCodec() takes this mutex.
+      std::unique_lock<std::mutex> codecLock(_codecMutex);
+      if (_aborted) {
+        // Stopped meanwhile: the index is no longer the codec's.
         return;
       }
       size_t capacity = 0;
@@ -639,7 +981,19 @@ private:
         }
       }
       AMediaCodec_releaseOutputBuffer(codec, index, false);
-      if (info.flags & kBufferFlagEndOfStream) {
+      codecLock.unlock();
+      if ((info.flags & kBufferFlagEndOfStream) && !_fault.noEndOfStream) {
+        // Frames the codec took and never output (dropped): an empty chunk
+        // each, as VideoToolbox reports a dropped frame, so JS stops
+        // counting them.
+        // (flush() waits on the GL thread meanwhile: _framesIn is still.)
+        for (int64_t n = _framesIn - _framesOut; n > 0 && !_failed; n--) {
+          _output(NativeEncodedChunk(ArrayBuffer::allocate(0), 0, 0, false, std::nullopt));
+        }
+        {
+          std::lock_guard<std::mutex> lock(_mutex);
+          _timestamps.clear();
+        }
         {
           std::lock_guard<std::mutex> lock(_mutex);
           _eos = true;
@@ -680,7 +1034,7 @@ private:
   }
 
   // HDR: a half-float surface, converted to P010 into an input buffer.
-  void queueP010(AHardwareBuffer* buffer, int64_t ptsUs) {
+  void queueP010(AHardwareBuffer* buffer, int64_t ptsUs, FrameRead* read = nullptr) {
     AHardwareBuffer_Desc desc{};
     AHardwareBuffer_describe(buffer, &desc);
     if (desc.format != AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT) {
@@ -694,17 +1048,32 @@ private:
     ssize_t index = dequeueInput();
     size_t capacity = 0;
     uint8_t* dst = AMediaCodec_getInputBuffer(_codec, static_cast<size_t>(index), &capacity);
-    size_t size = _stride * _sliceHeight * 3 / 2;
+    size_t size = p010Size(_stride, _sliceHeight);
     if (!dst || capacity < size) {
       throw std::runtime_error("the input buffer is too small for P010");
     }
+    // No fence (-1): the caller waited for the frame's fence to signal
+    // (awaitFence). Passing it would hand it to gralloc, whose wait on it can
+    // be unbounded.
     void* src = nullptr;
     int locked = AHardwareBuffer_lock(buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, &src);
     if (locked != 0 || !src) {
       throw std::runtime_error("AHardwareBuffer_lock failed (" + std::to_string(locked) + ")");
     }
-    rgba16fToP010(static_cast<const uint16_t*>(src), desc.stride * 4, width, height, dst, _stride, _sliceHeight);
-    AHardwareBuffer_unlock(buffer, nullptr);
+    {
+      // Unlocked whatever happens while it is read.
+      struct Unlock {
+        AHardwareBuffer* buffer;
+        ~Unlock() {
+          AHardwareBuffer_unlock(buffer, nullptr);
+        }
+      } unlock{buffer};
+      rgba16fToP010(static_cast<const uint16_t*>(src), desc.stride * 4, width, height, dst, _stride, _sliceHeight);
+    }
+    // Copied out and unlocked: its producer may have it back.
+    if (read) {
+      read->signal();
+    }
     media_status_t status = AMediaCodec_queueInputBuffer(_codec, static_cast<size_t>(index), 0, size, ptsUs, 0);
     if (status != AMEDIA_OK) {
       throw std::runtime_error("queueInputBuffer failed (" + std::to_string(status) + ")");
@@ -720,27 +1089,31 @@ private:
     }
   }
 
-  double takeDuration(int64_t ptsUs) {
+  // The real timestamp and duration of the frame an output is (the codec's
+  // pts when no frame is waiting).
+  PendingFrame takeFrame(int64_t ptsUs) {
     std::lock_guard<std::mutex> lock(_mutex);
-    auto it = _durations.find(ptsUs);
-    if (it == _durations.end()) {
-      return 0;
+    size_t skipped = 0;
+    auto frame = _timestamps.take(ptsUs, skipped);
+    _framesSkipped += static_cast<int64_t>(skipped);
+    if (!frame.has_value()) {
+      return {ptsUs, ptsUs, 0};
     }
-    double duration = it->second;
-    _durations.erase(_durations.begin(), std::next(it));
-    return duration;
+    return *frame;
   }
 
   // AV1 chunks are the OBUs as they come (low-overhead format, with sizes),
   // as WebCodecs has them. No description: the av1C record is optional, and
   // the sequence header is in the key frames.
   void emitAv1(const uint8_t* data, size_t size, int64_t ptsUs, bool key) {
-    double duration = takeDuration(ptsUs);
+    PendingFrame frame = takeFrame(ptsUs);
     if (_failed) {
       return;
     }
     std::vector<uint8_t> chunk(data, data + size);
-    _output(NativeEncodedChunk(ArrayBuffer::move(std::move(chunk)), static_cast<double>(ptsUs), duration, key, std::nullopt));
+    frameOut();
+    _output(NativeEncodedChunk(ArrayBuffer::move(std::move(chunk)), static_cast<double>(frame.realTs), frame.duration, key,
+                               std::nullopt));
   }
 
   void emit(const uint8_t* data, size_t size, int64_t ptsUs, bool key) {
@@ -762,7 +1135,7 @@ private:
       avcc.push_back(static_cast<uint8_t>(length));
       avcc.insert(avcc.end(), unit, unit + length);
     }
-    double duration = takeDuration(ptsUs);
+    PendingFrame frame = takeFrame(ptsUs);
     std::optional<std::shared_ptr<ArrayBuffer>> description;
     if (key) {
       auto record = makeAvcC(_sps, _pps);
@@ -774,10 +1147,24 @@ private:
     if (_failed) {
       return;
     }
-    _output(NativeEncodedChunk(ArrayBuffer::move(std::move(avcc)), static_cast<double>(ptsUs), duration, key, description));
+    frameOut();
+    _output(NativeEncodedChunk(ArrayBuffer::move(std::move(avcc)), static_cast<double>(frame.realTs), frame.duration, key, description));
   }
 
-  void fail(const std::string& message) {
+  // Counts an output, and wakes a key frame request waiting for it.
+  void frameOut() {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _framesOut++;
+    }
+    _cv.notify_all();
+  }
+
+  // stopCodec: from the drain thread (holding no output buffer), whose
+  // failure may leave the GL thread blocked drawing into the codec. Not from
+  // the GL thread, which is not blocked, while the drain thread may be
+  // copying from an output buffer.
+  void fail(const std::string& message, bool stopCodec = false) {
     bool expected = false;
     if (!_reported.compare_exchange_strong(expected, true)) {
       return;
@@ -788,6 +1175,11 @@ private:
       _failed = true;
     }
     _cv.notify_all();
+    // A failed codec takes nothing more: stop it now, so that the GL thread
+    // is not left blocked drawing into it.
+    if (stopCodec) {
+      abortCodec();
+    }
     if (!_closed) {
       _error(message);
     }
@@ -799,13 +1191,23 @@ private:
 
   std::mutex _mutex;
   std::condition_variable _cv;
-  std::map<int64_t, double> _durations;
+  // Frames drawn and not yet output, in draw order.
+  TimestampQueue _timestamps;
+  // Frames the codec dropped (found when a later one came out).
+  int64_t _framesSkipped = 0;
   bool _eos = false;
   bool _draining = false;
+  // When the codec last output anything (flush() reads it for progress).
+  std::chrono::steady_clock::time_point _lastOutputAt;
   std::string _failure;
   std::atomic<bool> _failed{false};
   std::atomic<bool> _closed{false};
   std::atomic<bool> _reported{false};
+  std::atomic<bool> _shutdown{false};
+  // The codec between start() and stop(), for abortCodec() from any thread.
+  std::mutex _codecMutex;
+  AMediaCodec* _liveCodec = nullptr;
+  bool _aborted = false;
 
   // GL thread only.
   AMediaCodec* _codec = nullptr;
@@ -813,14 +1215,25 @@ private:
   EGLSurface _window = EGL_NO_SURFACE;
   GlBlitter _blitter;
   ColorAspects _aspects;
-  // The encoder chosen for the config and color aspects (empty: the type's
-  // default), looked up once.
-  std::optional<std::string> _encoderName;
+  // The encoders that may take the config and color aspects, best first
+  // ("": the type's default), looked up once; the one that started first.
+  std::optional<std::vector<std::string>> _candidates;
+  // The configure attempt the encoder that started took.
+  size_t _firstAttempt = 0;
   size_t _stride = 0;
   size_t _sliceHeight = 0;
-  int64_t _framesIn = 0;
+  // Frames drawn into the current codec (GL thread), and output by it
+  // (drain thread).
+  std::atomic<int64_t> _framesIn{0};
+  std::atomic<int64_t> _framesOut{0};
   bool _ended = false;
   std::atomic<bool> _hardware{false};
+  // Set in start(), before the drain thread starts (which reads it).
+  EncoderFault _fault;
+  // venc-fence-hang: the write ends of the pipes standing in for fences.
+  std::vector<int> _faultPipes;
+  // The codec's name, for the log.
+  std::string _codecLabel;
   std::thread _drain;
 
   // Drain thread only.

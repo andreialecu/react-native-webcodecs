@@ -7,12 +7,14 @@ import type {
   NativeVideoEncoderConfig,
 } from "../specs/WebCodecs.nitro";
 
+import { avcCodedSize } from "./avc";
 import {
   cloneConfig,
   CodecBase,
   domError,
   native,
   nativeError,
+  nextMacrotask,
   rethrow,
   toArrayBuffer,
   toBytes,
@@ -175,7 +177,10 @@ export class VideoFrame {
    *   a decoder. The frame takes it over: close the frame, not the surface.
    * - `new VideoFrame({ handle }, init)`: any native surface handle, such as
    *   a react-native-webgpu NativeBuffer. The frame takes its own reference,
-   *   so the source can be released right after.
+   *   so the source can be released right after. On Android, encode()
+   *   returns once such a frame has been read, so its producer may then
+   *   write into the buffer again (encode() waits for the frames queued
+   *   before it).
    */
   constructor(
     source: VideoFrame | NativeSurface | NativeSurfaceSource,
@@ -422,9 +427,12 @@ const toNativeEncoderConfig = (
     return null;
   }
   let profile: string | undefined;
+  let level: number | undefined;
   if (codec === "avc") {
     const profileIdc = parseInt(config.codec.slice(5, 7), 16);
     profile = avcProfile(profileIdc);
+    const levelIdc = parseInt(config.codec.slice(9, 11), 16);
+    level = levelIdc > 0 ? levelIdc : undefined;
   } else if (codec === "av1") {
     // av01.<profile>.<level><tier>.<bit depth>: Main (profile 0), 8 or 10
     // bits.
@@ -449,6 +457,7 @@ const toNativeEncoderConfig = (
     framerate: config.framerate,
     realtime: config.latencyMode === "realtime",
     profile,
+    level,
   };
 };
 
@@ -519,7 +528,8 @@ export class VideoEncoder extends CodecBase {
       );
       return;
     }
-    this._encoder?.close();
+    // The frames the old encoder holds go with it.
+    this._replaceNative();
     this._config = config;
     this._nativeConfig = nativeConfig;
     this._colorSpace = { ...BT709 };
@@ -527,8 +537,8 @@ export class VideoEncoder extends CodecBase {
     try {
       this._encoder = native().createVideoEncoder(
         nativeConfig,
-        (chunk) => this._onChunk(chunk),
-        (message) => this._fail(nativeError(message)),
+        this._bind((chunk: NativeEncodedChunk) => this._onChunk(chunk)),
+        this._bind((message: string) => this._fail(nativeError(message))),
       );
     } catch (e) {
       this._fail(nativeError((e as Error).message));
@@ -543,6 +553,9 @@ export class VideoEncoder extends CodecBase {
     this._assertConfigured();
     if (!(frame instanceof VideoFrame)) {
       throw new TypeError("frame must be a VideoFrame");
+    }
+    if (!frame._surface) {
+      throw new TypeError("the VideoFrame is closed");
     }
     // The encoder takes its own reference (and the frame's fence), so the
     // caller may close the frame right away, as on the web.
@@ -570,27 +583,39 @@ export class VideoEncoder extends CodecBase {
     _stats.maxPending = Math.max(_stats.maxPending, this._pending);
   }
 
-  async flush() {
-    this._assertConfigured();
-    try {
+  flush() {
+    return this._flush(async () => {
+      const generation = this._generation;
       await this._encoder!.flush();
-    } catch (e) {
-      rethrow(e);
-    }
-    await this._waitPending();
+      await nextMacrotask();
+      if (generation !== this._generation) {
+        return;
+      }
+      // Every output the codec had came back before its flush resolved. A
+      // frame still counted is one it dropped without saying so (MediaCodec
+      // does for a timestamp that does not move forward): forget it, or
+      // the queue would stay blocked.
+      this._pending = this._queue;
+      this._drain(this._limit());
+    });
   }
 
   reset() {
-    this._encoder?.close();
-    this._encoder = null;
-    this._state = "unconfigured";
-    this._reset();
+    this._resetCodec();
   }
 
   close() {
-    this._encoder?.close();
-    this._encoder = null;
     this._close();
+  }
+
+  _releaseNative() {
+    const encoder = this._encoder;
+    this._encoder = null;
+    try {
+      encoder?.close();
+    } catch {
+      // Already closed natively.
+    }
   }
 
   _onChunk(chunk: NativeEncodedChunk) {
@@ -666,6 +691,10 @@ export interface VideoDecoderConfig {
   // importExternalTexture or copyExternalImageToTexture. By default, "BGRA"
   // on iOS and "NV12" on Android.
   outputFormat?: "BGRA" | "NV12";
+  // On Android, "prefer-software" decodes on a software decoder and
+  // "prefer-hardware" never does; iOS leaves the choice to VideoToolbox.
+  hardwareAcceleration?:
+    "no-preference" | "prefer-hardware" | "prefer-software";
   [key: string]: unknown;
 }
 
@@ -674,12 +703,23 @@ const toNativeDecoderConfig = (config: VideoDecoderConfig) => {
   if (!codec || !config.description) {
     return null;
   }
+  // Without a size, the SPS's: Android sizes the decoder's input buffers
+  // (and its pictures) from it.
+  const sized =
+    config.codedWidth !== undefined && config.codedHeight !== undefined;
+  const size =
+    !sized && codec === "avc" ? avcCodedSize(config.description) : undefined;
   return {
     codec,
     description: toArrayBuffer(config.description),
-    codedWidth: config.codedWidth,
-    codedHeight: config.codedHeight,
+    codedWidth: config.codedWidth ?? size?.width,
+    codedHeight: config.codedHeight ?? size?.height,
     pixelFormat: config.outputFormat,
+    hardwareAcceleration:
+      config.hardwareAcceleration === "prefer-software" ||
+      config.hardwareAcceleration === "prefer-hardware"
+        ? config.hardwareAcceleration
+        : undefined,
   };
 };
 
@@ -726,12 +766,17 @@ export class VideoDecoder extends CodecBase {
       );
       return;
     }
-    this._decoder?.close();
+    this._replaceNative();
     try {
       this._decoder = native().createVideoDecoder(
         nativeConfig,
-        (frame) => this._onFrame(frame),
-        (message) => this._fail(nativeError(message)),
+        // A frame of a decoder since reset or closed is not output, but
+        // goes back to its decoder.
+        this._bind(
+          (frame: NativeDecodedFrame) => this._onFrame(frame),
+          (frame) => frame.surface.release(),
+        ),
+        this._bind((message: string) => this._fail(nativeError(message))),
       );
     } catch (e) {
       this._fail(nativeError((e as Error).message));
@@ -762,29 +807,30 @@ export class VideoDecoder extends CodecBase {
     setTimeout(() => this._drain(), 0);
   }
 
-  async flush() {
-    this._assertConfigured();
-    try {
+  flush() {
+    return this._flush(async () => {
       await this._decoder!.flush();
-    } catch (e) {
-      rethrow(e);
-    }
-    // Frames come back through the JS thread's queue after the flush.
-    await new Promise<void>((resolve) => setTimeout(() => resolve(), 0));
-    this._key = false;
+      await nextMacrotask();
+      this._key = false;
+    });
   }
 
   reset() {
-    this._decoder?.close();
-    this._decoder = null;
-    this._state = "unconfigured";
-    this._reset();
+    this._resetCodec();
   }
 
   close() {
-    this._decoder?.close();
-    this._decoder = null;
     this._close();
+  }
+
+  _releaseNative() {
+    const decoder = this._decoder;
+    this._decoder = null;
+    try {
+      decoder?.close();
+    } catch {
+      // Already closed natively.
+    }
   }
 
   _onFrame(frame: NativeDecodedFrame) {
