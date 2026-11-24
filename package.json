@@ -1,6 +1,6 @@
 {
   "name": "react-native-webcodecs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "WebCodecs (VideoEncoder, VideoDecoder, AudioEncoder, AudioDecoder, VideoFrame, AudioData) for React Native on VideoToolbox, AudioToolbox and MediaCodec, for Mediabunny and react-native-webgpu",
   "main": "lib/commonjs/index",
   "module": "lib/module/index",
