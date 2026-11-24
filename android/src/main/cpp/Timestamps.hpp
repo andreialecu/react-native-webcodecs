@@ -10,8 +10,14 @@
 // when it does not increase, and each output gets back the real timestamp
 // and duration of its frame: the codec outputs frames in input order (no
 // B-frames), so the frame is the oldest one waiting, or a later one when the
-// codec dropped some. Timestamps are not respaced: rate control still sees
-// the real ones.
+// codec dropped some.
+//
+// Not done (issue #1 leaves this open): Chromium and WebRTC also respace the
+// timestamps evenly before the codec, because some rate control (WebRTC's
+// frame-rate bitrate adjuster for Exynos) assumes a fixed frame rate. Here
+// the codec still gets the real timestamps, nudged only when they do not
+// increase, so uneven input can still throw such rate control off. The
+// emulator's c2/goldfish encoders don't show it, so nothing here tests it.
 
 #include <cstddef>
 #include <cstdint>
