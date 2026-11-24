@@ -75,6 +75,10 @@ public:
     // of the 16-aligned picture); Codec2 takes the larger of this and its
     // own, others may default to less.
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, maxInputSize(width, height));
+    // No picture dropped by the surface when the reader is behind (the
+    // default from Android 10). Our drain renders one picture at a time
+    // and waits for it, so none should be; older releases ignore the key.
+    AMediaFormat_setInt32(format, "allow-frame-drop", 0);
     auto csd = [](const std::vector<uint8_t>& unit) {
       std::vector<uint8_t> out = {0, 0, 0, 1};
       out.insert(out.end(), unit.begin(), unit.end());
