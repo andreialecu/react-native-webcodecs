@@ -219,6 +219,10 @@ public:
           ended = true;
           break;
         }
+        if (_heldByJs) {
+          // Not stuck: waiting for JS to close a frame.
+          flushStart = now;
+        }
         if (now - std::max(flushStart, _lastImage) > std::chrono::seconds(10)) {
           break;
         }
@@ -284,6 +288,11 @@ private:
       index = AMediaCodec_dequeueInputBuffer(_codec, 10000);
       if (index >= 0 || index != AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
         break;
+      }
+      // Stalled by JS holding every picture: wait for it as long as it
+      // takes, as the drain does.
+      if (_heldByJs) {
+        tries = 0;
       }
     }
     if (index < 0 || index == kErrorInsufficientResource || index == kErrorReclaimed) {
@@ -382,8 +391,16 @@ private:
   // On the drain thread.
   void waitAcquired() {
     auto start = std::chrono::steady_clock::now();
+    struct Held {
+      std::atomic<bool>& flag;
+      ~Held() {
+        flag = false;
+      }
+    } held{_heldByJs};
     while (draining() && !_failed) {
-      if (tryAcquire() == AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED) {
+      bool full = tryAcquire() == AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED;
+      _heldByJs = full;
+      if (full) {
         // JS holds every picture: wait for it to close one, as a web
         // decoder stalls until frames are closed.
         start = std::chrono::steady_clock::now();
@@ -540,6 +557,8 @@ private:
   std::atomic<bool> _closed{false};
   std::atomic<bool> _reported{false};
   std::atomic<bool> _shutdown{false};
+  // The drain waits for JS to close a frame (every picture is taken).
+  std::atomic<bool> _heldByJs{false};
   std::thread _drain;
   // Chunks queued since configure() or the last flush (the input thread's).
   int64_t _queuedSinceFlush = 0;

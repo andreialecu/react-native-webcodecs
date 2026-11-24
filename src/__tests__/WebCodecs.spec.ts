@@ -1748,6 +1748,111 @@ describe("react-native-webcodecs + Mediabunny", () => {
     }
   }, 400000);
 
+  // JS holds every picture the decoder's ImageReader has for longer than
+  // the decoder's 5 s wait for a picture: the decoder must wait for JS
+  // rather than drop or lose any (a guard: our drain renders one picture
+  // at a time, so the surface has nothing to drop).
+  it("loses no frame while JS holds every decoded picture for 6 s", async () => {
+    if (!supported() || !probes()) {
+      return;
+    }
+    const file = await sourceClip(false);
+    const android = client.OS === "android";
+    if (android) {
+      logcatClear();
+    }
+    const result = await runOnDevice<any>(
+      ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+        const input = new mb.Input({
+          source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+          formats: mb.ALL_FORMATS,
+        });
+        return input.getPrimaryVideoTrack().then((track: any) =>
+          track.getDecoderConfig().then((config: any) => {
+            const errors: string[] = [];
+            const times: number[] = [];
+            let held: any[] | null = [];
+            let maxHeld = 0;
+            const decoder = new wc.VideoDecoder({
+              output: (frame: any) => {
+                times.push(frame.timestamp);
+                if (held) {
+                  held.push(frame);
+                  maxHeld = Math.max(maxHeld, held.length);
+                  if (held.length === 1) {
+                    setTimeout(() => {
+                      for (const f of held!) {
+                        f.close();
+                      }
+                      held = null;
+                    }, ctx.holdMs);
+                  }
+                } else {
+                  frame.close();
+                }
+              },
+              error: (e: any) => errors.push(String(e)),
+            });
+            decoder.configure(config);
+            const packets = new mb.EncodedPacketSink(track).packets();
+            const step = (): Promise<void> =>
+              packets.next().then((r: any) => {
+                if (r.done || decoder.state === "closed") {
+                  return undefined;
+                }
+                decoder.decode(r.value.toEncodedVideoChunk());
+                return step();
+              });
+            const t0 = Date.now();
+            return step()
+              .then(() =>
+                decoder.state === "closed" ? undefined : decoder.flush(),
+              )
+              .catch((e: any) => {
+                errors.push(`flush: ${e}`);
+              })
+              .then(() => {
+                if (decoder.state !== "closed") {
+                  decoder.close();
+                }
+                input.dispose();
+                return {
+                  errors,
+                  frames: times.length,
+                  unordered: times.filter((t, i) => i > 0 && t <= times[i - 1]!)
+                    .length,
+                  maxHeld,
+                  ms: Date.now() - t0,
+                };
+              });
+          }),
+        );
+      },
+      { file, holdMs: 12000 },
+      180000,
+    );
+    const lost = android
+      ? adb(["logcat", "-d"])
+          .toString()
+          .split("\n")
+          .filter((line) => /did not reach the ImageReader/.test(line))
+      : [];
+    console.log(`held: ${JSON.stringify({ result, lost })}`);
+    expect({
+      errors: result.errors,
+      frames: result.frames,
+      unordered: result.unordered,
+      lost,
+      waited: result.ms > 12000,
+    }).toEqual({
+      errors: [],
+      frames: 90,
+      unordered: 0,
+      lost: [],
+      waited: true,
+    });
+  }, 300000);
+
   // hardwareAcceleration picks the decoder: "prefer-software" a software
   // one (on the emulator c2.android.avc.decoder rather than goldfish's),
   // "prefer-hardware" none of those. iOS takes the preference as a hint.
