@@ -1274,6 +1274,25 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(second[0][0]).toBe(5e6);
   }, 60000);
 
+  // WebCodecs: flush() outputs what was encoded, so nothing when nothing was
+  // (no padding of silence), before the first encode() or right after
+  // another flush().
+  it("outputs no AAC from a flush with nothing encoded", async () => {
+    if (!supported()) {
+      return;
+    }
+    const [before, sound, after] = await encodeAac([
+      { start: 0, seconds: 0 },
+      { start: 0, seconds: 0.5 },
+      { start: 1e6, seconds: 0 },
+    ]);
+    expect(before).toEqual([]);
+    expect(sound.filter(([t]) => t < 0)).toEqual([]);
+    expect(sound.length).toBeGreaterThan(0);
+    expect(sound[0][0]).toBe(0);
+    expect(after).toEqual([]);
+  }, 60000);
+
   it("flushes a VideoEncoder given two frames with one timestamp", async () => {
     if (!supported()) {
       return;

@@ -170,7 +170,9 @@ public:
       return promise;
     }
     _queue.post([this, promise] {
-      if (!_failed && !_ended) {
+      // Nothing fed since start() (or since the last flush): nothing to
+      // output, so no padding and no end of stream; the codec stays as is.
+      if (!_failed && !_ended && _framesIn > 0) {
         // What the encoder still holds (its delay, and the last partial
         // frame) must come out before the end of stream: Codec2's AAC
         // encoder flushes it at EOS, but MediaCodec then discards those
