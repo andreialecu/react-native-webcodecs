@@ -1300,9 +1300,9 @@ describe("react-native-webcodecs + Mediabunny", () => {
             codec: "avc1.42001f",
             width,
             height,
-          }).then((support: any) => support.supported)
-        )
-      )
+          }).then((support: any) => support.supported),
+        ),
+      ),
     )) as any;
     expect(result).toEqual([false, false, true]);
   }, 60000);
