@@ -71,7 +71,10 @@ Either way the JavaScript thread never waits for the GPU: drawing frame
   down it lists (High, Main, Baseline). When an encoder refuses a setting,
   `configure` retries: first with a lower operating rate, then none and at
   most 30 fps, keeping the profile; then the same again without the profile
-  and level, as Media3 does. Each codec runs on its own
+  and level, as Media3 does. When an encoder takes none of them (or does
+  not start), the next one that may take the config is tried, software
+  ones included; the error names each encoder and the status of each
+  attempt. Each codec runs on its own
   worker thread. HDR is different: the encoder runs in buffer mode, and each
   half-float surface is read on the CPU and converted to P010 (10-bit
   BT.2020 YCbCr) into an input buffer, as an EGL window has no 10-bit format

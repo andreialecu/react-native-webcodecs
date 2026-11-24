@@ -121,6 +121,13 @@ inline std::optional<std::string> findVideoEncoder(const NativeVideoEncoderConfi
                                          mediaCodecProfile(config), config.codec == "avc", hdr ? kColorFormatYuvP010 : kColorFormatSurface);
 }
 
+// Every encoder that may take this config, best first (findVideoEncoder's
+// answer first): start() tries the next when one does not start.
+inline std::vector<std::string> findVideoEncoders(const NativeVideoEncoderConfig& config, bool hdr) {
+  return JCapabilities::findVideoEncoders(videoMime(config.codec), static_cast<int>(config.width), static_cast<int>(config.height),
+                                          mediaCodecProfile(config), config.codec == "avc", hdr ? kColorFormatYuvP010 : kColorFormatSurface);
+}
+
 // Waits on the CPU for a sync fd (taken over, closed either way).
 inline void waitFenceCpu(int fd) {
   if (fd < 0) {
@@ -356,7 +363,8 @@ public:
         }
         stop();
         _aspects = aspects;
-        _encoderName.reset();  // HDR takes P010 buffers: maybe another encoder
+        _candidates.reset();  // HDR takes P010 buffers: maybe other encoders
+        _firstAttempt = 0;
         start();
         restarted->set_value("");
       } catch (const std::exception& e) {
@@ -380,18 +388,25 @@ public:
   }
 
 private:
-  // The encoder MediaCodecList says takes the config, as isConfigSupported
-  // answered; the platform's default for the type when none says so.
-  AMediaCodec* createCodec() {
-    if (!_encoderName.has_value()) {
-      _encoderName = findVideoEncoder(_config, _aspects.hdr()).value_or("");
-    }
-    if (!_encoderName->empty()) {
-      if (AMediaCodec* codec = AMediaCodec_createCodecByName(_encoderName->c_str())) {
-        return codec;
+  // The encoders MediaCodecList says may take the config, best first
+  // (isConfigSupported's answer first), looked up once; "" (the platform's
+  // default for the type) when none says so.
+  const std::vector<std::string>& candidates() {
+    if (!_candidates.has_value()) {
+      _candidates = findVideoEncoders(_config, _aspects.hdr());
+      if (_candidates->empty()) {
+        _candidates->push_back("");
       }
     }
-    return AMediaCodec_createEncoderByType(videoMime(_config.codec).c_str());
+    return *_candidates;
+  }
+
+  // The encoder `name`, or the type's default for "".
+  AMediaCodec* createCodec(const std::string& name) {
+    if (name.empty()) {
+      return AMediaCodec_createEncoderByType(videoMime(_config.codec).c_str());
+    }
+    return AMediaCodec_createCodecByName(name.c_str());
   }
 
   // The codec's name ("" when unknown). AMediaCodec_getName is API 28,
@@ -410,10 +425,16 @@ private:
     return result;
   }
 
-  void start() {
-    _codec = createCodec();
+  // Makes, configures and starts the encoder `name` ("" for the type's
+  // default), from the configure attempt `firstAttempt` on. False, with the
+  // codec let go and `failure` saying why (each attempt's status), when it
+  // does not start.
+  bool startEncoder(const std::string& name, size_t firstAttempt, std::string& failure) {
+    const std::string label = name.empty() ? "the " + _config.codec + " default" : name;
+    _codec = createCodec(name);
     if (!_codec) {
-      throw std::runtime_error("no encoder for " + _config.codec);
+      failure = label + ": could not be made";
+      return false;
     }
     int32_t width = static_cast<int32_t>(_config.width);
     int32_t height = static_cast<int32_t>(_config.height);
@@ -424,6 +445,9 @@ private:
       framerate = 30;
     }
     std::string encoderName = codecName(_codec);
+    if (encoderName.empty()) {
+      encoderName = name;
+    }
     double bitrate = JCapabilities::videoBitrate(encoderName, videoMime(_config.codec), _config.bitrate.value_or(0), width, height,
                                                  _config.framerate.value_or(0));
     // H.264's profile goes with a level (OMX encoders refuse a profile
@@ -484,12 +508,14 @@ private:
       return status;
     };
     media_status_t configured = AMEDIA_ERROR_UNKNOWN;
-    size_t attempt = 0;
-    for (; attempt < attempts.size(); attempt++) {
-      if (attempt > 0) {
+    std::string statuses;
+    size_t attempt = std::min(firstAttempt, attempts.size() - 1);
+    for (size_t first = attempt; attempt < attempts.size(); attempt++) {
+      if (attempt > first) {
         AMediaCodec_delete(_codec);
-        _codec = createCodec();
+        _codec = createCodec(name);
         if (!_codec) {
+          statuses += ", then could not be made again";
           break;
         }
       }
@@ -499,16 +525,18 @@ private:
       }
       WC_LOG("video encoder: %s refused attempt %zu (%s): %d", encoderName.c_str(), attempt,
              describeAttempt(attempts[attempt]).c_str(), configured);
+      statuses += (statuses.empty() ? "" : ", ") + describeMediaStatus(configured) + " (" + describeAttempt(attempts[attempt]) + ")";
     }
     if (configured != AMEDIA_OK) {
       if (_codec) {
         AMediaCodec_delete(_codec);
         _codec = nullptr;
       }
-      throw std::runtime_error("the " + _config.codec + " encoder does not take " + std::to_string(width) + "x" + std::to_string(height) +
-                               " at " + std::to_string(static_cast<int64_t>(bitrate)) + " bps (" +
-                               std::to_string(configured) + ")");
+      failure = (encoderName.empty() ? label : encoderName) + " at " + std::to_string(static_cast<int64_t>(bitrate)) +
+                " bps: configure " + statuses;
+      return false;
     }
+    _firstAttempt = attempt;
     // Software codecs are Codec2's c2.android.* (and OMX.google.*).
     if (!encoderName.empty()) {
       _hardware = encoderName.rfind("c2.android.", 0) != 0 && encoderName.rfind("OMX.google.", 0) != 0;
@@ -522,20 +550,52 @@ private:
       if (status != AMEDIA_OK || !window) {
         AMediaCodec_delete(_codec);
         _codec = nullptr;
-        throw std::runtime_error("AMediaCodec_createInputSurface failed (" + std::to_string(status) + ")");
+        _firstAttempt = 0;
+        failure = encoderName + ": createInputSurface " + describeMediaStatus(status);
+        return false;
       }
       _nativeWindow = window;
       try {
         _window = _blitter.createWindowSurface(window);
-      } catch (...) {
+      } catch (const std::exception& e) {
         stopQuietly();
-        throw;
+        _firstAttempt = 0;
+        failure = encoderName + ": " + e.what();
+        return false;
       }
     }
     status = AMediaCodec_start(_codec);
     if (status != AMEDIA_OK) {
       stopQuietly();
-      throw std::runtime_error("AMediaCodec_start failed (" + std::to_string(status) + ")");
+      _firstAttempt = 0;
+      failure = encoderName + ": start " + describeMediaStatus(status);
+      return false;
+    }
+    return true;
+  }
+
+  // Makes and starts the codec: each candidate encoder in turn (software
+  // ones included), each through the configure attempts, until one starts.
+  // The encoder and attempt that did are tried first the next time (after a
+  // flush, on a new color space).
+  void start() {
+    const auto& names = candidates();
+    std::string failures;
+    bool started = false;
+    for (size_t c = 0; c < names.size() && !started; c++) {
+      std::string failure;
+      started = startEncoder(names[c], c == 0 ? _firstAttempt : 0, failure);
+      if (started && c > 0) {
+        std::rotate(_candidates->begin(), _candidates->begin() + static_cast<std::ptrdiff_t>(c), _candidates->begin() + static_cast<std::ptrdiff_t>(c) + 1);
+      }
+      if (!started) {
+        WC_LOG("video encoder: %s", failure.c_str());
+        failures += (failures.empty() ? "" : "; ") + failure;
+      }
+    }
+    if (!started) {
+      throw std::runtime_error("no " + _config.codec + " encoder took " + std::to_string(static_cast<int64_t>(_config.width)) + "x" +
+                               std::to_string(static_cast<int64_t>(_config.height)) + " (" + failures + ")");
     }
     if (_aspects.hdr()) {
       // The layout of the input buffers: rows `stride` bytes apart, the
@@ -872,9 +932,11 @@ private:
   EGLSurface _window = EGL_NO_SURFACE;
   GlBlitter _blitter;
   ColorAspects _aspects;
-  // The encoder chosen for the config and color aspects (empty: the type's
-  // default), looked up once.
-  std::optional<std::string> _encoderName;
+  // The encoders that may take the config and color aspects, best first
+  // ("": the type's default), looked up once; the one that started first.
+  std::optional<std::vector<std::string>> _candidates;
+  // The configure attempt the encoder that started took.
+  size_t _firstAttempt = 0;
   size_t _stride = 0;
   size_t _sliceHeight = 0;
   // Frames drawn into the current codec (GL thread), and output by it

@@ -358,4 +358,34 @@ public class EncoderRulesTest {
     assertEquals(0, EncoderRules.avcLevelOf(0));
     assertEquals(0, EncoderRules.avcLevelOf(33));
   }
+
+  // Every encoder that may take the config, in the order choose() ranks them
+  // (its answer first): when configure() fails on one, the next is tried,
+  // software ones included.
+  @Test
+  public void candidatesAreEveryFittingEncoderInChoosesOrder() {
+    Fake hwA = new Fake("c2.qti.avc.encoder").size(1920, 1088).align(16, 16);
+    Fake small = new Fake("c2.small.avc.encoder").size(640, 480);
+    Fake hwB = new Fake("c2.exynos.avc.encoder");
+    Fake software = new Fake("c2.android.avc.encoder").software().size(2048, 2048);
+    assertEquals(Arrays.asList("c2.qti.avc.encoder", "c2.exynos.avc.encoder", "c2.android.avc.encoder"),
+        EncoderRules.candidates(Arrays.asList(software, hwA, small, hwB), 1280, 720, 0, false, SURFACE, h -> false));
+    // Taken strictly before leniently: 1080x1920 only swapped and aligned up
+    // on hwA, as asked for on the others.
+    assertEquals(Arrays.asList("c2.exynos.avc.encoder", "c2.android.avc.encoder", "c2.qti.avc.encoder"),
+        EncoderRules.candidates(Arrays.asList(hwA, software, hwB), 1080, 1920, 0, false, SURFACE, h -> false));
+    // In the profile first, then (optional) in any, each once.
+    hwB.profiles = new int[] {AVC_BASELINE, AVC_HIGH};
+    assertEquals(Arrays.asList("c2.exynos.avc.encoder", "c2.qti.avc.encoder", "c2.android.avc.encoder"),
+        EncoderRules.candidates(Arrays.asList(software, hwA, hwB), 1280, 720, AVC_HIGH, true, SURFACE, h -> false));
+    assertEquals(Arrays.asList("c2.exynos.avc.encoder"),
+        EncoderRules.candidates(Arrays.asList(software, hwA, hwB), 1280, 720, AVC_HIGH, false, SURFACE, h -> false));
+    assertEquals(Arrays.asList(),
+        EncoderRules.candidates(Arrays.asList(software, small), 4096, 4096, 0, false, SURFACE, h -> false));
+    // choose() is the first of them.
+    for (int[] size : new int[][] {{1280, 720}, {1080, 1920}, {640, 480}}) {
+      java.util.List<String> all = EncoderRules.candidates(Arrays.asList(software, hwA, small, hwB), size[0], size[1], AVC_HIGH, true, SURFACE, h -> false);
+      assertEquals(all.get(0), EncoderRules.choose(Arrays.asList(software, hwA, small, hwB), size[0], size[1], AVC_HIGH, true, SURFACE, h -> false));
+    }
+  }
 }

@@ -68,4 +68,55 @@ inline std::string describeAttempt(const EncoderAttempt& attempt) {
   return text;
 }
 
+// The name of a media_status_t (NdkMediaError.h), or of a status_t that
+// MediaCodec passes through (utils/Errors.h, -errno): "" when unknown.
+inline const char* mediaStatusName(int32_t status) {
+  switch (status) {
+    case 1100:
+      return "ERROR_INSUFFICIENT_RESOURCE";
+    case 1101:
+      return "ERROR_RECLAIMED";
+    case -10000:
+      return "AMEDIA_ERROR_UNKNOWN";
+    case -10001:
+      return "AMEDIA_ERROR_MALFORMED";
+    case -10002:
+      return "AMEDIA_ERROR_UNSUPPORTED";
+    case -10003:
+      return "AMEDIA_ERROR_INVALID_OBJECT";
+    case -10004:
+      return "AMEDIA_ERROR_INVALID_PARAMETER";
+    case -10005:
+      return "AMEDIA_ERROR_INVALID_OPERATION";
+    case -10006:
+      return "AMEDIA_ERROR_END_OF_STREAM";
+    case -10007:
+      return "AMEDIA_ERROR_IO";
+    case -10008:
+      return "AMEDIA_ERROR_WOULD_BLOCK";
+    case -12:
+      return "NO_MEMORY";
+    case -19:
+      return "NO_INIT";
+    case -22:
+      return "BAD_VALUE";
+    case -32:
+      return "DEAD_OBJECT";
+    case -38:
+      return "INVALID_OPERATION";
+    case -110:
+      return "TIMED_OUT";
+    case INT32_MIN:
+      return "UNKNOWN_ERROR";
+    default:
+      return "";
+  }
+}
+
+// A status for a message: "-12 NO_MEMORY", or the number alone.
+inline std::string describeMediaStatus(int32_t status) {
+  std::string name = mediaStatusName(status);
+  return name.empty() ? std::to_string(status) : std::to_string(status) + " " + name;
+}
+
 }  // namespace margelo::nitro::webcodecs

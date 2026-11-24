@@ -36,6 +36,17 @@ public final class Capabilities {
     return EncoderRules.choose(videoEncoders(mime), width, height, profile, profileOptional, colorFormat, Capabilities::camcorderHasHeight);
   }
 
+  /**
+   * Every encoder that may take the config, best first (findVideoEncoder's
+   * answer first), newline-separated: see EncoderRules.candidates. When
+   * configure() fails on one, the next is tried.
+   */
+  @Keep
+  public static String findVideoEncoders(String mime, int width, int height, int profile, boolean profileOptional, int colorFormat) {
+    return String.join("\n",
+        EncoderRules.candidates(videoEncoders(mime), width, height, profile, profileOptional, colorFormat, Capabilities::camcorderHasHeight));
+  }
+
   // Whether the device records 1080p (1080) or 4K (2160) video, by its
   // CamcorderProfile: Media3's cross-check for encoders that list fewer rows
   // than they take. False on devices with no camera.

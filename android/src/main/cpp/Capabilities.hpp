@@ -39,6 +39,29 @@ struct JCapabilities : facebook::jni::JavaClass<JCapabilities> {
     return name;
   }
 
+  // Every encoder that may take the config, best first (findVideoEncoder's
+  // answer first): see Capabilities.findVideoEncoders.
+  static std::vector<std::string> findVideoEncoders(const std::string& mime, int width, int height, int profile, bool profileOptional,
+                                                    int colorFormat) {
+    std::vector<std::string> names;
+    facebook::jni::ThreadScope::WithClassLoader([&] {
+      static const auto method =
+          javaClassStatic()->getStaticMethod<facebook::jni::local_ref<facebook::jni::JString>(facebook::jni::alias_ref<facebook::jni::JString>, jint, jint, jint, jboolean, jint)>(
+              "findVideoEncoders");
+      auto result = method(javaClassStatic(), facebook::jni::make_jstring(mime), width, height, profile, profileOptional ? JNI_TRUE : JNI_FALSE, colorFormat);
+      if (result) {
+        std::istringstream lines(result->toStdString());
+        std::string line;
+        while (std::getline(lines, line)) {
+          if (!line.empty()) {
+            names.push_back(line);
+          }
+        }
+      }
+    });
+    return names;
+  }
+
   // The bitrate to configure the encoder `name` with: `requested`, or when 0
   // or less width * height * fps * 0.1, clamped into the encoder's range.
   static int32_t videoBitrate(const std::string& name, const std::string& mime, double requested, int width, int height,

@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 using namespace margelo::nitro::webcodecs;
 
@@ -68,11 +69,25 @@ static void describe() {
   CHECK(describeAttempt(EncoderAttempt{false, kOperatingRateNone, true}) == "no profile, no operating rate, at most 30 fps");
 }
 
+// media_status_t values by name, for the error message.
+static void statusNames() {
+  CHECK(std::string(mediaStatusName(-10000)) == "AMEDIA_ERROR_UNKNOWN");
+  // A status_t MediaCodec passes through: -ENOMEM.
+  CHECK(std::string(mediaStatusName(-12)) == "NO_MEMORY");
+  CHECK(std::string(mediaStatusName(-10004)) == "AMEDIA_ERROR_INVALID_PARAMETER");
+  CHECK(std::string(mediaStatusName(1100)) == "ERROR_INSUFFICIENT_RESOURCE");
+  CHECK(std::string(mediaStatusName(1101)) == "ERROR_RECLAIMED");
+  CHECK(std::string(mediaStatusName(42)) == "");
+  CHECK(describeMediaStatus(-12) == "-12 NO_MEMORY");
+  CHECK(describeMediaStatus(7) == "7");
+}
+
 int main() {
   withProfile();
   withoutProfile();
   realtime();
   describe();
+  statusNames();
   if (failures > 0) {
     std::fprintf(stderr, "%d failed\n", failures);
     return EXIT_FAILURE;

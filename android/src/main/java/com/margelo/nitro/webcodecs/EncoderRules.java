@@ -1,5 +1,6 @@
 package com.margelo.nitro.webcodecs;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.function.IntPredicate;
 import java.util.function.Predicate;
@@ -63,30 +64,12 @@ final class EncoderRules {
   }
 
   /**
-   * The encoder to make, or null when none fits. The encoder is configured
-   * with the size asked for, and configure() falls back on no other one, so
-   * as in Media3 the encoders that take that size as they say come first:
-   * 1. that take the size strictly, in the profile;
-   * 2. that take it strictly, in any profile (when `profileOptional`);
-   * 3. that take it as read leniently (see sizeSupported), in the profile;
-   * 4. that take it leniently, in any profile (when `profileOptional`).
-   * In each, the first hardware encoder in the platform's order, else the
-   * first software one.
+   * The encoder to make, or null when none fits: the first of candidates().
    */
   static String choose(List<? extends Encoder> encoders, int width, int height, int profile, boolean profileOptional, int colorFormat,
       IntPredicate camcorderHasHeight) {
-    boolean dropProfile = profileOptional && profile > 0;
-    String name = pick(encoders, e -> fitsStrictly(e, width, height, profile, colorFormat));
-    if (name == null && dropProfile) {
-      name = pick(encoders, e -> fitsStrictly(e, width, height, 0, colorFormat));
-    }
-    if (name == null) {
-      name = pick(encoders, e -> fits(e, width, height, profile, colorFormat, camcorderHasHeight));
-    }
-    if (name == null && dropProfile) {
-      name = pick(encoders, e -> fits(e, width, height, 0, colorFormat, camcorderHasHeight));
-    }
-    return name;
+    List<String> names = candidates(encoders, width, height, profile, profileOptional, colorFormat, camcorderHasHeight);
+    return names.isEmpty() ? null : names.get(0);
   }
 
   /** choose(), with the profile required. */
@@ -95,21 +78,42 @@ final class EncoderRules {
     return choose(encoders, width, height, profile, false, colorFormat, camcorderHasHeight);
   }
 
-  // The first hardware encoder that `fit` takes, in the platform's order;
-  // else the first software one; or null.
-  private static String pick(List<? extends Encoder> encoders, Predicate<Encoder> fit) {
-    String software = null;
-    for (Encoder encoder : encoders) {
-      if (fit.test(encoder)) {
-        if (encoder.hardware()) {
-          return encoder.name();
-        }
-        if (software == null) {
-          software = encoder.name();
+  /**
+   * The encoders that may take the config, best first, each once: the
+   * encoder is configured with the size asked for, so as in Media3 those
+   * that take that size as they say come first:
+   * 1. that take the size strictly, in the profile;
+   * 2. that take it strictly, in any profile (when `profileOptional`);
+   * 3. that take it as read leniently (see sizeSupported), in the profile;
+   * 4. that take it leniently, in any profile (when `profileOptional`).
+   * In each, the hardware encoders in the platform's order, then the
+   * software ones. When configure() fails on one, the next is tried.
+   */
+  static List<String> candidates(List<? extends Encoder> encoders, int width, int height, int profile, boolean profileOptional,
+      int colorFormat, IntPredicate camcorderHasHeight) {
+    boolean dropProfile = profileOptional && profile > 0;
+    List<String> names = new ArrayList<>();
+    addAll(names, encoders, e -> fitsStrictly(e, width, height, profile, colorFormat));
+    if (dropProfile) {
+      addAll(names, encoders, e -> fitsStrictly(e, width, height, 0, colorFormat));
+    }
+    addAll(names, encoders, e -> fits(e, width, height, profile, colorFormat, camcorderHasHeight));
+    if (dropProfile) {
+      addAll(names, encoders, e -> fits(e, width, height, 0, colorFormat, camcorderHasHeight));
+    }
+    return names;
+  }
+
+  // Adds the encoders `fit` takes that are not in `names` yet: the hardware
+  // ones in the platform's order, then the software ones.
+  private static void addAll(List<String> names, List<? extends Encoder> encoders, Predicate<Encoder> fit) {
+    for (boolean hardware : new boolean[] {true, false}) {
+      for (Encoder encoder : encoders) {
+        if (encoder.hardware() == hardware && !names.contains(encoder.name()) && fit.test(encoder)) {
+          names.add(encoder.name());
         }
       }
     }
-    return software;
   }
 
   /**

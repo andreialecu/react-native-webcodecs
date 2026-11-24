@@ -1459,6 +1459,37 @@ describe("react-native-webcodecs + Mediabunny", () => {
     }
   }, 120000);
 
+  // A config no encoder takes: NotSupportedError, and on Android a message
+  // naming each encoder tried and the status of each configure attempt
+  // (MediaCodec's own, e.g. NO_MEMORY -12 on a device out of codec memory).
+  it("says which encoders refused a config and why", async () => {
+    if (!supported()) {
+      return;
+    }
+    const result = (await client.eval(({ webcodecs: wc }) => {
+      const errors: string[] = [];
+      const encoder = new wc.VideoEncoder({
+        output: () => undefined,
+        error: (e: any) => errors.push(`${e.name}: ${e.message}`),
+      });
+      encoder.configure({ codec: "avc1.42001f", width: 16384, height: 16384 });
+      return new Promise((resolve) => setTimeout(resolve, 100)).then(() => ({
+        errors,
+        state: encoder.state,
+      }));
+    })) as any;
+    expect(result.state).toBe("closed");
+    expect(result.errors.length).toBe(1);
+    expect(result.errors[0]).toMatch(/^NotSupportedError: /);
+    if (client.OS === "android") {
+      const [message] = result.errors as string[];
+      expect(message).toContain("c2.android.avc.encoder");
+      // Every attempt, with the status by name: three with Baseline and its
+      // level, three without.
+      expect(message.match(/-10000 AMEDIA_ERROR_UNKNOWN/g)?.length).toBe(6);
+    }
+  }, 60000);
+
   // AudioEncoder alone, fed a 440 Hz sine in 1000-frame AudioData (not
   // multiples of an AAC frame): `segments` runs, each from its own start
   // time and followed by a flush. Returns each chunk's timestamp and
