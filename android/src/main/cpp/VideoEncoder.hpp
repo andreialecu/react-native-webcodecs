@@ -55,6 +55,10 @@ constexpr auto kKeyFrameDrainTimeout = std::chrono::milliseconds(200);
 // with no output is the end, for encoders that never say so.
 constexpr auto kEndOfStreamQuietTimeout = std::chrono::seconds(1);
 
+// How long shutdown() waits for the GL thread to stop the codec, before it
+// stops it from its own thread (then as long again).
+constexpr auto kShutdownTimeout = std::chrono::milliseconds(2000);
+
 // How long flush() waits for the frames drawn to come out before it ends the
 // stream (Media3 waits 100 ms).
 constexpr auto kEndOfStreamDrainTimeout = std::chrono::milliseconds(200);
@@ -640,6 +644,7 @@ private:
       return false;
     }
     _firstAttempt = attempt;
+    _codecLabel = encoderName.empty() ? label : encoderName;
     // Software codecs are Codec2's c2.android.* (and OMX.google.*).
     if (!encoderName.empty()) {
       _hardware = encoderName.rfind("c2.android.", 0) != 0 && encoderName.rfind("OMX.google.", 0) != 0;
@@ -738,6 +743,11 @@ private:
       _timestamps.clear();
       _framesSkipped = 0;
     }
+    {
+      std::lock_guard<std::mutex> lock(_codecMutex);
+      _liveCodec = _codec;
+      _aborted = false;
+    }
     _drain = std::thread([this, codec = _codec] { drainLoop(codec); });
   }
 
@@ -750,14 +760,22 @@ private:
     if (_drain.joinable()) {
       _drain.join();
     }
+    {
+      std::lock_guard<std::mutex> lock(_codecMutex);
+      _liveCodec = nullptr;
+    }
     if (_window != EGL_NO_SURFACE) {
       _blitter.destroySurface(_window);
       _window = EGL_NO_SURFACE;
     }
     if (_codec) {
+      if (_fault.slowStopMs > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(_fault.slowStopMs));
+      }
       AMediaCodec_stop(_codec);
       AMediaCodec_delete(_codec);
       _codec = nullptr;
+      WC_LOG("video encoder: released %s", _codecLabel.c_str());
     }
     if (_nativeWindow) {
       ANativeWindow_release(_nativeWindow);
@@ -773,9 +791,27 @@ private:
     }
   }
 
+  // Stops the codec from any thread, once: its input surface is let go, so
+  // a draw blocked waiting for the codec to take a buffer (eglSwapBuffers in
+  // dequeueBuffer) returns, and the GL thread gets to what comes next. The
+  // GL thread's stop() still deletes it.
+  void abortCodec() {
+    std::lock_guard<std::mutex> lock(_codecMutex);
+    if (!_liveCodec || _aborted) {
+      return;
+    }
+    _aborted = true;
+    WC_LOG("video encoder: stopping %s from another thread", _codecLabel.c_str());
+    AMediaCodec_stop(_liveCodec);
+  }
+
   void shutdown() {
+    if (_shutdown.exchange(true)) {
+      return;
+    }
     _closed = true;
     _failed = true;
+    _cv.notify_all();
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
     _gl.post([this, done] {
@@ -783,7 +819,18 @@ private:
       _blitter.destroy();
       done->set_value();
     });
-    future.wait();
+    if (future.wait_for(kShutdownTimeout) == std::future_status::ready) {
+      return;
+    }
+    // The GL thread is stuck (in a draw into a codec that takes nothing):
+    // stopping the codec here lets it go on.
+    WC_LOG("video encoder: not stopped after %lld ms", static_cast<long long>(kShutdownTimeout.count()));
+    abortCodec();
+    if (future.wait_for(kShutdownTimeout) != std::future_status::ready) {
+      // Left to finish on the GL thread: the destructor's ~SerialQueue
+      // waits for it, as it must while the task uses this object.
+      WC_ERR("video encoder: the GL thread is still busy");
+    }
   }
 
   bool draining() {
@@ -795,6 +842,22 @@ private:
     pthread_setname_np(pthread_self(), "wc-venc-drain");
     auto lastOutput = std::chrono::steady_clock::now();
     while (draining()) {
+      if (_fault.stallOutputSeconds > 0) {
+        // Fault: the codec's output is never taken, as if it hung.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        bool waiting = false;
+        {
+          std::lock_guard<std::mutex> lock(_mutex);
+          waiting = !_timestamps.empty();
+        }
+        if (!waiting) {
+          lastOutput = std::chrono::steady_clock::now();
+        } else if (std::chrono::steady_clock::now() - lastOutput > std::chrono::seconds(_fault.stallOutputSeconds)) {
+          fail(errorMessage("EncodingError", "encoder-failed", "timed out waiting for the encoder"));
+          return;
+        }
+        continue;
+      }
       AMediaCodecBufferInfo info{};
       ssize_t index = AMediaCodec_dequeueOutputBuffer(codec, &info, 10000);
       if (index == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
@@ -1030,6 +1093,9 @@ private:
       _failed = true;
     }
     _cv.notify_all();
+    // A failed codec takes nothing more: stop it now, so that the GL thread
+    // is not left blocked drawing into it.
+    abortCodec();
     if (!_closed) {
       _error(message);
     }
@@ -1053,6 +1119,11 @@ private:
   std::atomic<bool> _failed{false};
   std::atomic<bool> _closed{false};
   std::atomic<bool> _reported{false};
+  std::atomic<bool> _shutdown{false};
+  // The codec between start() and stop(), for abortCodec() from any thread.
+  std::mutex _codecMutex;
+  AMediaCodec* _liveCodec = nullptr;
+  bool _aborted = false;
 
   // GL thread only.
   AMediaCodec* _codec = nullptr;
@@ -1075,6 +1146,8 @@ private:
   std::atomic<bool> _hardware{false};
   // Set in start(), before the drain thread starts (which reads it).
   EncoderFault _fault;
+  // The codec's name, for the log.
+  std::string _codecLabel;
   std::thread _drain;
 
   // Drain thread only.

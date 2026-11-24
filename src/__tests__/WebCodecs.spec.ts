@@ -2043,6 +2043,105 @@ describe("react-native-webcodecs + Mediabunny", () => {
     }
   }, 120000);
 
+  it("lets go of a VideoEncoder codec that hangs with frames queued (Android fault)", async () => {
+    if (client.OS !== "android") {
+      return;
+    }
+    // Debug builds only: the codec's output is never taken, so it stops
+    // taking input with frames still to draw; 3 s later that is a stall.
+    setFault("venc-stall-output:3");
+    adb(["logcat", "-c"]);
+    let stuck: any;
+    try {
+      stuck = (await client.eval(({ webcodecs: wc }) => {
+        const errors: string[] = [];
+        let failed: () => void = () => {};
+        const failure = new Promise<void>((resolve) => {
+          failed = resolve;
+        });
+        const encoder = new wc.VideoEncoder({
+          output: () => {},
+          error: (e: any) => {
+            errors.push(`${e.name}: ${e.message}`);
+            failed();
+          },
+        });
+        encoder.configure({ codec: "avc1.42001f", width: 1280, height: 720 });
+        const pool = wc.createSurfacePool(1280, 720);
+        // All queued at once, without waiting on the encoder.
+        for (let i = 0; i < 90; i++) {
+          const frame = new wc.VideoFrame(pool.acquire(), {
+            timestamp: i * 33333,
+          });
+          encoder.encode(frame, { keyFrame: i === 0 });
+          frame.close();
+        }
+        const start = Date.now();
+        const flushed = encoder.flush().then(
+          () => "flushed",
+          (e: any) => `${e.name}`,
+        );
+        return Promise.race([
+          Promise.all([failure, flushed]).then(([, f]) => f),
+          new Promise((resolve) => setTimeout(() => resolve("timeout"), 30000)),
+        ]).then((outcome: any) => ({
+          outcome,
+          errors,
+          ms: Date.now() - start,
+          state: encoder.state,
+        }));
+      })) as any;
+    } finally {
+      setFault("");
+    }
+    expect(stuck.outcome).toBe("AbortError");
+    expect(stuck.errors.length).toBe(1);
+    expect(stuck.errors[0]).toMatch(/^EncodingError: /);
+    expect(stuck.state).toBe("closed");
+    // The codec is let go (on the encoder's GL thread, which must not stay
+    // blocked drawing into a codec that takes nothing).
+    let released = false;
+    for (let i = 0; i < 50 && !released; i++) {
+      released = /video encoder: released/.test(
+        adb(["logcat", "-d", "-s", "WebCodecs"]).toString(),
+      );
+      if (!released) {
+        execFileSync("sleep", ["0.2"]);
+      }
+    }
+    expect(released).toBe(true);
+    // And encoding goes on with a new encoder.
+    const after = (await client.eval(({ webcodecs: wc }) => {
+      const chunks: number[] = [];
+      const errors: string[] = [];
+      const encoder = new wc.VideoEncoder({
+        output: (chunk: any) => chunks.push(chunk.timestamp),
+        error: (e: any) => errors.push(String(e)),
+      });
+      encoder.configure({ codec: "avc1.42001f", width: 1280, height: 720 });
+      const pool = wc.createSurfacePool(1280, 720);
+      for (let i = 0; i < 3; i++) {
+        const frame = new wc.VideoFrame(pool.acquire(), {
+          timestamp: i * 33333,
+        });
+        encoder.encode(frame, { keyFrame: i === 0 });
+        frame.close();
+      }
+      return encoder.flush().then(
+        () => {
+          encoder.close();
+          return { chunks, errors };
+        },
+        (e: any) => {
+          encoder.close();
+          return { chunks, errors: errors.concat([String(e)]) };
+        },
+      );
+    })) as any;
+    expect(after.errors).toEqual([]);
+    expect(after.chunks.length).toBe(3);
+  }, 120000);
+
   it("writes into missing directories and reads percent-encoded file:// URLs", async () => {
     if (!supported()) {
       return;
