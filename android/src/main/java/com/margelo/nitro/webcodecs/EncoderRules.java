@@ -76,8 +76,9 @@ final class EncoderRules {
   /**
    * Whether the encoder takes frames of this size, read leniently, as Media3
    * and ExoPlayer do (the encoder is still given the size asked for):
-   * - also aligned up to the encoder's alignment: encoders listing 16 often
-   *   take 1080 rows (ExoPlayer #6551);
+   * - also aligned up to the encoder's alignment, for even sizes: encoders
+   *   listing 16 often take 1080 rows (ExoPlayer #6551), while odd sizes
+   *   are refused by encoders aligned to 2;
    * - also swapped: encoders limit the number of macroblocks rather than
    *   the orientation;
    * - 1920x1080 and 3840x2160 also when `camcorderHasHeight` (the device's
@@ -93,10 +94,14 @@ final class EncoderRules {
     if (encoder.isSizeSupported(width, height)) {
       return true;
     }
-    int alignedWidth = alignUp(width, encoder.widthAlignment());
-    int alignedHeight = alignUp(height, encoder.heightAlignment());
-    if ((alignedWidth != width || alignedHeight != height) && encoder.isSizeSupported(alignedWidth, alignedHeight)) {
-      return true;
+    // Even sizes only: the encoder is given the size asked for, and an odd
+    // one is refused by encoders aligned to 2 (the 1080-rows case is even).
+    if (width % 2 == 0 && height % 2 == 0) {
+      int alignedWidth = alignUp(width, encoder.widthAlignment());
+      int alignedHeight = alignUp(height, encoder.heightAlignment());
+      if ((alignedWidth != width || alignedHeight != height) && encoder.isSizeSupported(alignedWidth, alignedHeight)) {
+        return true;
+      }
     }
     if (width == 1920 && height == 1080) {
       return camcorderHasHeight.test(1080);

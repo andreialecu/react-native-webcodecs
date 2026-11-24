@@ -1283,6 +1283,30 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(result.huge).toBe(false);
   }, 60000);
 
+  // Android: an odd size is not read aligned up (the encoder would be given
+  // the odd size, which encoders aligned to 2 refuse at configure time).
+  it("answers isConfigSupported false for odd sizes on Android", async () => {
+    if (client.OS !== "android") {
+      return;
+    }
+    const result = (await client.eval(({ webcodecs: wc }) =>
+      Promise.all(
+        [
+          [1279, 720],
+          [641, 481],
+          [1280, 720],
+        ].map(([width, height]) =>
+          wc.VideoEncoder.isConfigSupported({
+            codec: "avc1.42001f",
+            width,
+            height,
+          }).then((support: any) => support.supported)
+        )
+      )
+    )) as any;
+    expect(result).toEqual([false, false, true]);
+  }, 60000);
+
   // The frame rate and bitrate are hints, as in Media3: an encoder is not
   // refused for them (the emulator's c2.android.avc.encoder lists at most
   // 12 Mbps, and about 30 fps at 1080x1920). The bitrate is clamped into the

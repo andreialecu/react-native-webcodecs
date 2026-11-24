@@ -168,6 +168,20 @@ public class EncoderRulesTest {
     assertFalse(EncoderRules.fits(encoder, 1930, 1080, 0, SURFACE));
   }
 
+  // Only even sizes are aligned up: the encoder is given the size asked
+  // for, and an odd one is refused by encoders aligned to 2 or more.
+  @Test
+  public void oddSizesAreNotAlignedUp() {
+    Fake two = new Fake("c2.android.avc.encoder");
+    assertFalse(EncoderRules.fits(two, 1279, 720, 0, SURFACE));
+    assertFalse(EncoderRules.fits(two, 641, 481, 0, SURFACE));
+    assertFalse(EncoderRules.fits(two, 720, 1279, 0, SURFACE));
+    Fake sixteen = new Fake("hw").size(1920, 1088).align(16, 16);
+    assertFalse(EncoderRules.fits(sixteen, 1279, 720, 0, SURFACE));
+    assertFalse(EncoderRules.fits(sixteen, 1920, 1079, 0, SURFACE));
+    assertTrue(EncoderRules.fits(sixteen, 1920, 1080, 0, SURFACE));
+  }
+
   // Encoders limit the number of macroblocks rather than the orientation
   // (as Media3 assumes): a portrait size is retried swapped.
   @Test
