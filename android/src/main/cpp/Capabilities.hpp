@@ -20,16 +20,18 @@ struct JCapabilities : facebook::jni::JavaClass<JCapabilities> {
     javaClassStatic();
   }
 
-  // The name of the first encoder for `mime` that takes this size, profile
-  // (ignored when 0 or less) and input color format, or none. The frame rate
-  // and bitrate are hints, which refuse no encoder.
-  static std::optional<std::string> findVideoEncoder(const std::string& mime, int width, int height, int profile, int colorFormat) {
+  // The name of the encoder for `mime` that takes this size, profile
+  // (ignored when 0 or less; dropped when `profileOptional` and no encoder
+  // takes it) and input color format, or none: see Capabilities.java. The
+  // frame rate and bitrate are hints, which refuse no encoder.
+  static std::optional<std::string> findVideoEncoder(const std::string& mime, int width, int height, int profile, bool profileOptional,
+                                                     int colorFormat) {
     std::optional<std::string> name;
     facebook::jni::ThreadScope::WithClassLoader([&] {
       static const auto method =
-          javaClassStatic()->getStaticMethod<facebook::jni::local_ref<facebook::jni::JString>(facebook::jni::alias_ref<facebook::jni::JString>, jint, jint, jint, jint)>(
+          javaClassStatic()->getStaticMethod<facebook::jni::local_ref<facebook::jni::JString>(facebook::jni::alias_ref<facebook::jni::JString>, jint, jint, jint, jboolean, jint)>(
               "findVideoEncoder");
-      auto result = method(javaClassStatic(), facebook::jni::make_jstring(mime), width, height, profile, colorFormat);
+      auto result = method(javaClassStatic(), facebook::jni::make_jstring(mime), width, height, profile, profileOptional ? JNI_TRUE : JNI_FALSE, colorFormat);
       if (result) {
         name = result->toStdString();
       }

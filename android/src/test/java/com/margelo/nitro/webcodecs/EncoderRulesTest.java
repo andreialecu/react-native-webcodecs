@@ -210,18 +210,63 @@ public class EncoderRulesTest {
     assertFalse(EncoderRules.fits(hevc, 3840, 2160, 0, SURFACE, height -> height == 1080));
   }
 
-  // A hardware encoder that takes the config is chosen over a software one,
-  // wherever the platform lists it; software when no hardware one fits.
+  // A hardware encoder that takes the config as it is asked for is chosen
+  // over a software one, wherever the platform lists it; software when no
+  // hardware one does.
   @Test
   public void prefersHardwareThatFitsOverSoftware() {
     Fake software = new Fake("c2.android.avc.encoder").software().size(2048, 2048);
     Fake hardware = new Fake("c2.qti.avc.encoder").size(1920, 1088).align(16, 16);
     Fake small = new Fake("c2.small.avc.encoder").size(640, 480);
-    // Through the lenient reading: 1080x1920 portrait, 1080 aligned to 1088.
     assertEquals("c2.qti.avc.encoder",
-        EncoderRules.choose(Arrays.asList(software, small, hardware), 1080, 1920, 0, SURFACE, h -> false));
+        EncoderRules.choose(Arrays.asList(software, small, hardware), 1920, 1088, 0, SURFACE, h -> false));
     assertEquals("c2.android.avc.encoder",
         EncoderRules.choose(Arrays.asList(small, software, hardware), 2048, 2048, 0, SURFACE, h -> false));
     assertNull(EncoderRules.choose(Arrays.asList(small, software, hardware), 4096, 4096, 0, SURFACE, h -> false));
+  }
+
+  // The encoder is configured with the size asked for, and configure() has
+  // no other encoder to fall back on: one that takes the size as asked for
+  // (software or not) beats a hardware one only the lenient reading lets
+  // through (as Media3 orders them).
+  @Test
+  public void anEncoderThatTakesTheSizeBeatsHardwareReadLeniently() {
+    Fake software = new Fake("c2.android.avc.encoder").software().size(2048, 2048);
+    Fake hardware = new Fake("c2.qti.avc.encoder").size(1920, 1088).align(16, 16);
+    // 1080x1920: the hardware one only swapped and aligned up.
+    assertEquals("c2.android.avc.encoder",
+        EncoderRules.choose(Arrays.asList(hardware, software), 1080, 1920, 0, SURFACE, h -> false));
+    // 1920x1080 by CamcorderProfile only.
+    Fake hardware1072 = new Fake("c2.exynos.avc.encoder").size(1920, 1072).align(16, 16);
+    assertEquals("c2.android.avc.encoder",
+        EncoderRules.choose(Arrays.asList(hardware1072, software), 1920, 1080, 0, SURFACE, h -> h == 1080));
+    // No encoder takes it as asked for: the lenient reading, hardware first.
+    Fake smallSoftware = new Fake("c2.android.small").software().size(1088, 1088);
+    assertEquals("c2.qti.avc.encoder",
+        EncoderRules.choose(Arrays.asList(smallSoftware, hardware), 1080, 1920, 0, SURFACE, h -> false));
+    assertEquals("c2.exynos.avc.encoder",
+        EncoderRules.choose(Arrays.asList(smallSoftware, hardware1072), 1920, 1080, 0, SURFACE, h -> h == 1080));
+  }
+
+  // An optional profile (H.264's) is dropped before the size is read
+  // leniently: a size the encoder may refuse at configure time is worse than
+  // the encoder's default profile.
+  @Test
+  public void anOptionalProfileIsDroppedBeforeTheLenientReading() {
+    Fake software = new Fake("c2.android.avc.encoder").software().size(2048, 2048);
+    Fake hardware = new Fake("c2.qti.avc.encoder").size(1920, 1088).align(16, 16);
+    hardware.profiles = new int[] {AVC_BASELINE, AVC_HIGH};
+    assertEquals("c2.android.avc.encoder",
+        EncoderRules.choose(Arrays.asList(hardware, software), 1080, 1920, AVC_HIGH, true, SURFACE, h -> false));
+    // A required profile is not dropped.
+    assertEquals("c2.qti.avc.encoder",
+        EncoderRules.choose(Arrays.asList(hardware, software), 1080, 1920, AVC_HIGH, false, SURFACE, h -> false));
+    // Taken as asked for, in the profile: the hardware one.
+    assertEquals("c2.qti.avc.encoder",
+        EncoderRules.choose(Arrays.asList(software, hardware), 1920, 1088, AVC_HIGH, true, SURFACE, h -> false));
+    // No encoder lists the profile: any that takes the size.
+    assertEquals("c2.android.avc.encoder",
+        EncoderRules.choose(Arrays.asList(software), 1280, 720, AVC_HIGH, true, SURFACE, h -> false));
+    assertNull(EncoderRules.choose(Arrays.asList(software), 1280, 720, AVC_HIGH, false, SURFACE, h -> false));
   }
 }

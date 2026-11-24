@@ -20,18 +20,20 @@ public final class Capabilities {
   private Capabilities() {}
 
   /**
-   * The name of the encoder for `mime` that takes frames of this size
-   * (read leniently, as in Media3: see EncoderRules.sizeSupported), in
-   * this profile (ignored when 0 or less) and input color format; or null
-   * when none does: the first hardware one in the platform's order (the
+   * The name of the encoder for `mime` that takes frames of this size, in
+   * this profile (ignored when 0 or less; when `profileOptional`, dropped
+   * when no encoder takes it) and input color format; or null when none
+   * does. Encoders that take the size as they say come before those only
+   * the lenient reading (as in Media3: see EncoderRules.sizeSupported) lets
+   * through; in each, the first hardware one in the platform's order (the
    * order MediaCodec.createEncoderByType tries), else the first software
-   * one. The frame rate and bitrate are hints, as in Media3: they refuse no
-   * encoder (see videoBitrate).
+   * one: see EncoderRules.choose. The frame rate and bitrate are hints, as
+   * in Media3: they refuse no encoder (see videoBitrate).
    */
   @Keep
   @Nullable
-  public static String findVideoEncoder(String mime, int width, int height, int profile, int colorFormat) {
-    return EncoderRules.choose(videoEncoders(mime), width, height, profile, colorFormat, Capabilities::camcorderHasHeight);
+  public static String findVideoEncoder(String mime, int width, int height, int profile, boolean profileOptional, int colorFormat) {
+    return EncoderRules.choose(videoEncoders(mime), width, height, profile, profileOptional, colorFormat, Capabilities::camcorderHasHeight);
   }
 
   // Whether the device records 1080p (1080) or 4K (2160) video, by its

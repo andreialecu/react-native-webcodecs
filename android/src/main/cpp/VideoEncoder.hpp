@@ -104,26 +104,20 @@ struct ColorAspects {
 constexpr int32_t kColorFormatYuvP010 = 0x36;
 
 // The encoder MediaCodecList says takes this config (size, profile, and the
-// input: a surface, or P010 buffers for 10-bit HDR), a hardware one before
-// a software one; none when no encoder does. The frame rate and bitrate
-// are hints, as in Media3: start() clamps the bitrate into the range of the
-// encoder it made.
+// input: a surface, or P010 buffers for 10-bit HDR); none when no encoder
+// does. Encoders that take the size as they say come first (start()
+// configures the size asked for and falls back on no other encoder), then
+// those the lenient reading lets through; in each, a hardware one before a
+// software one (Capabilities.java). The frame rate and bitrate are hints, as
+// in Media3: start() clamps the bitrate into the range of the encoder it made.
 //
 // An H.264 profile is a preference, as configure() treats it: when no encoder
 // lists it (the emulator's software encoder has no High), any encoder that
 // takes the rest will do, in its default profile, which the avcC description
 // of the output says. AV1's Main 10 is required: HDR depends on it.
 inline std::optional<std::string> findVideoEncoder(const NativeVideoEncoderConfig& config, bool hdr) {
-  auto find = [&](int32_t profile) {
-    return JCapabilities::findVideoEncoder(videoMime(config.codec), static_cast<int>(config.width), static_cast<int>(config.height), profile,
-                                           hdr ? kColorFormatYuvP010 : kColorFormatSurface);
-  };
-  int32_t profile = mediaCodecProfile(config);
-  auto name = find(profile);
-  if (!name.has_value() && config.codec == "avc" && profile > 0) {
-    name = find(0);
-  }
-  return name;
+  return JCapabilities::findVideoEncoder(videoMime(config.codec), static_cast<int>(config.width), static_cast<int>(config.height),
+                                         mediaCodecProfile(config), config.codec == "avc", hdr ? kColorFormatYuvP010 : kColorFormatSurface);
 }
 
 // Waits on the CPU for a sync fd (taken over, closed either way).

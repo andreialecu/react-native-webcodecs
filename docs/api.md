@@ -51,7 +51,8 @@ How each platform answers:
   for Main 10, which HDR needs), a hardware one before a software one. As in
   Media3, sizes are read leniently (even sizes also aligned up to the encoder's
   alignment, swapped, and 1920x1080 or 3840x2160 when the device's camera records
-  them), and the frame rate and bitrate are hints: the bitrate, or the
+  them), though an encoder that takes the size as it says, hardware or
+  software, comes before one only that reading lets through; the frame rate and bitrate are hints: the bitrate, or the
   default of width × height × fps × 0.1, is clamped into the encoder's
   range, and the frame rate is floored, and ignored below 1. The encoder that
   answered is the one `configure` creates. An H.264 profile no encoder lists

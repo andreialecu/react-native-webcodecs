@@ -2,6 +2,7 @@ package com.margelo.nitro.webcodecs;
 
 import java.util.List;
 import java.util.function.IntPredicate;
+import java.util.function.Predicate;
 
 // The rules Capabilities applies to MediaCodecList's answers, apart from
 // MediaCodecInfo (whose classes are stubs on the JVM): unit-tested in
@@ -38,13 +39,7 @@ final class EncoderRules {
    * (the bitrate is clamped into its range, see bitrate()).
    */
   static boolean fits(Encoder encoder, int width, int height, int profile, int colorFormat, IntPredicate camcorderHasHeight) {
-    if (!sizeSupported(encoder, width, height, camcorderHasHeight)) {
-      return false;
-    }
-    if (profile > 0 && !contains(encoder.profiles(), profile)) {
-      return false;
-    }
-    return contains(encoder.colorFormats(), colorFormat);
+    return sizeSupported(encoder, width, height, camcorderHasHeight) && takes(encoder, profile, colorFormat);
   }
 
   /** fits(), with no camcorder profile to vouch for a size. */
@@ -52,16 +47,57 @@ final class EncoderRules {
     return fits(encoder, width, height, profile, colorFormat, h -> false);
   }
 
+  /** fits(), with the size as asked for: as the encoder says, not leniently. */
+  static boolean fitsStrictly(Encoder encoder, int width, int height, int profile, int colorFormat) {
+    return encoder.isSizeSupported(width, height) && takes(encoder, profile, colorFormat);
+  }
+
+  private static boolean takes(Encoder encoder, int profile, int colorFormat) {
+    if (profile > 0 && !contains(encoder.profiles(), profile)) {
+      return false;
+    }
+    return contains(encoder.colorFormats(), colorFormat);
+  }
+
   /**
-   * The first hardware encoder, in the platform's order, that fits; else
-   * the first software one; or null. A hardware encoder the lenient checks
-   * let through beats a software one the platform lists first.
+   * The encoder to make, or null when none fits. The encoder is configured
+   * with the size asked for, and configure() falls back on no other one, so
+   * as in Media3 the encoders that take that size as they say come first:
+   * 1. that take the size strictly, in the profile;
+   * 2. that take it strictly, in any profile (when `profileOptional`);
+   * 3. that take it as read leniently (see sizeSupported), in the profile;
+   * 4. that take it leniently, in any profile (when `profileOptional`).
+   * In each, the first hardware encoder in the platform's order, else the
+   * first software one.
    */
+  static String choose(List<? extends Encoder> encoders, int width, int height, int profile, boolean profileOptional, int colorFormat,
+      IntPredicate camcorderHasHeight) {
+    boolean dropProfile = profileOptional && profile > 0;
+    String name = pick(encoders, e -> fitsStrictly(e, width, height, profile, colorFormat));
+    if (name == null && dropProfile) {
+      name = pick(encoders, e -> fitsStrictly(e, width, height, 0, colorFormat));
+    }
+    if (name == null) {
+      name = pick(encoders, e -> fits(e, width, height, profile, colorFormat, camcorderHasHeight));
+    }
+    if (name == null && dropProfile) {
+      name = pick(encoders, e -> fits(e, width, height, 0, colorFormat, camcorderHasHeight));
+    }
+    return name;
+  }
+
+  /** choose(), with the profile required. */
   static String choose(
       List<? extends Encoder> encoders, int width, int height, int profile, int colorFormat, IntPredicate camcorderHasHeight) {
+    return choose(encoders, width, height, profile, false, colorFormat, camcorderHasHeight);
+  }
+
+  // The first hardware encoder that `fit` takes, in the platform's order;
+  // else the first software one; or null.
+  private static String pick(List<? extends Encoder> encoders, Predicate<Encoder> fit) {
     String software = null;
     for (Encoder encoder : encoders) {
-      if (fits(encoder, width, height, profile, colorFormat, camcorderHasHeight)) {
+      if (fit.test(encoder)) {
         if (encoder.hardware()) {
           return encoder.name();
         }
