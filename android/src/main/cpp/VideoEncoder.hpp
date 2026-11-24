@@ -7,12 +7,14 @@
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
 #include <poll.h>
+#include <sys/system_properties.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <optional>
@@ -49,9 +51,48 @@ constexpr auto kStallTimeout = std::chrono::seconds(20);
 // How long a key frame request waits for the frames before it to come out.
 constexpr auto kKeyFrameDrainTimeout = std::chrono::milliseconds(200);
 
+// After the end of stream is asked for, with every frame drawn out: this long
+// with no output is the end, for encoders that never say so.
+constexpr auto kEndOfStreamQuietTimeout = std::chrono::seconds(1);
+
 // How long flush() waits for the frames drawn to come out before it ends the
 // stream (Media3 waits 100 ms).
 constexpr auto kEndOfStreamDrainTimeout = std::chrono::milliseconds(200);
+
+// Debug builds only: a fault the e2e tests make the encoder act out, from
+// `adb shell setprop debug.webcodecs.fault <value>`, read when a codec starts:
+//   venc-no-eos             the end of stream never comes out
+//   venc-stall-output:<s>   no output is taken, and <s> s without it is a stall
+//   venc-slow-stop:<ms>     stopping the codec takes <ms> ms longer
+// Release builds (NDEBUG) never read it.
+struct EncoderFault {
+  bool noEndOfStream = false;
+  int stallOutputSeconds = 0;
+  int slowStopMs = 0;
+
+  static EncoderFault read() {
+    EncoderFault fault;
+#ifndef NDEBUG
+    char value[PROP_VALUE_MAX] = {0};
+    __system_property_get("debug.webcodecs.fault", value);
+    const std::string text(value);
+    auto argument = [&](const std::string& name) {
+      return std::atoi(text.c_str() + name.size());
+    };
+    if (text == "venc-no-eos") {
+      fault.noEndOfStream = true;
+    } else if (text.rfind("venc-stall-output:", 0) == 0) {
+      fault.stallOutputSeconds = std::max(1, argument("venc-stall-output:"));
+    } else if (text.rfind("venc-slow-stop:", 0) == 0) {
+      fault.slowStopMs = std::max(0, argument("venc-slow-stop:"));
+    }
+    if (!text.empty()) {
+      WC_LOG("video encoder: fault %s", value);
+    }
+#endif
+    return fault;
+  }
+};
 
 inline std::string describeCodecStatus(media_status_t status, const std::string& what, const std::string& prefix) {
   // The system takes a codec back from an app in the background when another
@@ -356,13 +397,42 @@ public:
         promise->reject(std::make_exception_ptr(std::runtime_error(_failure)));
         return;
       }
+      // Done when the end of stream comes out. Some encoders never output
+      // it (b/365484741): every frame drawn having come out, and nothing
+      // more for a while, is the end too. Only an encoder that outputs
+      // nothing for kStallTimeout with frames still in it has timed out:
+      // a slow one still making progress has not.
+      const auto signalled = std::chrono::steady_clock::now();
+      bool quiet = false;
+      bool stalled = false;
       std::unique_lock<std::mutex> lock(_mutex);
-      bool done = _cv.wait_for(lock, std::chrono::seconds(10), [this] { return _eos || _failed; });
+      while (!_cv.wait_for(lock, std::chrono::milliseconds(250), [this] { return _eos || _failed || _closed; })) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto since = now - std::max(_lastOutputAt, signalled);
+        if (_framesOut + _framesSkipped >= _framesIn && since >= kEndOfStreamQuietTimeout) {
+          quiet = true;
+          break;
+        }
+        if (since > kStallTimeout) {
+          stalled = true;
+          break;
+        }
+      }
       lock.unlock();
+      if (quiet) {
+        // No end of stream to end the drain thread: stop the codec, so no
+        // output comes after the flush resolves. The next encode() starts a
+        // new one.
+        WC_LOG("video encoder: no end of stream after every frame came out; stopping the codec");
+        stop();
+        for (int64_t n = _framesIn - _framesOut; n > 0 && !_failed; n--) {
+          _output(NativeEncodedChunk(ArrayBuffer::allocate(0), 0, 0, false, std::nullopt));
+        }
+      }
       _ended = true;
       if (_failed) {
         promise->reject(std::make_exception_ptr(std::runtime_error(_failure)));
-      } else if (!done) {
+      } else if (stalled) {
         promise->reject(std::make_exception_ptr(std::runtime_error(errorMessage("EncodingError", "encoder-failed", "flush timed out"))));
       } else {
         promise->resolve();
@@ -612,6 +682,7 @@ private:
   // The encoder and attempt that did are tried first the next time (after a
   // flush, on a new color space).
   void start() {
+    _fault = EncoderFault::read();
     const auto& names = candidates();
     std::string failures;
     bool started = false;
@@ -663,6 +734,7 @@ private:
       std::lock_guard<std::mutex> lock(_mutex);
       _eos = false;
       _draining = true;
+      _lastOutputAt = std::chrono::steady_clock::now();
       _timestamps.clear();
       _framesSkipped = 0;
     }
@@ -744,6 +816,10 @@ private:
         continue;
       }
       lastOutput = std::chrono::steady_clock::now();
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _lastOutputAt = lastOutput;
+      }
       if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
         AMediaFormat* format = AMediaCodec_getOutputFormat(codec);
         void* sps = nullptr;
@@ -780,7 +856,7 @@ private:
         }
       }
       AMediaCodec_releaseOutputBuffer(codec, index, false);
-      if (info.flags & kBufferFlagEndOfStream) {
+      if ((info.flags & kBufferFlagEndOfStream) && !_fault.noEndOfStream) {
         // Frames the codec took and never output (dropped): an empty chunk
         // each, as VideoToolbox reports a dropped frame, so JS stops
         // counting them.
@@ -971,6 +1047,8 @@ private:
   int64_t _framesSkipped = 0;
   bool _eos = false;
   bool _draining = false;
+  // When the codec last output anything (flush() reads it for progress).
+  std::chrono::steady_clock::time_point _lastOutputAt;
   std::string _failure;
   std::atomic<bool> _failed{false};
   std::atomic<bool> _closed{false};
@@ -995,6 +1073,8 @@ private:
   std::atomic<int64_t> _framesOut{0};
   bool _ended = false;
   std::atomic<bool> _hardware{false};
+  // Set in start(), before the drain thread starts (which reads it).
+  EncoderFault _fault;
   std::thread _drain;
 
   // Drain thread only.

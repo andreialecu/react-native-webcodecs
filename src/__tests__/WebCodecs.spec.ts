@@ -169,6 +169,17 @@ const adb = (args: string[], input?: Buffer) =>
     { input, maxBuffer: 256 * 1024 * 1024 },
   );
 
+// Android debug builds: a fault the video encoder acts out from its next
+// codec on (see EncoderFault in VideoEncoder.hpp); "" for none. The property
+// outlives the app: reset it in a finally.
+const setFault = (value: string) =>
+  adb([
+    "shell",
+    "setprop",
+    "debug.webcodecs.fault",
+    value === "" ? '""' : value,
+  ]);
+
 const pushAsset = (name: string) =>
   pushFile(path.join(__dirname, "assets", name));
 
@@ -1964,6 +1975,72 @@ describe("react-native-webcodecs + Mediabunny", () => {
         }
       });
     });
+  }, 120000);
+
+  it("flushes a VideoEncoder whose codec never ends the stream (Android fault)", async () => {
+    if (client.OS !== "android") {
+      return;
+    }
+    // Debug builds only: the codec's end of stream is never seen.
+    setFault("venc-no-eos");
+    try {
+      const result = (await client.eval(({ webcodecs: wc }) => {
+        const chunks: number[] = [];
+        const errors: string[] = [];
+        const encoder = new wc.VideoEncoder({
+          output: (chunk: any) => {
+            if (chunk.byteLength > 0) {
+              chunks.push(chunk.timestamp);
+            }
+          },
+          error: (e: any) => errors.push(String(e)),
+        });
+        encoder.configure({ codec: "avc1.42001f", width: 64, height: 64 });
+        const pool = wc.createSurfacePool(64, 64);
+        const flushes: { flushed: string; ms: number }[] = [];
+        // Two streams: after a flush, the encoder starts a new codec.
+        const round = (first: number, count: number) => {
+          for (let i = first; i < first + count; i++) {
+            const frame = new wc.VideoFrame(pool.acquire(), {
+              timestamp: i * 33333,
+            });
+            encoder.encode(frame, { keyFrame: i === first });
+            frame.close();
+          }
+          const start = Date.now();
+          return Promise.race([
+            encoder.flush().then(
+              () => "flushed",
+              (e: any) => `${e.name}: ${e.message}`,
+            ),
+            new Promise((resolve) =>
+              setTimeout(() => resolve("timeout"), 15000),
+            ),
+          ]).then((flushed: any) => {
+            flushes.push({ flushed, ms: Date.now() - start });
+          });
+        };
+        return round(0, 5)
+          .then(() => round(5, 3))
+          .then(() => {
+            const queue = encoder.encodeQueueSize;
+            encoder.close();
+            return { chunks, errors, flushes, queue };
+          });
+      })) as any;
+      expect(result.errors).toEqual([]);
+      expect(result.flushes.map((f: any) => f.flushed)).toEqual([
+        "flushed",
+        "flushed",
+      ]);
+      result.flushes.forEach((f: any) => expect(f.ms).toBeLessThan(5000));
+      expect(result.chunks).toEqual(
+        Array.from({ length: 8 }, (_, i) => i * 33333),
+      );
+      expect(result.queue).toBe(0);
+    } finally {
+      setFault("");
+    }
   }, 120000);
 
   it("writes into missing directories and reads percent-encoded file:// URLs", async () => {
