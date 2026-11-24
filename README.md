@@ -60,6 +60,43 @@ import { installWebCodecs } from "react-native-webcodecs";
 installWebCodecs();
 ```
 
+### Expo
+
+The package has native code, so it runs in a
+[development build](https://docs.expo.dev/develop/development-builds/introduction/),
+not in Expo Go. It needs no config plugin: autolinking picks it up.
+
+```sh
+npx expo install react-native-webcodecs react-native-nitro-modules mediabunny expo-build-properties
+```
+
+Android needs API 26, and Expo's default is 24, so raise it in `app.json`:
+
+```json
+{
+  "expo": {
+    "plugins": [
+      ["expo-build-properties", { "android": { "minSdkVersion": 26 } }]
+    ]
+  }
+}
+```
+
+Then build and run, as usual for a development build (or with EAS Build):
+
+```sh
+npx expo run:ios
+```
+
+```sh
+npx expo run:android
+```
+
+If `android/` already exists, run `npx expo prebuild --clean` first, so the
+new `minSdkVersion` reaches it. Call `installWebCodecs()` in your entry file,
+as above. Checked with a new Expo SDK 58 app (`create-expo-app`) on the iOS
+Simulator and an Android emulator.
+
 To draw frames or read decoded ones on the GPU, add
 [React Native WebGPU](https://github.com/wcandillon/react-native-webgpu)
 (`react-native-webgpu`), and [React Native Skia](https://shopify.github.io/react-native-skia/)
