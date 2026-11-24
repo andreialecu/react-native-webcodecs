@@ -182,7 +182,10 @@ final class HybridNativeAudioEncoder: HybridNativeAudioEncoderSpec {
   func flush() throws -> Promise<Void> {
     guard converter != nil else { return Promise.rejected(withError: WebCodecsError.invalidState("the encoder is closed")) }
     return Promise.parallel(queue) {
-      if self.failed { return }
+      // Nothing encoded since the last flush (start is set by the first
+      // encode()): nothing to output. An end of stream now would still give
+      // the converter's priming, as frames of silence.
+      if self.failed || self.start == nil { return }
       self.endOfStream = true
       self.pull()
       // The converter is done after an end of stream: start a new stream for
