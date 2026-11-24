@@ -71,6 +71,10 @@ public:
     AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime.c_str());
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height);
+    // Room for a key frame of the size (Media3's: 3/4 of a byte per pixel
+    // of the 16-aligned picture); Codec2 takes the larger of this and its
+    // own, others may default to less.
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, maxInputSize(width, height));
     auto csd = [](const std::vector<uint8_t>& unit) {
       std::vector<uint8_t> out = {0, 0, 0, 1};
       out.insert(out.end(), unit.begin(), unit.end());
@@ -237,6 +241,11 @@ public:
   }
 
 private:
+  static int32_t maxInputSize(int32_t width, int32_t height) {
+    int64_t pixels = static_cast<int64_t>((width + 15) / 16) * ((height + 15) / 16) * 256;
+    return static_cast<int32_t>(std::min<int64_t>(pixels * 3 / 4, INT32_MAX));
+  }
+
   void startDrain() {
     {
       std::lock_guard<std::mutex> lock(_mutex);
@@ -265,7 +274,9 @@ private:
     size_t capacity = 0;
     uint8_t* buffer = AMediaCodec_getInputBuffer(_codec, index, &capacity);
     if (!buffer || size > capacity) {
-      fail(errorMessage("EncodingError", "decoder-failed", "chunk larger than the input buffer"));
+      fail(errorMessage("EncodingError", "decoder-failed",
+                        "chunk larger than the input buffer (" + std::to_string(size) + " > " + std::to_string(capacity) +
+                            " bytes)"));
       return;
     }
     if (size > 0) {

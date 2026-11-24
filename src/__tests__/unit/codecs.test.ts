@@ -329,6 +329,36 @@ describe("VideoDecoder", () => {
     expect(passed).toEqual(["prefer-software", "prefer-hardware", undefined]);
   });
 
+  it("passes the SPS's size to the native decoder when the config has none", () => {
+    // libx264, 3840x2160.
+    const description = Uint8Array.from(
+      Buffer.from(
+        "01640033ffe1001a67640033acd9403c0043ec0440000003004000000f03c60c658001000668ebe3cb22c0fdf8f800",
+        "hex",
+      ),
+    );
+    const decoder = new VideoDecoder({ output: jest.fn(), error: jest.fn() });
+    const sizes = [
+      { codec: "avc1.640033", description },
+      { codec: "avc1.640033", description, codedWidth: 64, codedHeight: 48 },
+      DECODER_CONFIG,
+    ].map((config) => {
+      decoder.configure(config);
+      const { codedWidth, codedHeight } = last().config as {
+        codedWidth?: number;
+        codedHeight?: number;
+      };
+      return [codedWidth, codedHeight];
+    });
+    decoder.close();
+    expect(sizes).toEqual([
+      [3840, 2160],
+      [64, 48],
+      // Unreadable: native picks one.
+      [undefined, undefined],
+    ]);
+  });
+
   it("closes the native decoder on a native error", () => {
     const decoder = new VideoDecoder({ output: jest.fn(), error: jest.fn() });
     decoder.configure(DECODER_CONFIG);

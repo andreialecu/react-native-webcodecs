@@ -7,6 +7,7 @@ import type {
   NativeVideoEncoderConfig,
 } from "../specs/WebCodecs.nitro";
 
+import { avcCodedSize } from "./avc";
 import {
   cloneConfig,
   CodecBase,
@@ -695,11 +696,17 @@ const toNativeDecoderConfig = (config: VideoDecoderConfig) => {
   if (!codec || !config.description) {
     return null;
   }
+  // Without a size, the SPS's: Android sizes the decoder's input buffers
+  // (and its pictures) from it.
+  const sized =
+    config.codedWidth !== undefined && config.codedHeight !== undefined;
+  const size =
+    !sized && codec === "avc" ? avcCodedSize(config.description) : undefined;
   return {
     codec,
     description: toArrayBuffer(config.description),
-    codedWidth: config.codedWidth,
-    codedHeight: config.codedHeight,
+    codedWidth: config.codedWidth ?? size?.width,
+    codedHeight: config.codedHeight ?? size?.height,
     pixelFormat: config.outputFormat,
     hardwareAcceleration:
       config.hardwareAcceleration === "prefer-software" ||

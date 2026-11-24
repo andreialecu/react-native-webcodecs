@@ -811,8 +811,9 @@ interface Decoded {
 }
 
 // Decodes a file of the app's on the device with the track's decoder config
-// and `ctx.config` on top (e.g. hardwareAcceleration).
-const decodeOnDevice = (file: string, config: object) =>
+// and `ctx.config` on top (e.g. hardwareAcceleration), without the members
+// named in `drop`.
+const decodeOnDevice = (file: string, config: object, drop: string[] = []) =>
   runOnDevice<Decoded>(
     ({ mediabunny: mb, webcodecs: wc, ctx }) => {
       const input = new mb.Input({
@@ -845,27 +846,39 @@ const decodeOnDevice = (file: string, config: object) =>
             },
             error: (e: any) => result.errors.push(String(e)),
           });
-          decoder.configure(Object.assign({}, trackConfig, ctx.config));
+          const merged = Object.assign({}, trackConfig, ctx.config);
+          for (const name of ctx.drop) {
+            delete merged[name];
+          }
+          decoder.configure(merged);
           const packets = new mb.EncodedPacketSink(track).packets();
+          // Stops at an error: the decoder is closed then.
           const step = (): Promise<void> =>
             packets.next().then((r: any) => {
-              if (r.done) {
+              if (r.done || decoder.state === "closed") {
                 return undefined;
               }
               decoder.decode(r.value.toEncodedVideoChunk());
               return step();
             });
           return step()
-            .then(() => decoder.flush())
+            .then(() =>
+              decoder.state === "closed" ? undefined : decoder.flush(),
+            )
+            .catch((e: any) => {
+              result.errors.push(`flush: ${e}`);
+            })
             .then(() => {
-              decoder.close();
+              if (decoder.state !== "closed") {
+                decoder.close();
+              }
               input.dispose();
               return result;
             });
         }),
       );
     },
-    { file, config },
+    { file, config, drop },
     120000,
   );
 
@@ -1834,6 +1847,106 @@ describe("react-native-webcodecs + Mediabunny", () => {
       blue: true,
       yellowBottom: true,
     });
+  }, 300000);
+
+  // A config without codedWidth/codedHeight (allowed: the avcC has the
+  // size): the decoder must still take a 4K key frame. Sized for 1920x1080,
+  // Android's software decoder has 2 MiB input buffers, and this key frame
+  // is about 3.4 MB.
+  it("decodes 4K key frames from a config without a coded size", async () => {
+    if (!supported() || !probes()) {
+      return;
+    }
+    const clip = path.join(clipDirectory, "clip-4k-noise.mp4");
+    fs.mkdirSync(clipDirectory, { recursive: true });
+    if (!fs.existsSync(clip)) {
+      execFileSync("ffmpeg", [
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "nullsrc=s=3840x2160:r=30:d=0.2,geq=lum='random(1)*255':cb=128:cr=128",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-qp",
+        "38",
+        "-g",
+        "1",
+        clip,
+      ]);
+    }
+    const sizes = execFileSync(
+      "ffprobe",
+      [
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "packet=size",
+        "-of",
+        "csv=p=0",
+        clip,
+      ],
+      { encoding: "utf8" },
+    )
+      .trim()
+      .split("\n")
+      .map(Number);
+    // Larger than 2 MiB, smaller than 4K's own 0.75 byte per pixel.
+    expect(sizes[0]).toBeGreaterThan(2.2e6);
+    expect(sizes[0]).toBeLessThan(5.5e6);
+    const file = await pushFile(clip);
+    const android = client.OS === "android";
+    const run = async (config: object) => {
+      if (android) {
+        logcatClear();
+      }
+      const decoded = await decodeOnDevice(file, config, [
+        "codedWidth",
+        "codedHeight",
+        "displayAspectWidth",
+        "displayAspectHeight",
+      ]);
+      const codecs = android
+        ? allocatedCodecs().filter((name) => /decoder/.test(name))
+        : [];
+      return {
+        frames: decoded.frames,
+        errors: decoded.errors,
+        width: decoded.first?.visibleRect.width,
+        height: decoded.first?.visibleRect.height,
+        codecs,
+      };
+    };
+    const software = await run({ hardwareAcceleration: "prefer-software" });
+    const plain = await run({});
+    console.log(`4k: ${JSON.stringify({ sizes, software, plain })}`);
+    const frames = {
+      frames: sizes.length,
+      errors: [],
+      width: 3840,
+      height: 2160,
+    };
+    expect({
+      software: { ...software, codecs: undefined },
+      plain: { ...plain, codecs: undefined },
+    }).toEqual({
+      software: { ...frames, codecs: undefined },
+      plain: { ...frames, codecs: undefined },
+    });
+    if (android) {
+      expect(software.codecs.length).toBeGreaterThan(0);
+      expect(
+        software.codecs.every((name) =>
+          /^(c2\.android\.|OMX\.google\.)/.test(name),
+        ),
+      ).toBe(true);
+    }
   }, 300000);
 
   // The example app's screens, through its own code (example/src/Tests.tsx
