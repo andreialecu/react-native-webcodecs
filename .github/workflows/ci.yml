@@ -16,6 +16,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      # The release dry run checks that it could push the release commit.
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,8 +45,10 @@ jobs:
         run: yarn specs && git diff --exit-code -- nitrogen
 
       # Validate the semantic-release config without publishing, so a broken
-      # .releaserc is caught on PRs rather than at release time.
+      # .releaserc is caught on main rather than at release time. Not on pull
+      # requests: a fork's token cannot push, and the dry run checks that.
       - name: Release dry run
+        if: github.event_name != 'pull_request'
         run: yarn semantic-release --dry-run
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
