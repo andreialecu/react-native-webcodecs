@@ -50,6 +50,14 @@ ffmpeg on the host:
 2. Launch the app on a simulator or emulator.
 3. At the repository root, run `yarn test`.
 
+To share the machine with other projects, start Metro on another port
+(`yarn start --port 8102`) and give Metro and `yarn test` the same
+`E2E_PORT` (for example `E2E_PORT=4300`, with Metro's `--reset-cache`).
+The app reaches the test server on `localhost`, through `adb reverse` on
+Android; where that does not work, start Metro with
+`E2E_ANDROID_HOST=10.0.2.2` (the emulator's address for this machine). With
+several Android devices attached, set `ANDROID_SERIAL` for `yarn test`.
+
 They cover:
 
 - 60 frames at 128×128 in memory: H.264, no B-frames, BT.709 tags, colors

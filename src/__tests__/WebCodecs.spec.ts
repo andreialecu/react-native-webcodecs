@@ -884,6 +884,165 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(result.huge).toBe(false);
   }, 60000);
 
+  // AudioEncoder alone, fed a 440 Hz sine in 1000-frame AudioData (not
+  // multiples of an AAC frame): `segments` runs, each from its own start
+  // time and followed by a flush. Returns each chunk's timestamp and
+  // duration, in µs, per run.
+  const encodeAac = (segments: { start: number; seconds: number }[]) =>
+    client.eval(
+      ({ webcodecs: wc, ctx }) => {
+        const rate = 48000;
+        const runs: (number | string)[][][] = [];
+        let run: (number | string)[][] = [];
+        const encoder = new wc.AudioEncoder({
+          output: (chunk: any) => run.push([chunk.timestamp, chunk.duration]),
+          error: (e: any) => run.push([-1, String(e)]),
+        });
+        encoder.configure({
+          codec: "mp4a.40.2",
+          sampleRate: rate,
+          numberOfChannels: 1,
+          bitrate: 128000,
+        });
+        const segment = (i: number): Promise<void> => {
+          if (i >= ctx.segments.length) {
+            return Promise.resolve();
+          }
+          const { start, seconds } = ctx.segments[i];
+          const total = Math.round(seconds * rate);
+          for (let at = 0; at < total; at += 1000) {
+            const frames = Math.min(1000, total - at);
+            const data = new Float32Array(frames);
+            for (let f = 0; f < frames; f++) {
+              data[f] = 0.5 * Math.sin((2 * Math.PI * 440 * (at + f)) / rate);
+            }
+            const audio = new wc.AudioData({
+              format: "f32",
+              sampleRate: rate,
+              numberOfFrames: frames,
+              numberOfChannels: 1,
+              timestamp: start + Math.round((at * 1e6) / rate),
+              data,
+            });
+            encoder.encode(audio);
+            audio.close();
+          }
+          return encoder.flush().then(() => {
+            runs.push(run);
+            run = [];
+            return segment(i + 1);
+          });
+        };
+        return segment(0).then(() => {
+          encoder.close();
+          return runs;
+        });
+      },
+      { ctx: { segments } },
+    ) as Promise<number[][][]>;
+
+  const FRAME_US = (1024 * 1e6) / 48000;
+
+  it("encodes 1 s of sound to 1 s of AAC, in steps of one frame", async () => {
+    if (!supported()) {
+      return;
+    }
+    const [chunks] = await encodeAac([{ start: 0, seconds: 1 }]);
+    expect(chunks.filter(([t]) => t < 0)).toEqual([]);
+    const [first] = chunks;
+    const last = chunks[chunks.length - 1];
+    // Every sample is in (the last frame padded), plus the encoder's
+    // priming, which is not trimmed.
+    expect(last[0] + last[1] - first[0]).toBeGreaterThanOrEqual(1e6);
+    expect(first[0]).toBe(0);
+    for (let i = 1; i < chunks.length; i++) {
+      expect(
+        Math.abs(chunks[i][0] - chunks[i - 1][0] - FRAME_US),
+      ).toBeLessThanOrEqual(1);
+    }
+  }, 60000);
+
+  it("starts the AAC timeline over after a flush", async () => {
+    if (!supported()) {
+      return;
+    }
+    const [, second] = await encodeAac([
+      { start: 0, seconds: 0.5 },
+      { start: 5e6, seconds: 0.5 },
+    ]);
+    expect(second.length).toBeGreaterThan(0);
+    expect(second[0][0]).toBe(5e6);
+  }, 60000);
+
+  it("flushes a VideoEncoder given two frames with one timestamp", async () => {
+    if (!supported()) {
+      return;
+    }
+    const result = (await client.eval(({ webcodecs: wc }) => {
+      const chunks: number[] = [];
+      const errors: string[] = [];
+      const encoder = new wc.VideoEncoder({
+        output: (chunk: any) => chunks.push(chunk.timestamp),
+        error: (e: any) => errors.push(String(e)),
+      });
+      encoder.configure({ codec: "avc1.42001f", width: 64, height: 64 });
+      const pool = wc.createSurfacePool(64, 64);
+      [0, 0, 33333, 66666].forEach((timestamp) => {
+        const frame = new wc.VideoFrame(pool.acquire(), { timestamp });
+        encoder.encode(frame, { keyFrame: timestamp === 0 });
+        frame.close();
+      });
+      const timeout = new Promise((resolve) =>
+        setTimeout(() => resolve("timeout"), 15000),
+      );
+      return Promise.race([
+        encoder.flush().then(
+          () => "flushed",
+          (e: any) => `${e.name}: ${e.message}`,
+        ),
+        timeout,
+      ]).then((flushed: any) => {
+        const queue = encoder.encodeQueueSize;
+        encoder.close();
+        return { flushed, chunks, errors, queue };
+      });
+    })) as any;
+    expect(result.errors).toEqual([]);
+    expect(result.flushed).toBe("flushed");
+    expect(result.queue).toBe(0);
+    expect(result.chunks.length).toBeGreaterThanOrEqual(3);
+  }, 60000);
+
+  it("writes into missing directories and reads percent-encoded file:// URLs", async () => {
+    if (!supported()) {
+      return;
+    }
+    const result = (await client.eval(({ webcodecs: wc }) => {
+      const written = wc.writeFile(
+        "e2e dir/nested/data.bin",
+        new Uint8Array([1, 2, 3, 4, 5]),
+      ) as string;
+      const url = `file://${written.split("/").map(encodeURIComponent).join("/")}`;
+      const source = wc.fileSourceOptions(url);
+      return Promise.resolve(source.read(0, 5)).then((bytes: Uint8Array) => {
+        const size = source.getSize();
+        source.dispose();
+        const writable = wc.createFileWritable("e2e dir/other/stream.bin");
+        const writer = writable.writable.getWriter();
+        return writer
+          .write({ type: "write", data: new Uint8Array([9, 9]), position: 0 })
+          .then(() => writer.close())
+          .then(() => {
+            wc.removeFile(writable.path);
+            wc.removeFile(written);
+            return { size, bytes: Array.from(bytes), url };
+          });
+      });
+    })) as any;
+    expect(result.size).toBe(5);
+    expect(result.bytes).toEqual([1, 2, 3, 4, 5]);
+  }, 60000);
+
   // iOS takes the hardware codecs away from a backgrounded app. Two exports,
   // one after the other, each sent to the background by opening Settings on
   // the Simulator and then brought back:
