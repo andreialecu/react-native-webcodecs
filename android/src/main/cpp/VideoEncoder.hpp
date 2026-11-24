@@ -25,6 +25,7 @@
 #include "HybridNativeVideoEncoderSpec.hpp"
 #include "NativeEncodedChunk.hpp"
 #include "NativeVideoEncoderConfig.hpp"
+#include "P010.hpp"
 #include "Surface.hpp"
 #include "Timestamps.hpp"
 
@@ -192,52 +193,6 @@ inline void waitFenceCpu(int fd) {
   pollfd p{fd, POLLIN, 0};
   ::poll(&p, 1, 1000);
   ::close(fd);
-}
-
-// One half float (IEEE 754 binary16) to a float.
-inline float halfToFloat(uint16_t h) {
-  __fp16 value;
-  std::memcpy(&value, &h, sizeof(value));
-  return static_cast<float>(value);
-}
-
-// Converts an RGBA half-float picture holding BT.2020 R'G'B' (already
-// encoded with the transfer function, 0 to 1) to P010: 10-bit BT.2020
-// non-constant-luminance YCbCr, limited range, 4:2:0, each sample in the top
-// 10 bits of 16, then Cb and Cr interleaved. `srcStride` is in half floats,
-// `dstStride` in bytes.
-inline void rgba16fToP010(const uint16_t* src, size_t srcStride, int width, int height, uint8_t* dst, size_t dstStride,
-                          size_t sliceHeight) {
-  auto code = [](float v, float offset, float range) {
-    float c = offset + range * v + 0.5f;
-    c = c < 0.0f ? 0.0f : (c > 1023.0f ? 1023.0f : c);
-    return static_cast<uint16_t>(static_cast<uint16_t>(c) << 6);
-  };
-  uint8_t* uv = dst + dstStride * sliceHeight;
-  std::vector<float> cb(width / 2);
-  std::vector<float> cr(width / 2);
-  for (int y = 0; y < height; y += 2) {
-    std::fill(cb.begin(), cb.end(), 0.0f);
-    std::fill(cr.begin(), cr.end(), 0.0f);
-    for (int dy = 0; dy < 2 && y + dy < height; dy++) {
-      const uint16_t* row = src + (y + dy) * srcStride;
-      auto* out = reinterpret_cast<uint16_t*>(dst + (y + dy) * dstStride);
-      for (int x = 0; x < width; x++) {
-        float r = halfToFloat(row[x * 4]);
-        float g = halfToFloat(row[x * 4 + 1]);
-        float b = halfToFloat(row[x * 4 + 2]);
-        float l = 0.2627f * r + 0.6780f * g + 0.0593f * b;
-        out[x] = code(l, 64.0f, 876.0f);
-        cb[x / 2] += (b - l) / 1.8814f;
-        cr[x / 2] += (r - l) / 1.4746f;
-      }
-    }
-    auto* out = reinterpret_cast<uint16_t*>(uv + (y / 2) * dstStride);
-    for (int i = 0; i < width / 2; i++) {
-      out[i * 2] = code(cb[i] / 4.0f, 512.0f, 896.0f);
-      out[i * 2 + 1] = code(cr[i] / 4.0f, 512.0f, 896.0f);
-    }
-  }
 }
 
 // H.264, or AV1, through MediaCodec. Frames are copied (GPU, EGL) into the
@@ -721,7 +676,7 @@ private:
     if (_aspects.hdr()) {
       // The layout of the input buffers: rows `stride` bytes apart, the
       // chroma plane `slice-height` rows after the luma one.
-      _stride = static_cast<size_t>(_config.width) * 2;
+      int32_t stride = 0;
       _sliceHeight = static_cast<size_t>(_config.height);
       // API 28, above this library's minimum (26).
       using GetInputFormat = AMediaFormat* (*)(AMediaCodec*);
@@ -731,17 +686,16 @@ private:
       if (input) {
         int32_t value = 0;
         if (AMediaFormat_getInt32(input, "stride", &value) && value > 0) {
-          _stride = static_cast<size_t>(value);
+          stride = value;
         }
-        if (AMediaFormat_getInt32(input, "slice-height", &value) && value > 0) {
+        // Never fewer rows than the picture has, or its chroma would land on
+        // its luma.
+        if (AMediaFormat_getInt32(input, "slice-height", &value) && value >= static_cast<int32_t>(_config.height)) {
           _sliceHeight = static_cast<size_t>(value);
         }
         AMediaFormat_delete(input);
       }
-      // A stride in pixels (some codecs) rather than bytes.
-      if (_stride < static_cast<size_t>(_config.width) * 2) {
-        _stride *= 2;
-      }
+      _stride = p010Stride(static_cast<int>(_config.width), stride);
       WC_LOG("video encoder: P010 input, stride %zu, slice height %zu", _stride, _sliceHeight);
     }
     _framesIn = 0;
@@ -1011,7 +965,7 @@ private:
     ssize_t index = dequeueInput();
     size_t capacity = 0;
     uint8_t* dst = AMediaCodec_getInputBuffer(_codec, static_cast<size_t>(index), &capacity);
-    size_t size = _stride * _sliceHeight * 3 / 2;
+    size_t size = p010Size(_stride, _sliceHeight);
     if (!dst || capacity < size) {
       throw std::runtime_error("the input buffer is too small for P010");
     }
