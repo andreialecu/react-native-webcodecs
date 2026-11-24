@@ -2142,6 +2142,77 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(after.chunks.length).toBe(3);
   }, 120000);
 
+  it("closes a VideoEncoder whose codec hangs without failing, in bounded time (Android fault)", async () => {
+    if (client.OS !== "android") {
+      return;
+    }
+    // Debug builds only: the codec's output is never taken, and the stall
+    // is not reported for 60 s, so nothing has failed when close() comes,
+    // with the GL thread blocked drawing.
+    setFault("venc-stall-output:60");
+    adb(["logcat", "-c"]);
+    let closed: any;
+    try {
+      closed = (await client.eval(({ webcodecs: wc }) => {
+        const errors: string[] = [];
+        const encoder = new wc.VideoEncoder({
+          output: () => {},
+          error: (e: any) => errors.push(String(e)),
+        });
+        encoder.configure({ codec: "avc1.42001f", width: 1280, height: 720 });
+        const pool = wc.createSurfacePool(1280, 720);
+        for (let i = 0; i < 90; i++) {
+          const frame = new wc.VideoFrame(pool.acquire(), {
+            timestamp: i * 33333,
+          });
+          encoder.encode(frame, { keyFrame: i === 0 });
+          frame.close();
+        }
+        return new Promise((resolve) => setTimeout(resolve, 1500)).then(() => {
+          const start = Date.now();
+          encoder.close();
+          return { ms: Date.now() - start, errors };
+        });
+      })) as any;
+    } finally {
+      setFault("");
+    }
+    // Closed by the user: no error. close() waits for the GL thread, then
+    // stops the codec itself and the draw returns.
+    expect(closed.errors).toEqual([]);
+    expect(closed.ms).toBeLessThan(5000);
+    expect(
+      /video encoder: released/.test(
+        adb(["logcat", "-d", "-s", "WebCodecs"]).toString(),
+      ),
+    ).toBe(true);
+    const after = (await client.eval(({ webcodecs: wc }) => {
+      const chunks: number[] = [];
+      const errors: string[] = [];
+      const encoder = new wc.VideoEncoder({
+        output: (chunk: any) => chunks.push(chunk.timestamp),
+        error: (e: any) => errors.push(String(e)),
+      });
+      encoder.configure({ codec: "avc1.42001f", width: 64, height: 64 });
+      const pool = wc.createSurfacePool(64, 64);
+      const frame = new wc.VideoFrame(pool.acquire(), { timestamp: 0 });
+      encoder.encode(frame, { keyFrame: true });
+      frame.close();
+      return encoder.flush().then(
+        () => {
+          encoder.close();
+          return { chunks, errors };
+        },
+        (e: any) => {
+          encoder.close();
+          return { chunks, errors: errors.concat([String(e)]) };
+        },
+      );
+    })) as any;
+    expect(after.errors).toEqual([]);
+    expect(after.chunks).toEqual([0]);
+  }, 120000);
+
   it("releases the old VideoEncoder codec before configure() makes a new one (Android fault)", async () => {
     if (client.OS !== "android") {
       return;
