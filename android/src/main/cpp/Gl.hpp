@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "Common.hpp"
+#include "Fence.hpp"
 
 namespace margelo::nitro::webcodecs {
 
@@ -84,20 +85,30 @@ public:
     }
   }
 
-  // GPU-side wait on a sync_fd (taken over, closed either way).
+  // Waits for a frame's sync_fd (taken over, closed either way): on the CPU
+  // first, bounded, so that a fence that never signals (a hung GPU) fails
+  // the frame (throws) instead of blocking this thread in the driver; then
+  // on the GPU, where EGL takes the fence, for drivers that order our reads
+  // through it. That one can no longer block: the fence has signalled.
   void waitFence(int fd) {
     if (fd < 0) {
       return;
     }
+    FenceWait wait = waitSyncFd(fd, kFenceTimeoutMs);
+    if (wait != FenceWait::Signaled) {
+      ::close(fd);
+      throw std::runtime_error(describeFenceWait(wait, kFenceTimeoutMs));
+    }
     const EGLint attributes[] = {EGL_SYNC_NATIVE_FENCE_FD_ANDROID, fd, EGL_NONE};
     EGLSyncKHR sync = eglCreateSyncKHR(_display, EGL_SYNC_NATIVE_FENCE_ANDROID, attributes);
     if (sync == EGL_NO_SYNC_KHR) {
-      // Not taken over: wait on the CPU instead.
+      // Not taken over; the CPU wait above was enough.
       ::close(fd);
-      glFinish();
       return;
     }
-    eglWaitSyncKHR(_display, sync, 0);
+    if (eglWaitSyncKHR(_display, sync, 0) != EGL_TRUE) {
+      WC_LOG("eglWaitSyncKHR failed (%d) on a signalled fence", eglGetError());
+    }
     eglDestroySyncKHR(_display, sync);
   }
 

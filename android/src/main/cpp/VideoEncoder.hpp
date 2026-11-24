@@ -69,6 +69,7 @@ constexpr auto kEndOfStreamDrainTimeout = std::chrono::milliseconds(200);
 //   venc-no-eos             the end of stream never comes out
 //   venc-stall-output:<s>   no output is taken, and <s> s without it is a stall
 //   venc-slow-stop:<ms>     stopping the codec takes <ms> ms longer
+//   venc-fence-hang         every frame's GPU fence is one that never signals
 // Release builds (NDEBUG) never read it.
 struct EncoderFault {
   bool noEndOfStream = false;
@@ -76,6 +77,9 @@ struct EncoderFault {
   int slowStopMs = 0;
   // The draw of this frame (1-based) fails on the GL thread.
   int drawFailAt = 0;
+  // Each frame's fence is replaced by the read end of a pipe nothing is
+  // written to: a fence that never signals (a hung GPU).
+  bool fenceHang = false;
 
   static EncoderFault read() {
     EncoderFault fault;
@@ -88,6 +92,8 @@ struct EncoderFault {
     };
     if (text == "venc-no-eos") {
       fault.noEndOfStream = true;
+    } else if (text == "venc-fence-hang") {
+      fault.fenceHang = true;
     } else if (text.rfind("venc-stall-output:", 0) == 0) {
       fault.stallOutputSeconds = std::max(1, argument("venc-stall-output:"));
     } else if (text.rfind("venc-slow-stop:", 0) == 0) {
@@ -185,14 +191,15 @@ inline std::vector<std::string> findVideoEncoders(const NativeVideoEncoderConfig
                                           mediaCodecProfile(config), config.codec == "avc", hdr ? kColorFormatYuvP010 : kColorFormatSurface);
 }
 
-// Waits on the CPU for a sync fd (taken over, closed either way).
+// Waits on the CPU for a sync fd (taken over, closed either way), at most
+// kFenceTimeoutMs.
 inline void waitFenceCpu(int fd) {
-  if (fd < 0) {
-    return;
+  if (waitSyncFd(fd, kFenceTimeoutMs) != FenceWait::Signaled) {
+    WC_LOG("video encoder: an HDR frame's GPU fence did not signal");
   }
-  pollfd p{fd, POLLIN, 0};
-  ::poll(&p, 1, 1000);
-  ::close(fd);
+  if (fd >= 0) {
+    ::close(fd);
+  }
 }
 
 // H.264, or AV1, through MediaCodec. Frames are copied (GPU, EGL) into the
@@ -266,7 +273,7 @@ public:
     uint32_t visibleWidth = native->visibleWidth();
     uint32_t visibleHeight = native->visibleHeight();
     int64_t ts = static_cast<int64_t>(timestamp);
-    _gl.post([this, ref, fence, visibleWidth, visibleHeight, ts, duration, keyFrame] {
+    _gl.post([this, ref, fence, visibleWidth, visibleHeight, ts, duration, keyFrame]() mutable {
       if (_failed) {
         if (fence >= 0) {
           ::close(fence);
@@ -317,6 +324,16 @@ public:
             ::close(fence);
           }
           throw std::runtime_error("fault: the draw failed");
+        }
+        if (_fault.fenceHang) {
+          int ends[2];
+          if (::pipe(ends) == 0) {
+            if (fence >= 0) {
+              ::close(fence);
+            }
+            fence = ends[0];
+            _faultPipes.push_back(ends[1]);
+          }
         }
         if (_aspects.hdr()) {
           waitFenceCpu(fence);
@@ -750,6 +767,10 @@ private:
       ANativeWindow_release(_nativeWindow);
       _nativeWindow = nullptr;
     }
+    for (int end : _faultPipes) {
+      ::close(end);
+    }
+    _faultPipes.clear();
   }
 
   // stop() on a failure path, where the first error is the one to report.
@@ -1132,6 +1153,8 @@ private:
   std::atomic<bool> _hardware{false};
   // Set in start(), before the drain thread starts (which reads it).
   EncoderFault _fault;
+  // venc-fence-hang: the write ends of the pipes standing in for fences.
+  std::vector<int> _faultPipes;
   // The codec's name, for the log.
   std::string _codecLabel;
   std::thread _drain;

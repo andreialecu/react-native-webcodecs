@@ -2281,6 +2281,63 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(log).not.toMatch(/stopping .* from another thread/);
   }, 120000);
 
+  it("fails a VideoEncoder whose frame's GPU fence never signals (Android fault)", async () => {
+    if (client.OS !== "android") {
+      return;
+    }
+    // Debug builds only: every frame's fence is a pipe nothing is written
+    // to, as a hung GPU's would be. The wait is bounded: the frame fails
+    // with an EncodingError instead of being drawn unfinished or blocking
+    // the GL thread for ever.
+    setFault("venc-fence-hang");
+    let run: any;
+    try {
+      run = (await client.eval(({ webcodecs: wc }) => {
+        const errors: string[] = [];
+        let chunks = 0;
+        const encoder = new wc.VideoEncoder({
+          output: () => {
+            chunks++;
+          },
+          error: (e: any) => {
+            errors.push(`${e.name}: ${e.message}`);
+          },
+        });
+        encoder.configure({ codec: "avc1.42001f", width: 320, height: 240 });
+        const pool = wc.createSurfacePool(320, 240);
+        for (let i = 0; i < 5; i++) {
+          const frame = new wc.VideoFrame(pool.acquire(), {
+            timestamp: i * 33333,
+          });
+          encoder.encode(frame, { keyFrame: i === 0 });
+          frame.close();
+        }
+        const started = Date.now();
+        return Promise.race([
+          encoder.flush().then(
+            () => "flushed",
+            () => "failed",
+          ),
+          new Promise((resolve) => setTimeout(() => resolve("timeout"), 30000)),
+        ]).then((outcome: any) => {
+          const { state } = encoder;
+          if (state !== "closed") {
+            encoder.close();
+          }
+          return { outcome, errors, chunks, state, ms: Date.now() - started };
+        });
+      })) as any;
+    } finally {
+      setFault("");
+    }
+    console.log(`fence hang: ${JSON.stringify(run)}`);
+    expect(run.outcome).toBe("failed");
+    expect(run.errors.length).toBe(1);
+    expect(run.errors[0]).toMatch(/^EncodingError: .*fence did not signal/);
+    expect(run.chunks).toBe(0);
+    expect(run.state).toBe("closed");
+  }, 120000);
+
   it("releases the old VideoEncoder codec before configure() makes a new one (Android fault)", async () => {
     if (client.OS !== "android") {
       return;
