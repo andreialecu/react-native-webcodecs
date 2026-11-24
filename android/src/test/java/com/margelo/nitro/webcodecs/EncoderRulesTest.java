@@ -6,6 +6,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.util.Arrays;
+import java.util.function.IntPredicate;
 
 import org.junit.Test;
 
@@ -62,6 +63,16 @@ public class EncoderRulesTest {
     }
 
     @Override
+    public int widthAlignment() {
+      return widthAlignment;
+    }
+
+    @Override
+    public int heightAlignment() {
+      return heightAlignment;
+    }
+
+    @Override
     public int bitrateLower() {
       return 1;
     }
@@ -97,8 +108,8 @@ public class EncoderRulesTest {
     Fake small = new Fake("small").size(640, 480);
     Fake a = new Fake("a");
     Fake b = new Fake("b");
-    assertEquals("a", EncoderRules.choose(Arrays.asList(small, a, b), 1280, 720, 0, SURFACE));
-    assertNull(EncoderRules.choose(Arrays.asList(small), 1280, 720, 0, SURFACE));
+    assertEquals("a", EncoderRules.choose(Arrays.asList(small, a, b), 1280, 720, 0, SURFACE, h -> false));
+    assertNull(EncoderRules.choose(Arrays.asList(small), 1280, 720, 0, SURFACE, h -> false));
   }
 
   // The frame rate and bitrate are hints (as in Media3): an encoder is not
@@ -139,5 +150,44 @@ public class EncoderRulesTest {
     // No frame rate (or below 1): 30.
     assertEquals(2_764_800, EncoderRules.bitrate(0, 1280, 720, 0.5, 1, 80_000_000));
     assertEquals(500_000, EncoderRules.bitrate(0, 64, 64, 30, 500_000, 80_000_000));
+  }
+
+  // Encoders listing a 16-pixel alignment often take 1080 rows (ExoPlayer
+  // #6551): the size is checked aligned up too (the encoder is still given
+  // the size asked for).
+  @Test
+  public void sizesAreCheckedAlignedUp() {
+    Fake encoder = new Fake("hw").size(1920, 1088).align(16, 16);
+    assertTrue(EncoderRules.fits(encoder, 1920, 1080, 0, SURFACE));
+    assertTrue(EncoderRules.fits(encoder, 1278, 718, 0, SURFACE));
+    assertFalse(EncoderRules.fits(encoder, 1930, 1080, 0, SURFACE));
+  }
+
+  // Encoders limit the number of macroblocks rather than the orientation
+  // (as Media3 assumes): a portrait size is retried swapped.
+  @Test
+  public void portraitSizesAreRetriedSwapped() {
+    Fake encoder = new Fake("hw").size(1920, 1088);
+    assertTrue(EncoderRules.fits(encoder, 1080, 1920, 0, SURFACE));
+    assertTrue(EncoderRules.fits(encoder, 720, 1280, 0, SURFACE));
+    assertFalse(EncoderRules.fits(encoder, 1088, 2000, 0, SURFACE));
+  }
+
+  // Some Samsung, Huawei and Pixel 6 encoders list 1072 rows for H.264
+  // 1920x1080 and 2144 for HEVC 3840x2160 (b/222095724, b/229825948):
+  // CamcorderProfile vouches for those two sizes, as in Media3.
+  @Test
+  public void camcorderProfilesVouchFor1080pAnd2160p() {
+    Fake avc = new Fake("hw").size(1920, 1072).align(16, 16);
+    Fake hevc = new Fake("hw").size(3840, 2144).align(16, 16);
+    IntPredicate both = height -> height == 1080 || height == 2160;
+    IntPredicate none = height -> false;
+    assertTrue(EncoderRules.fits(avc, 1920, 1080, 0, SURFACE, both));
+    assertTrue(EncoderRules.fits(avc, 1080, 1920, 0, SURFACE, both));
+    assertTrue(EncoderRules.fits(hevc, 3840, 2160, 0, SURFACE, both));
+    assertFalse(EncoderRules.fits(avc, 1920, 1080, 0, SURFACE, none));
+    assertFalse(EncoderRules.fits(hevc, 3840, 2160, 0, SURFACE, none));
+    assertFalse(EncoderRules.fits(avc, 1280, 1080, 0, SURFACE, both));
+    assertFalse(EncoderRules.fits(hevc, 3840, 2160, 0, SURFACE, height -> height == 1080));
   }
 }

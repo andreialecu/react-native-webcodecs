@@ -1,5 +1,6 @@
 package com.margelo.nitro.webcodecs;
 
+import android.media.CamcorderProfile;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
 import android.os.Build;
@@ -20,7 +21,8 @@ public final class Capabilities {
 
   /**
    * The name of the first encoder for `mime` (in the platform's order, as
-   * MediaCodec.createEncoderByType picks) that takes frames of this size, in
+   * MediaCodec.createEncoderByType picks) that takes frames of this size
+   * (read leniently, as in Media3: see EncoderRules.sizeSupported), in
    * this profile (ignored when 0 or less) and input color format; or null
    * when none does. The frame rate and bitrate are hints, as in Media3: they
    * refuse no encoder (see videoBitrate).
@@ -28,7 +30,26 @@ public final class Capabilities {
   @Keep
   @Nullable
   public static String findVideoEncoder(String mime, int width, int height, int profile, int colorFormat) {
-    return EncoderRules.choose(videoEncoders(mime), width, height, profile, colorFormat);
+    return EncoderRules.choose(videoEncoders(mime), width, height, profile, colorFormat, Capabilities::camcorderHasHeight);
+  }
+
+  // Whether the device records 1080p (1080) or 4K (2160) video, by its
+  // CamcorderProfile: Media3's cross-check for encoders that list fewer rows
+  // than they take. False on devices with no camera.
+  private static boolean camcorderHasHeight(int height) {
+    int quality;
+    if (height == 1080) {
+      quality = CamcorderProfile.QUALITY_1080P;
+    } else if (height == 2160) {
+      quality = CamcorderProfile.QUALITY_2160P;
+    } else {
+      return false;
+    }
+    try {
+      return CamcorderProfile.hasProfile(quality);
+    } catch (RuntimeException e) {
+      return false;
+    }
   }
 
   /**
@@ -98,6 +119,16 @@ public final class Capabilities {
     @Override
     public boolean isSizeSupported(int width, int height) {
       return video.isSizeSupported(width, height);
+    }
+
+    @Override
+    public int widthAlignment() {
+      return video.getWidthAlignment();
+    }
+
+    @Override
+    public int heightAlignment() {
+      return video.getHeightAlignment();
     }
 
     @Override
