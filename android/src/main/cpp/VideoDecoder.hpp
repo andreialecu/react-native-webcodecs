@@ -184,6 +184,22 @@ public:
       return promise;
     }
     _input.post([this, promise] {
+      // Nothing since configure() or the last flush: nothing to wait for,
+      // and no end of stream (some decoders mishandle one as the first
+      // input) or codec flush.
+      if (_queuedSinceFlush == 0) {
+        if (_failed) {
+          std::string failure;
+          {
+            std::lock_guard<std::mutex> lock(_mutex);
+            failure = _failure;
+          }
+          promise->reject(std::make_exception_ptr(std::runtime_error(failure)));
+        } else {
+          promise->resolve();
+        }
+        return;
+      }
       if (!_failed) {
         queueInput(nullptr, 0, 0, kBufferFlagEndOfStream);
       }
@@ -230,6 +246,7 @@ public:
         _acquired = 0;
         _durations.clear();
       }
+      _queuedSinceFlush = 0;
       startDrain();
       promise->resolve();
     });
@@ -285,6 +302,8 @@ private:
     media_status_t status = AMediaCodec_queueInputBuffer(_codec, index, 0, size, ts, flags);
     if (status != AMEDIA_OK) {
       fail(describeCodecStatus(status, "decoder", "decoder"));
+    } else if ((flags & kBufferFlagEndOfStream) == 0) {
+      _queuedSinceFlush++;
     }
   }
 
@@ -518,6 +537,8 @@ private:
   std::atomic<bool> _reported{false};
   std::atomic<bool> _shutdown{false};
   std::thread _drain;
+  // Chunks queued since configure() or the last flush (the input thread's).
+  int64_t _queuedSinceFlush = 0;
 
   SerialQueue _input{"wc-vdec-input"};
   SerialQueue _deliver{"wc-vdec-out"};

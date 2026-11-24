@@ -1630,6 +1630,124 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(times.filter((t, i) => i > 0 && t <= times[i - 1])).toEqual([]);
   }, 180000);
 
+  // A flush with nothing decoded since configure() or the last flush has
+  // nothing to wait for: it resolves at once, outputs nothing, and the
+  // decoder decodes the whole clip after it, on either decoder.
+  it("flushes a VideoDecoder with nothing queued, then decodes after flushes", async () => {
+    if (!supported() || !probes()) {
+      return;
+    }
+    const file = await sourceClip(false);
+    const run = (hardwareAcceleration?: string) =>
+      runOnDevice<any>(
+        ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+          const input = new mb.Input({
+            source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+            formats: mb.ALL_FORMATS,
+          });
+          return input.getPrimaryVideoTrack().then((track: any) =>
+            track.getDecoderConfig().then((config: any) => {
+              const errors: string[] = [];
+              let times: number[] = [];
+              const decoder = new wc.VideoDecoder({
+                output: (frame: any) => {
+                  times.push(frame.timestamp);
+                  frame.close();
+                },
+                error: (e: any) => errors.push(String(e)),
+              });
+              decoder.configure(
+                ctx.hardwareAcceleration
+                  ? Object.assign({}, config, {
+                      hardwareAcceleration: ctx.hardwareAcceleration,
+                    })
+                  : config,
+              );
+              const timedFlush = () => {
+                const before = times.length;
+                const t0 = Date.now();
+                return decoder.flush().then(() => ({
+                  ms: Date.now() - t0,
+                  frames: times.length - before,
+                }));
+              };
+              const pass = () => {
+                times = [];
+                const packets = new mb.EncodedPacketSink(track).packets();
+                const step = (): Promise<void> =>
+                  packets.next().then((r: any) => {
+                    if (r.done) {
+                      return undefined;
+                    }
+                    decoder.decode(r.value.toEncodedVideoChunk());
+                    return step();
+                  });
+                return step()
+                  .then(() => decoder.flush())
+                  .then(() => ({
+                    frames: times.length,
+                    unordered: times.filter(
+                      (t, i) => i > 0 && t <= times[i - 1]!,
+                    ).length,
+                  }));
+              };
+              const out: any = { errors };
+              return timedFlush()
+                .then((r: any) => {
+                  out.first = r;
+                  return timedFlush();
+                })
+                .then((r: any) => {
+                  out.second = r;
+                  return pass();
+                })
+                .then((r: any) => {
+                  out.one = r;
+                  return timedFlush();
+                })
+                .then((r: any) => {
+                  out.again = r;
+                  return pass();
+                })
+                .then((r: any) => {
+                  out.two = r;
+                  decoder.close();
+                  input.dispose();
+                  return out;
+                });
+            }),
+          );
+        },
+        { file, hardwareAcceleration },
+        180000,
+      );
+    const plain = await run();
+    const software = await run("prefer-software");
+    console.log(`empty flush: ${JSON.stringify({ plain, software })}`);
+    for (const result of [plain, software]) {
+      const empty = { frames: 0, fast: true };
+      const flushed = (r: { ms: number; frames: number }) => ({
+        frames: r.frames,
+        fast: r.ms < 200,
+      });
+      expect({
+        errors: result.errors,
+        first: flushed(result.first),
+        second: flushed(result.second),
+        again: flushed(result.again),
+        one: result.one,
+        two: result.two,
+      }).toEqual({
+        errors: [],
+        first: empty,
+        second: empty,
+        again: empty,
+        one: { frames: 90, unordered: 0 },
+        two: { frames: 90, unordered: 0 },
+      });
+    }
+  }, 400000);
+
   // hardwareAcceleration picks the decoder: "prefer-software" a software
   // one (on the emulator c2.android.avc.decoder rather than goldfish's),
   // "prefer-hardware" none of those. iOS takes the preference as a hint.
