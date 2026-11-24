@@ -6,7 +6,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <initializer_list>
+#include <optional>
 
+#include "AudioRules.hpp"
 #include "Common.hpp"
 #include "HybridNativeAudioDecoderSpec.hpp"
 #include "HybridNativeAudioEncoderSpec.hpp"
@@ -25,20 +28,25 @@ public:
     stop();
   }
 
-  void start(AMediaFormat* format, bool encoder, const std::string& mime) {
+  // Starts the first of `names` that exists and takes `format`, else the
+  // platform's default for `mime`. Returns the codec's name ("" when the
+  // platform does not tell it).
+  std::string start(AMediaFormat* format, bool encoder, const std::string& mime,
+                    std::initializer_list<const char*> names = {}) {
+    for (const char* name : names) {
+      if ((_codec = AMediaCodec_createCodecByName(name)) && configureAndStart(format, encoder) == AMEDIA_OK) {
+        return name;
+      }
+    }
     _codec = encoder ? AMediaCodec_createEncoderByType(mime.c_str()) : AMediaCodec_createDecoderByType(mime.c_str());
     if (!_codec) {
       throw domError("NotSupportedError", "no MediaCodec for " + mime);
     }
-    media_status_t status = AMediaCodec_configure(_codec, format, nullptr, nullptr, encoder ? AMEDIACODEC_CONFIGURE_FLAG_ENCODE : 0);
-    if (status == AMEDIA_OK) {
-      status = AMediaCodec_start(_codec);
-    }
+    media_status_t status = configureAndStart(format, encoder);
     if (status != AMEDIA_OK) {
-      AMediaCodec_delete(_codec);
-      _codec = nullptr;
       throw domError("NotSupportedError", "MediaCodec " + mime + " failed to start (" + std::to_string(status) + ")");
     }
+    return codecName(_codec).value_or("");
   }
 
   void stop() {
@@ -93,14 +101,24 @@ public:
   }
 
 private:
+  // Configures and starts _codec; on failure, deletes it.
+  media_status_t configureAndStart(AMediaFormat* format, bool encoder) {
+    media_status_t status = AMediaCodec_configure(_codec, format, nullptr, nullptr, encoder ? AMEDIACODEC_CONFIGURE_FLAG_ENCODE : 0);
+    if (status == AMEDIA_OK) {
+      status = AMediaCodec_start(_codec);
+    }
+    if (status != AMEDIA_OK) {
+      AMediaCodec_delete(_codec);
+      _codec = nullptr;
+    }
+    return status;
+  }
+
   AMediaCodec* _codec = nullptr;
 };
 
-// The AAC-LC encoder's delay in sample frames: FDK's (Codec2's
-// c2.android.aac.encoder), 1024 + 576. Frames up to the input plus this
-// carry sound; flush() pads with kAacPaddingFrames frames of silence, enough
-// to push out the delay and a partial last frame.
-constexpr int64_t kAacEncoderDelay = 1600;
+// flush() pads with kAacPaddingFrames frames of silence, enough to push out
+// the encoder's delay (aacEncoderDelay) and a partial last frame.
 constexpr int64_t kAacPaddingFrames = 3;
 
 // AAC-LC from f32 interleaved PCM.
@@ -224,13 +242,18 @@ private:
     double bitrate = _config.bitrate.value_or(0);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_BIT_RATE, bitrate > 0 ? static_cast<int32_t>(bitrate) : 128000);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, 64 * 1024);
+    std::string name;
     try {
-      _codec.start(format, true, "audio/mp4a-latm");
+      // FDK by name when there, whose delay is known; then the default.
+      name = _codec.start(format, true, "audio/mp4a-latm", {kAacEncoderNames[0], kAacEncoderNames[1]});
     } catch (...) {
       AMediaFormat_delete(format);
       throw;
     }
     AMediaFormat_delete(format);
+    _delay = aacEncoderDelay(name);
+    WC_LOG("audio encoder: %s (delay %lld)", name.empty() ? "?" : name.c_str(),
+           static_cast<long long>(_delay.value_or(-1)));
     _ended = false;
     _eos = false;
     // A new stream: timed from its own first input.
@@ -274,7 +297,7 @@ private:
         const uint8_t* bytes = data + info.offset;
         if (info.flags & kBufferFlagCodecConfig) {
           _config_bytes.assign(bytes, bytes + info.size);
-        } else if (!_closed && _framesOut * 1024 < _framesIn + kAacEncoderDelay) {
+        } else if (!_closed && aacKeepFrame(_framesOut, _framesIn, _delay)) {
           // (Past that, a frame holds only the silence flush() added.)
           std::optional<std::shared_ptr<ArrayBuffer>> description;
           if (!_config_bytes.empty() && _config_bytes != _sentDescription) {
@@ -327,6 +350,8 @@ private:
   std::optional<int64_t> _firstPts;
   int64_t _framesIn = 0;
   int64_t _framesOut = 0;
+  // The encoder's delay in sample frames, when known (FDK's).
+  std::optional<int64_t> _delay;
   bool _ended = false;
   bool _eos = false;
 

@@ -1,12 +1,15 @@
 #pragma once
 
 #include <android/log.h>
+#include <dlfcn.h>
+#include <media/NdkMediaCodec.h>
 
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -25,6 +28,22 @@ inline std::runtime_error domError(const std::string& name, const std::string& m
 
 inline std::string errorMessage(const std::string& name, const std::string& code, const std::string& message) {
   return name + ": " + code + ": " + message;
+}
+
+// A codec's name, when the platform tells it: AMediaCodec_getName is
+// API 28, above this library's minimum (26).
+inline std::optional<std::string> codecName(AMediaCodec* codec) {
+  using GetName = media_status_t (*)(AMediaCodec*, char**);
+  using ReleaseName = void (*)(AMediaCodec*, char*);
+  static auto getName = reinterpret_cast<GetName>(dlsym(RTLD_DEFAULT, "AMediaCodec_getName"));
+  static auto releaseName = reinterpret_cast<ReleaseName>(dlsym(RTLD_DEFAULT, "AMediaCodec_releaseName"));
+  char* name = nullptr;
+  if (!codec || !getName || !releaseName || getName(codec, &name) != AMEDIA_OK || !name) {
+    return std::nullopt;
+  }
+  std::string result(name);
+  releaseName(codec, name);
+  return result;
 }
 
 // One worker thread running tasks in order. Declare it as the last member of

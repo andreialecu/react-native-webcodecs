@@ -23,6 +23,7 @@
   "scripts": {
     "test": "NODE_OPTIONS='--experimental-require-module' jest -i",
     "test:unit": "jest -c jest.unit.config.js",
+    "test:cpp": "mkdir -p android/build/test-cpp && c++ -std=c++20 -Wall -Wextra -Werror -I android/src/main/cpp -o android/build/test-cpp/audio_rules android/src/test/cpp/audio_rules_test.cpp && android/build/test-cpp/audio_rules",
     "lint": "eslint . --ext .ts,.tsx --max-warnings 0 --cache --fix && yarn example lint",
     "tsc": "tsc --noEmit && yarn example tsc",
     "build": "bob build",
