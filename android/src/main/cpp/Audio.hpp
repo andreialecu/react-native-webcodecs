@@ -96,6 +96,13 @@ private:
   AMediaCodec* _codec = nullptr;
 };
 
+// The AAC-LC encoder's delay in sample frames: FDK's (Codec2's
+// c2.android.aac.encoder), 1024 + 576. Frames up to the input plus this
+// carry sound; flush() pads with kAacPaddingFrames frames of silence, enough
+// to push out the delay and a partial last frame.
+constexpr int64_t kAacEncoderDelay = 1600;
+constexpr int64_t kAacPaddingFrames = 3;
+
 // AAC-LC from f32 interleaved PCM.
 class HybridNativeAudioEncoder : public HybridNativeAudioEncoderSpec {
 public:
@@ -138,6 +145,10 @@ public:
         _codec.stop();
         start();
       }
+      if (!_firstPts.has_value()) {
+        _firstPts = ts;
+      }
+      _framesIn += static_cast<int64_t>(s16.size()) / _channels;
       const auto* bytes = reinterpret_cast<const uint8_t*>(s16.data());
       size_t size = s16.size() * sizeof(int16_t);
       // pts of a byte offset: offset / (2 * channels) / sampleRate seconds.
@@ -160,8 +171,20 @@ public:
     }
     _queue.post([this, promise] {
       if (!_failed && !_ended) {
-        media_status_t status = _codec.feed(nullptr, 0, _lastPts, 0, 0, kBufferFlagEndOfStream,
-                                            [this](int64_t timeout) { return drain(timeout); });
+        // What the encoder still holds (its delay, and the last partial
+        // frame) must come out before the end of stream: Codec2's AAC
+        // encoder flushes it at EOS, but MediaCodec then discards those
+        // late outputs. Silence pushes them out as ordinary frames; drain()
+        // keeps only the frames that carry input.
+        std::vector<int16_t> silence(static_cast<size_t>(kAacPaddingFrames) * 1024 * _channels, 0);
+        int64_t end = inputEndPts();
+        media_status_t status =
+            _codec.feed(reinterpret_cast<const uint8_t*>(silence.data()), silence.size() * sizeof(int16_t), end, 1000000,
+                        int64_t(2) * _channels * _sampleRate, 0, [this](int64_t timeout) { return drain(timeout); });
+        if (status == AMEDIA_OK) {
+          status = _codec.feed(nullptr, 0, end + kAacPaddingFrames * 1024 * 1000000LL / _sampleRate, 0, 0,
+                               kBufferFlagEndOfStream, [this](int64_t timeout) { return drain(timeout); });
+        }
         for (int i = 0; status == AMEDIA_OK && !_eos && i < 2000; i++) {
           status = drain(5000);
         }
@@ -205,6 +228,15 @@ private:
     AMediaFormat_delete(format);
     _ended = false;
     _eos = false;
+    // A new stream: timed from its own first input.
+    _firstPts.reset();
+    _framesIn = 0;
+    _framesOut = 0;
+  }
+
+  // The end of the input fed since start(), in µs.
+  int64_t inputEndPts() const {
+    return _firstPts.value_or(0) + _framesIn * 1000000LL / _sampleRate;
   }
 
   void sync() {
@@ -237,16 +269,21 @@ private:
         const uint8_t* bytes = data + info.offset;
         if (info.flags & kBufferFlagCodecConfig) {
           _config_bytes.assign(bytes, bytes + info.size);
-        } else if (!_closed) {
+        } else if (!_closed && _framesOut * 1024 < _framesIn + kAacEncoderDelay) {
+          // (Past that, a frame holds only the silence flush() added.)
           std::optional<std::shared_ptr<ArrayBuffer>> description;
           if (!_config_bytes.empty() && _config_bytes != _sentDescription) {
             _sentDescription = _config_bytes;
             description = ArrayBuffer::copy(_config_bytes);
           }
           double duration = 1024.0 * 1e6 / _sampleRate;
-          _lastPts = info.presentationTimeUs;
-          _output(NativeEncodedChunk(ArrayBuffer::copy(bytes, info.size), static_cast<double>(info.presentationTimeUs),
-                                     duration, true, description));
+          // Timed by frame count from the first input, as on iOS: the
+          // codec's own timestamps follow the input buffers' boundaries
+          // and jump at the end of stream.
+          double pts = static_cast<double>(_firstPts.value_or(0)) +
+                       std::round(static_cast<double>(_framesOut) * 1024.0 * 1e6 / _sampleRate);
+          _framesOut++;
+          _output(NativeEncodedChunk(ArrayBuffer::copy(bytes, info.size), pts, duration, true, description));
         }
       }
       AMediaCodec_releaseOutputBuffer(_codec.get(), index, false);
@@ -280,7 +317,11 @@ private:
   AudioCodec _codec;
   std::vector<uint8_t> _config_bytes;
   std::vector<uint8_t> _sentDescription;
-  int64_t _lastPts = 0;
+  // Timing of the current stream: the first input's timestamp, the sample
+  // frames fed, and the AAC frames output.
+  std::optional<int64_t> _firstPts;
+  int64_t _framesIn = 0;
+  int64_t _framesOut = 0;
   bool _ended = false;
   bool _eos = false;
 
