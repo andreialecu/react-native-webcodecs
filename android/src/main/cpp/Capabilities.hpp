@@ -55,6 +55,30 @@ struct JCapabilities : facebook::jni::JavaClass<JCapabilities> {
     return bitrate;
   }
 
+  // The H.264 profile and level (MediaCodecInfo.CodecProfileLevel) to give
+  // the encoder `name`: `profile`, or the next one down it lists (High,
+  // Main, Baseline); the codec string's level (`levelIdc`), raised to what
+  // the size and frame rate need, capped at the encoder's highest for the
+  // profile. None when it lists no profile that will do: it then gets
+  // neither. See EncoderRules.avcProfile and avcLevel.
+  struct AvcProfileLevel {
+    int32_t profile = 0;
+    int32_t level = 0;
+  };
+  static AvcProfileLevel avcProfileLevel(const std::string& name, const std::string& mime, int profile, int levelIdc, int width,
+                                         int height, double frameRate) {
+    jlong packed = 0;
+    facebook::jni::ThreadScope::WithClassLoader([&] {
+      static const auto method =
+          javaClassStatic()
+              ->getStaticMethod<jlong(facebook::jni::alias_ref<facebook::jni::JString>, facebook::jni::alias_ref<facebook::jni::JString>, jint,
+                                      jint, jint, jint, jdouble)>("avcProfileLevel");
+      packed = method(javaClassStatic(), facebook::jni::make_jstring(name), facebook::jni::make_jstring(mime), profile, levelIdc, width,
+                      height, frameRate);
+    });
+    return {static_cast<int32_t>(packed >> 32), static_cast<int32_t>(packed & 0xFFFFFFFF)};
+  }
+
   // The decoders for `mime` that take this size, in the platform's order:
   // with "prefer-software" only software ones, with "prefer-hardware" none
   // of those.

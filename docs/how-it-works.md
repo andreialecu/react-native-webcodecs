@@ -65,8 +65,13 @@ Either way the JavaScript thread never waits for the GPU: drawing frame
 - **Android**: a `MediaCodec` encoder in surface-input mode. An EGL context
   samples each `AHardwareBuffer` as an external texture and draws it into
   the codec's input surface (one GPU copy per frame). `max-bframes` is 0.
-  When an encoder refuses a setting (operating rate, profile, frame rate),
-  `configure` retries without it, as Media3 does. Each codec runs on its own
+  H.264's profile is set with a level, as Media3 and Chromium do: the codec
+  string's level, raised to what the size and frame rate need and capped at
+  the encoder's highest; an encoder without the profile gets the next one
+  down it lists (High, Main, Baseline). When an encoder refuses a setting,
+  `configure` retries: first with a lower operating rate, then none and at
+  most 30 fps, keeping the profile; then the same again without the profile
+  and level, as Media3 does. Each codec runs on its own
   worker thread. HDR is different: the encoder runs in buffer mode, and each
   half-float surface is read on the CPU and converted to P010 (10-bit
   BT.2020 YCbCr) into an input buffer, as an EGL window has no 10-bit format

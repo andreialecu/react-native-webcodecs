@@ -74,6 +74,24 @@ public final class Capabilities {
     return EncoderRules.bitrate(requested, width, height, frameRate, lower, upper);
   }
 
+  /**
+   * The H.264 profile and level (MediaCodecInfo.CodecProfileLevel) to give
+   * the encoder `name`, as (profile << 32) | level: see
+   * EncoderRules.avcProfile and avcLevel. 0 when the encoder lists no
+   * profile that will do, or is not found: it then gets neither.
+   */
+  @Keep
+  public static long avcProfileLevel(String name, String mime, int profile, int levelIdc, int width, int height, double frameRate) {
+    for (EncoderRules.Encoder encoder : videoEncoders(mime)) {
+      if (encoder.name().equals(name)) {
+        int chosen = EncoderRules.avcProfile(encoder, profile);
+        int level = EncoderRules.avcLevel(encoder, chosen, levelIdc, width, height, frameRate);
+        return level > 0 ? ((long) chosen << 32) | level : 0;
+      }
+    }
+    return 0;
+  }
+
   // The encoders for `mime`, in the platform's order, aliases left out.
   private static List<EncoderRules.Encoder> videoEncoders(String mime) {
     List<EncoderRules.Encoder> encoders = new ArrayList<>();
@@ -156,6 +174,15 @@ public final class Capabilities {
         profiles[i] = caps.profileLevels[i].profile;
       }
       return profiles;
+    }
+
+    @Override
+    public int[] levels() {
+      int[] levels = new int[caps.profileLevels.length];
+      for (int i = 0; i < levels.length; i++) {
+        levels[i] = caps.profileLevels[i].level;
+      }
+      return levels;
     }
 
     @Override

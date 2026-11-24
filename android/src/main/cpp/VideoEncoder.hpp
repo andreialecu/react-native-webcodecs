@@ -19,6 +19,7 @@
 #include <optional>
 
 #include "Capabilities.hpp"
+#include "EncoderAttempts.hpp"
 #include "Gl.hpp"
 #include "HybridNativeVideoEncoderSpec.hpp"
 #include "NativeEncodedChunk.hpp"
@@ -425,11 +426,23 @@ private:
     std::string encoderName = codecName(_codec);
     double bitrate = JCapabilities::videoBitrate(encoderName, videoMime(_config.codec), _config.bitrate.value_or(0), width, height,
                                                  _config.framerate.value_or(0));
-    // From the most to the least demanding: each attempt drops a setting some
-    // encoders refuse at configure time (as #641's writer, after Media3 and
-    // react-native-skia-video). A codec a configure failed on is in an error
+    // H.264's profile goes with a level (OMX encoders refuse a profile
+    // alone): the next profile down when the encoder does not list the one
+    // asked for, and neither when it lists none that will do. AV1's profile
+    // is always set: without it the encoder makes 8-bit streams.
+    int32_t profile = mediaCodecProfile(_config);
+    int32_t level = 0;
+    if (_config.codec == "avc" && profile > 0) {
+      auto chosen = JCapabilities::avcProfileLevel(encoderName, videoMime(_config.codec), profile,
+                                                   static_cast<int>(_config.level.value_or(0)), width, height,
+                                                   _config.framerate.value_or(0));
+      profile = chosen.profile;
+      level = chosen.level;
+    }
+    // See videoEncoderAttempts. A codec a configure failed on is in an error
     // state: each attempt makes a new one.
-    auto configure = [&](int attempt) {
+    const auto attempts = videoEncoderAttempts(level > 0, _config.realtime);
+    auto configure = [&](const EncoderAttempt& attempt) {
       AMediaFormat* format = AMediaFormat_new();
       AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, videoMime(_config.codec).c_str());
       AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
@@ -439,7 +452,7 @@ private:
       // KEY_FRAME_RATE only budgets the bitrate (the timestamps time the
       // frames); some encoders refuse a high one even when they list it.
       AMediaFormat_setFloat(format, AMEDIAFORMAT_KEY_FRAME_RATE,
-                            static_cast<float>(attempt >= 2 ? std::min(framerate, 30.0) : framerate));
+                            static_cast<float>(attempt.capFrameRate ? std::min(framerate, 30.0) : framerate));
       // Key frames come from encode({ keyFrame: true }), as on the web.
       AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, 3600);
       // WebCodecs outputs chunks in decode order: no B-frames.
@@ -452,31 +465,27 @@ private:
         AMediaFormat_setInt32(format, "priority", 0);
       } else {
         // Best effort, as fast as the encoder goes: without an operating rate
-        // some encoders pace an offline export in real time. INT32_MAX throws
-        // on some chipsets (Media3's
-        // deviceNeedsLowerOperatingRateAvoidingOverflowWorkaround), which take
-        // 1000; the last attempt asks for none.
+        // some encoders pace an offline export in real time.
         AMediaFormat_setInt32(format, "priority", 1);
-        if (attempt == 0) {
-          AMediaFormat_setInt32(format, "operating-rate", INT32_MAX);
-        } else if (attempt == 1) {
-          AMediaFormat_setInt32(format, "operating-rate", 1000);
+        if (attempt.operatingRate != kOperatingRateNone) {
+          AMediaFormat_setInt32(format, "operating-rate", attempt.operatingRate);
         }
       }
       if (_config.codec == "av1") {
         // AV1ProfileMain8, or AV1ProfileMain10 (HDR: AV1ProfileMain10HDR10
-        // is for PQ with static metadata, which HLG does not use). Always
-        // set: without it the encoder makes 8-bit streams.
-        AMediaFormat_setInt32(format, "profile", mediaCodecProfile(_config));
-      } else if (attempt < 2 && _config.profile.has_value()) {
-        AMediaFormat_setInt32(format, "profile", mediaCodecProfile(_config));
+        // is for PQ with static metadata, which HLG does not use).
+        AMediaFormat_setInt32(format, "profile", profile);
+      } else if (attempt.profile && level > 0) {
+        AMediaFormat_setInt32(format, "profile", profile);
+        AMediaFormat_setInt32(format, "level", level);
       }
       media_status_t status = AMediaCodec_configure(_codec, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
       AMediaFormat_delete(format);
       return status;
     };
     media_status_t configured = AMEDIA_ERROR_UNKNOWN;
-    for (int attempt = 0; attempt < 3; attempt++) {
+    size_t attempt = 0;
+    for (; attempt < attempts.size(); attempt++) {
       if (attempt > 0) {
         AMediaCodec_delete(_codec);
         _codec = createCodec();
@@ -484,10 +493,12 @@ private:
           break;
         }
       }
-      configured = configure(attempt);
+      configured = configure(attempts[attempt]);
       if (configured == AMEDIA_OK) {
         break;
       }
+      WC_LOG("video encoder: %s refused attempt %zu (%s): %d", encoderName.c_str(), attempt,
+             describeAttempt(attempts[attempt]).c_str(), configured);
     }
     if (configured != AMEDIA_OK) {
       if (_codec) {
@@ -501,7 +512,8 @@ private:
     // Software codecs are Codec2's c2.android.* (and OMX.google.*).
     if (!encoderName.empty()) {
       _hardware = encoderName.rfind("c2.android.", 0) != 0 && encoderName.rfind("OMX.google.", 0) != 0;
-      WC_LOG("video encoder: %s, %dx%d at %lld bps, %g fps", encoderName.c_str(), width, height, static_cast<long long>(bitrate), framerate);
+      WC_LOG("video encoder: %s, %dx%d at %lld bps, %g fps, profile %d level %d: attempt %zu (%s)", encoderName.c_str(), width, height,
+             static_cast<long long>(bitrate), framerate, profile, level, attempt, describeAttempt(attempts[attempt]).c_str());
     }
     media_status_t status = AMEDIA_OK;
     if (!_aspects.hdr()) {

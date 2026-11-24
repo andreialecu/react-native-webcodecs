@@ -1365,6 +1365,100 @@ describe("react-native-webcodecs + Mediabunny", () => {
     ]);
   }, 120000);
 
+  // The SPS (avcC) of the output: the codec string's profile, and a level no
+  // higher than its own when the size fits in it (raised when it does not).
+  // Android configures the encoder with the level along with the profile
+  // (OMX encoders refuse a profile alone), the codec string's rather than
+  // the encoder's highest; iOS picks the lowest that fits. An encoder
+  // without the profile gets the next one down that it lists: the emulator's
+  // c2.android.avc.encoder (libavc) has no High, and gives Main for
+  // avc1.640028 (it gave its default, Baseline, before).
+  it("encodes H.264 in the codec string's profile and level", async () => {
+    if (!supported()) {
+      return;
+    }
+    if (client.OS === "android") {
+      logcatClear();
+    }
+    const result = (await client.eval(({ webcodecs: wc }) => {
+      const configs = [
+        { codec: "avc1.640028", width: 1280, height: 720 },
+        { codec: "avc1.4d0028", width: 1280, height: 720 },
+        { codec: "avc1.42001f", width: 640, height: 480 },
+        { codec: "avc1.42001f", width: 1920, height: 1080 },
+      ];
+      const run = (config: any) => {
+        let avcC: number[] = [];
+        const errors: string[] = [];
+        let chunks = 0;
+        const encoder = new wc.VideoEncoder({
+          output: (chunk: any, meta: any) => {
+            chunks += chunk.byteLength > 0 ? 1 : 0;
+            const d = meta?.decoderConfig?.description;
+            if (d && avcC.length === 0) {
+              const bytes = ArrayBuffer.isView(d)
+                ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength)
+                : new Uint8Array(d);
+              avcC = [bytes[1], bytes[3]];
+            }
+          },
+          error: (e: any) => errors.push(`${e.name}: ${e.message}`),
+        });
+        encoder.configure(config);
+        const pool = wc.createSurfacePool(config.width, config.height);
+        [0, 33333, 66666, 100000, 133333].forEach((timestamp) => {
+          const frame = new wc.VideoFrame(pool.acquire(), { timestamp });
+          encoder.encode(frame, { keyFrame: timestamp === 0 });
+          frame.close();
+        });
+        return encoder
+          .flush()
+          .catch((e: any) => errors.push(`flush: ${e.name}: ${e.message}`))
+          .then(() => {
+            if (encoder.state !== "closed") {
+              encoder.close();
+            }
+            return { codec: config.codec, avcC, chunks, errors };
+          });
+      };
+      return configs.reduce(
+        (done: Promise<any[]>, config) =>
+          done.then((all) => run(config).then((r: any) => [...all, r])),
+        Promise.resolve([]),
+      );
+    })) as any[];
+    for (const run of result) {
+      expect(run.errors).toEqual([]);
+      expect(run.chunks).toBe(5);
+    }
+    const [high, main, baseline, baseline1080] = result.map((r) => r.avcC);
+    if (ios()) {
+      expect(high[0]).toBe(100);
+    } else {
+      expect([100, 77]).toContain(high[0]);
+    }
+    expect(main[0]).toBe(77);
+    expect(baseline[0]).toBe(66);
+    expect(baseline1080[0]).toBe(66);
+    // Within the codec string's level, or raised to 4.0 for 1080p.
+    expect(high[1]).toBeLessThanOrEqual(40);
+    expect(main[1]).toBeLessThanOrEqual(40);
+    expect(baseline[1]).toBeLessThanOrEqual(31);
+    expect(baseline1080[1]).toBeGreaterThanOrEqual(40);
+    if (client.OS === "android") {
+      expect([high[1], main[1], baseline[1], baseline1080[1]]).toEqual([
+        40, 40, 31, 40,
+      ]);
+      // The first attempt took each config.
+      const attempts = adb(["logcat", "-d", "-s", "WebCodecs:I"])
+        .toString()
+        .split("\n")
+        .map((line) => /video encoder: .*: attempt (\d+)/.exec(line)?.[1])
+        .filter((n): n is string => !!n);
+      expect(attempts).toEqual(["0", "0", "0", "0"]);
+    }
+  }, 120000);
+
   // AudioEncoder alone, fed a 440 Hz sine in 1000-frame AudioData (not
   // multiples of an AAC frame): `segments` runs, each from its own start
   // time and followed by a flush. Returns each chunk's timestamp and

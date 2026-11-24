@@ -56,10 +56,10 @@ const fakeCodec = <T>(
 // Read lazily, when the classes first create a native object.
 const mockNative = {
   createVideoEncoder: (
-    _c: unknown,
+    c: unknown,
     o: Output<unknown>,
     e: (m: string) => void,
-  ) => fakeCodec(o, e),
+  ) => fakeCodec(o, e, c),
   createVideoDecoder: (
     c: unknown,
     o: Output<unknown>,
@@ -256,6 +256,26 @@ describe("VideoEncoder", () => {
       expect.objectContaining({ name: "InvalidStateError" }),
     );
     expect(encoder.state).toBe("closed");
+  });
+
+  it("passes the H.264 level of the codec string to the native encoder", () => {
+    const { encoder } = newEncoder();
+    const passed = ["avc1.640028", "avc1.42001f", "avc1.4d0033"].map(
+      (codec) => {
+        encoder.configure({ ...CONFIG, codec });
+        const config = last().config as { profile?: string; level?: number };
+        return [config.profile, config.level];
+      },
+    );
+    encoder.configure({ ...CONFIG, codec: "av01.0.04M.08" });
+    const av1 = (last().config as { level?: number }).level;
+    encoder.close();
+    expect(passed).toEqual([
+      ["high", 40],
+      ["baseline", 31],
+      ["main", 51],
+    ]);
+    expect(av1).toBeUndefined();
   });
 
   it("throws TypeError when encoding a closed frame", () => {

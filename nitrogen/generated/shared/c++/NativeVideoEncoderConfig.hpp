@@ -47,10 +47,11 @@ namespace margelo::nitro::webcodecs {
     std::optional<double> framerate     SWIFT_PRIVATE;
     bool realtime     SWIFT_PRIVATE;
     std::optional<std::string> profile     SWIFT_PRIVATE;
+    std::optional<double> level     SWIFT_PRIVATE;
 
   public:
     NativeVideoEncoderConfig() = default;
-    explicit NativeVideoEncoderConfig(std::string codec, double width, double height, std::optional<double> bitrate, std::optional<double> framerate, bool realtime, std::optional<std::string> profile): codec(codec), width(width), height(height), bitrate(bitrate), framerate(framerate), realtime(realtime), profile(profile) {}
+    explicit NativeVideoEncoderConfig(std::string codec, double width, double height, std::optional<double> bitrate, std::optional<double> framerate, bool realtime, std::optional<std::string> profile, std::optional<double> level): codec(codec), width(width), height(height), bitrate(bitrate), framerate(framerate), realtime(realtime), profile(profile), level(level) {}
 
   public:
     friend bool operator==(const NativeVideoEncoderConfig& lhs, const NativeVideoEncoderConfig& rhs) = default;
@@ -72,7 +73,8 @@ namespace margelo::nitro {
         JSIConverter<std::optional<double>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "bitrate"))),
         JSIConverter<std::optional<double>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "framerate"))),
         JSIConverter<bool>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "realtime"))),
-        JSIConverter<std::optional<std::string>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "profile")))
+        JSIConverter<std::optional<std::string>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "profile"))),
+        JSIConverter<std::optional<double>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "level")))
       );
     }
     static inline jsi::Value toJSI(jsi::Runtime& runtime, const margelo::nitro::webcodecs::NativeVideoEncoderConfig& arg) {
@@ -84,6 +86,7 @@ namespace margelo::nitro {
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "framerate"), JSIConverter<std::optional<double>>::toJSI(runtime, arg.framerate));
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "realtime"), JSIConverter<bool>::toJSI(runtime, arg.realtime));
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "profile"), JSIConverter<std::optional<std::string>>::toJSI(runtime, arg.profile));
+      obj.setProperty(runtime, PropNameIDCache::get(runtime, "level"), JSIConverter<std::optional<double>>::toJSI(runtime, arg.level));
       return obj;
     }
     static inline bool canConvert(jsi::Runtime& runtime, const jsi::Value& value) {
@@ -101,6 +104,7 @@ namespace margelo::nitro {
       if (!JSIConverter<std::optional<double>>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "framerate")))) return false;
       if (!JSIConverter<bool>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "realtime")))) return false;
       if (!JSIConverter<std::optional<std::string>>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "profile")))) return false;
+      if (!JSIConverter<std::optional<double>>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "level")))) return false;
       return true;
     }
   };

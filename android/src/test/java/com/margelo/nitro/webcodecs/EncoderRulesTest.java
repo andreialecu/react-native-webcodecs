@@ -15,7 +15,17 @@ public class EncoderRulesTest {
   static final int SURFACE = 0x7f000789;
   static final int P010 = 0x36;
   static final int AVC_BASELINE = 1;
+  static final int AVC_MAIN = 2;
   static final int AVC_HIGH = 8;
+  // MediaCodecInfo.CodecProfileLevel.AVCLevel*.
+  static final int AVC_LEVEL_3 = 0x100;
+  static final int AVC_LEVEL_31 = 0x200;
+  static final int AVC_LEVEL_4 = 0x800;
+  static final int AVC_LEVEL_41 = 0x1000;
+  static final int AVC_LEVEL_42 = 0x2000;
+  static final int AVC_LEVEL_5 = 0x4000;
+  static final int AVC_LEVEL_51 = 0x8000;
+  static final int AVC_LEVEL_52 = 0x10000;
 
   // An encoder taking sizes up to maxWidth x maxHeight, each a multiple of
   // its alignment, and bitrates in [1, maxBitrate].
@@ -28,6 +38,8 @@ public class EncoderRulesTest {
     int heightAlignment = 2;
     int maxBitrate = 12_000_000;
     int[] profiles = {AVC_BASELINE};
+    // The level of each of `profiles`.
+    int[] levels = {AVC_LEVEL_41};
     int[] colorFormats = {SURFACE};
 
     Fake(String name) {
@@ -93,8 +105,19 @@ public class EncoderRulesTest {
     }
 
     @Override
+    public int[] levels() {
+      return levels;
+    }
+
+    @Override
     public int[] colorFormats() {
       return colorFormats;
+    }
+
+    Fake profileLevels(int[] profiles, int[] levels) {
+      this.profiles = profiles;
+      this.levels = levels;
+      return this;
     }
   }
 
@@ -268,5 +291,71 @@ public class EncoderRulesTest {
     assertEquals("c2.android.avc.encoder",
         EncoderRules.choose(Arrays.asList(software), 1280, 720, AVC_HIGH, true, SURFACE, h -> false));
     assertNull(EncoderRules.choose(Arrays.asList(software), 1280, 720, AVC_HIGH, false, SURFACE, h -> false));
+  }
+
+  // H.264's level goes with its profile (OMX encoders refuse a profile
+  // alone): the codec string's, raised to what the size and frame rate need,
+  // and capped at the highest the encoder lists for the profile.
+  @Test
+  public void theLevelIsTheCodecStringsWithinTheEncodersRange() {
+    Fake encoder = new Fake("c2.android.avc.encoder")
+        .profileLevels(new int[] {AVC_BASELINE, AVC_MAIN, AVC_BASELINE}, new int[] {AVC_LEVEL_31, AVC_LEVEL_41, AVC_LEVEL_41});
+    // 4.0 at 1280x720, as asked for (not the encoder's 4.1).
+    assertEquals(AVC_LEVEL_4, EncoderRules.avcLevel(encoder, AVC_BASELINE, 40, 1280, 720, 30));
+    assertEquals(AVC_LEVEL_31, EncoderRules.avcLevel(encoder, AVC_BASELINE, 31, 640, 480, 30));
+    // Higher than the encoder lists for the profile: its highest.
+    assertEquals(AVC_LEVEL_41, EncoderRules.avcLevel(encoder, AVC_MAIN, 51, 1280, 720, 30));
+    // None in the codec string (0): the encoder's highest for the profile, as Media3.
+    assertEquals(AVC_LEVEL_41, EncoderRules.avcLevel(encoder, AVC_BASELINE, 0, 1280, 720, 30));
+  }
+
+  @Test
+  public void theLevelIsRaisedToWhatTheSizeAndFrameRateNeed() {
+    Fake encoder = new Fake("hw").profileLevels(new int[] {AVC_HIGH}, new int[] {AVC_LEVEL_52});
+    // avc1.42001f (3.1) at 1920x1080: 8160 macroblocks need 4.0.
+    assertEquals(AVC_LEVEL_4, EncoderRules.avcLevel(encoder, AVC_HIGH, 31, 1920, 1080, 30));
+    assertEquals(AVC_LEVEL_4, EncoderRules.avcLevel(encoder, AVC_HIGH, 31, 1080, 1920, 30));
+    // At 60 fps: 489600 macroblocks a second, 4.2.
+    assertEquals(AVC_LEVEL_42, EncoderRules.avcLevel(encoder, AVC_HIGH, 31, 1920, 1080, 60));
+    // 4K at 30 fps: 5.1. No frame rate: 30.
+    assertEquals(AVC_LEVEL_51, EncoderRules.avcLevel(encoder, AVC_HIGH, 40, 3840, 2160, 0));
+    // 1280x720 at 30 fps fits in 3.1: a lower level asked for is raised.
+    assertEquals(AVC_LEVEL_31, EncoderRules.avcLevel(encoder, AVC_HIGH, 30, 1280, 720, 30));
+    // Never past the encoder's highest.
+    Fake small = new Fake("small").profileLevels(new int[] {AVC_HIGH}, new int[] {AVC_LEVEL_41});
+    assertEquals(AVC_LEVEL_41, EncoderRules.avcLevel(small, AVC_HIGH, 31, 3840, 2160, 30));
+  }
+
+  // An encoder that does not list the profile is given the next one down
+  // that it lists (High, Main, Baseline: a High decoder decodes Main), so
+  // that the level still goes with a profile: the emulator's
+  // c2.android.avc.encoder has no High. 0 when it lists none of them.
+  @Test
+  public void aProfileTheEncoderDoesNotListFallsToTheNextOneDown() {
+    Fake encoder = new Fake("c2.android.avc.encoder")
+        .profileLevels(new int[] {AVC_BASELINE, AVC_MAIN}, new int[] {AVC_LEVEL_41, AVC_LEVEL_41});
+    assertEquals(AVC_HIGH, EncoderRules.avcProfile(new Fake("hw").profileLevels(new int[] {AVC_HIGH}, new int[] {AVC_LEVEL_52}), AVC_HIGH));
+    assertEquals(AVC_MAIN, EncoderRules.avcProfile(encoder, AVC_HIGH));
+    assertEquals(AVC_MAIN, EncoderRules.avcProfile(encoder, AVC_MAIN));
+    assertEquals(AVC_BASELINE, EncoderRules.avcProfile(encoder, AVC_BASELINE));
+    Fake baselineOnly = new Fake("baseline").profileLevels(new int[] {AVC_BASELINE}, new int[] {AVC_LEVEL_41});
+    assertEquals(AVC_BASELINE, EncoderRules.avcProfile(baselineOnly, AVC_HIGH));
+    Fake highOnly = new Fake("high").profileLevels(new int[] {AVC_HIGH}, new int[] {AVC_LEVEL_41});
+    assertEquals(0, EncoderRules.avcProfile(highOnly, AVC_BASELINE));
+    assertEquals(0, EncoderRules.avcProfile(encoder, 0));
+    // avcLevel() reads the levels of the profile it is given.
+    assertEquals(0, EncoderRules.avcLevel(encoder, AVC_HIGH, 40, 1280, 720, 30));
+    assertEquals(AVC_LEVEL_4, EncoderRules.avcLevel(encoder, EncoderRules.avcProfile(encoder, AVC_HIGH), 40, 1280, 720, 30));
+  }
+
+  @Test
+  public void levelIdcsMapToMediaCodecLevels() {
+    assertEquals(0x01, EncoderRules.avcLevelOf(10));
+    assertEquals(0x02, EncoderRules.avcLevelOf(9));
+    assertEquals(AVC_LEVEL_3, EncoderRules.avcLevelOf(30));
+    assertEquals(AVC_LEVEL_52, EncoderRules.avcLevelOf(52));
+    assertEquals(0x80000, EncoderRules.avcLevelOf(62));
+    assertEquals(0, EncoderRules.avcLevelOf(0));
+    assertEquals(0, EncoderRules.avcLevelOf(33));
   }
 }

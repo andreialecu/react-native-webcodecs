@@ -75,6 +75,9 @@ export interface NativeVideoEncoderConfig {
   realtime: boolean;
   // "baseline" | "main" | "high" (avc1.PPCCLL), "main" | "main10" (hvc1.P.*)
   profile?: string;
+  // H.264's level_idc, from avc1.PPCCLL (e.g. 40 for 4.0): the highest the
+  // stream may need. Android sets it with the profile; iOS picks the level.
+  level?: number;
 }
 
 export interface NativeVideoEncoder extends HybridObject<Native> {

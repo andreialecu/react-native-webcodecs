@@ -424,9 +424,12 @@ const toNativeEncoderConfig = (
     return null;
   }
   let profile: string | undefined;
+  let level: number | undefined;
   if (codec === "avc") {
     const profileIdc = parseInt(config.codec.slice(5, 7), 16);
     profile = avcProfile(profileIdc);
+    const levelIdc = parseInt(config.codec.slice(9, 11), 16);
+    level = levelIdc > 0 ? levelIdc : undefined;
   } else if (codec === "av1") {
     // av01.<profile>.<level><tier>.<bit depth>: Main (profile 0), 8 or 10
     // bits.
@@ -451,6 +454,7 @@ const toNativeEncoderConfig = (
     framerate: config.framerate,
     realtime: config.latencyMode === "realtime",
     profile,
+    level,
   };
 };
 
