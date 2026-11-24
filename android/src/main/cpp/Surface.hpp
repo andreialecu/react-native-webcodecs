@@ -216,6 +216,30 @@ private:
 
 inline constexpr uint64_t kSurfaceUsage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
 
+// The usage a pool's buffers of `format` are allocated with.
+inline uint64_t poolUsage(uint32_t format) {
+  return format == AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT ? kSurfaceUsage | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN : kSurfaceUsage;
+}
+
+// Whether this device can make `width` x `height` buffers of `format` for a
+// pool (half floats: ones the CPU can also read, as the HDR encoder does).
+// AHardwareBuffer_isSupported is API 29, above this library's minimum (26):
+// without it, the first acquire() is what tells.
+inline bool poolFormatSupported(uint32_t width, uint32_t height, uint32_t format) {
+  using IsSupported = int (*)(const AHardwareBuffer_Desc*);
+  static auto isSupported = reinterpret_cast<IsSupported>(dlsym(RTLD_DEFAULT, "AHardwareBuffer_isSupported"));
+  if (!isSupported) {
+    return true;
+  }
+  AHardwareBuffer_Desc desc{};
+  desc.width = width;
+  desc.height = height;
+  desc.layers = 1;
+  desc.format = format;
+  desc.usage = poolUsage(format);
+  return isSupported(&desc) == 1;
+}
+
 class HybridNativeSurfacePool : public HybridNativeSurfacePoolSpec {
 public:
   // RGBA 8-bit, or half floats (AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT)
@@ -223,10 +247,7 @@ public:
   // encoder reads on the CPU (it converts them to P010).
   HybridNativeSurfacePool(uint32_t width, uint32_t height, uint32_t format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM)
       : HybridObject(TAG),
-        _state(std::make_shared<SurfacePoolState>(
-            width, height, format,
-            format == AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT ? kSurfaceUsage | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN
-                                                                 : kSurfaceUsage)) {}
+        _state(std::make_shared<SurfacePoolState>(width, height, format, poolUsage(format))) {}
 
   double getWidth() override {
     return _state->width();

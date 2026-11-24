@@ -1318,6 +1318,32 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(result).toEqual([false, false, true]);
   }, 60000);
 
+  // Android: createSurfacePool asks AHardwareBuffer_isSupported whether
+  // RGBA16F buffers the CPU can read (the HDR encoder converts them to P010)
+  // can be made, and refuses the pool up front when not. The emulator can:
+  // its pool is made, and its buffers allocated.
+  it("creates an RGBA16F surface pool where the device can read one (Android)", async () => {
+    if (client.OS !== "android") {
+      return;
+    }
+    const result = (await client.eval(({ webcodecs: wc }) => {
+      try {
+        const pool = wc.createSurfacePool(64, 32, "RGBA16F");
+        const surface = pool.acquire();
+        const out = {
+          format: surface.format,
+          width: surface.width,
+          height: surface.height,
+        };
+        surface.release();
+        return out;
+      } catch (e: any) {
+        return { error: `${e.name}: ${e.message}` };
+      }
+    })) as any;
+    expect(result).toEqual({ format: "RGBA16F", width: 64, height: 32 });
+  }, 60000);
+
   // The frame rate and bitrate are hints, as in Media3: an encoder is not
   // refused for them (the emulator's c2.android.avc.encoder lists at most
   // 12 Mbps, and about 30 fps at 1080x1920). The bitrate is clamped into the
