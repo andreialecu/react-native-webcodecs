@@ -1,5 +1,9 @@
 # react-native-webcodecs
 
+[![npm](https://img.shields.io/npm/v/react-native-webcodecs.svg)](https://www.npmjs.com/package/react-native-webcodecs)
+[![CI](https://github.com/andreialecu/react-native-webcodecs/actions/workflows/ci.yml/badge.svg)](https://github.com/andreialecu/react-native-webcodecs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/npm/l/react-native-webcodecs.svg)](LICENSE)
+
 The [WebCodecs API](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API)
 for React Native, on the phone's own codecs: VideoToolbox and AudioToolbox on
 iOS, MediaCodec on Android. Encode what you draw with WebGPU into an MP4, or
@@ -55,6 +59,31 @@ import { installWebCodecs } from "react-native-webcodecs";
 
 installWebCodecs();
 ```
+
+To draw frames or read decoded ones on the GPU, add
+[React Native WebGPU](https://github.com/wcandillon/react-native-webgpu)
+(`react-native-webgpu`), and [React Native Skia](https://shopify.github.io/react-native-skia/)
+(`react-native-skia`) if you draw with Skia.
+
+### Temporary patches
+
+Until [three pull requests](#unreleased-changes-in-other-libraries) to
+William Candillon's react-native-webgpu and react-native-skia are released,
+some paths need them applied as patches. Exports of SDR video work without
+them. With Yarn, copy the patch files from
+[`.yarn/patches`](.yarn/patches) into your app and point `resolutions` at
+them:
+
+```json
+"resolutions": {
+  "react-native-webgpu@0.23.0": "patch:react-native-webgpu@npm%3A0.23.0#./.yarn/patches/react-native-webgpu-npm-0.23.0-50f3d74c47.patch",
+  "react-native-skia@3.10.0": "patch:react-native-skia@npm%3A3.10.0#./.yarn/patches/react-native-skia-npm-3.10.0-c316c6c886.patch"
+}
+```
+
+With npm or pnpm, apply the same diffs with
+[patch-package](https://github.com/ds300/patch-package) or `pnpm patch`.
+The patches are for those exact versions, and go away once the changes ship.
 
 ## Codecs
 
@@ -189,7 +218,18 @@ The [example app](example) exports the card in the GIFs above, with sound,
 in SDR or HDR, and compresses a video you pick. It runs on iOS, on Android,
 on an Apple silicon Mac (as an iPad app), and in a browser, where it is a
 single page: [the live demo](https://andreialecu.github.io/react-native-webcodecs/).
-See [CONTRIBUTING.md](CONTRIBUTING.md#the-example-app) to run it.
+
+```sh
+git clone https://github.com/andreialecu/react-native-webcodecs.git
+cd react-native-webcodecs
+yarn
+cd example/ios && pod install && cd ..
+yarn start
+```
+
+Then, in another terminal in `example`, `yarn ios`, `yarn android` or
+`yarn web`. [CONTRIBUTING.md](CONTRIBUTING.md#the-example-app) has more,
+including running it on a Mac.
 
 <p align="center">
   <img src="docs/compress.gif" width="300" alt="The example app compressing a phone video picked from the library" />
@@ -200,7 +240,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#the-example-app) to run it.
 
 Some paths need changes that are not released yet. This repository applies
 them as Yarn patches (`.yarn/patches`); an app needs the same until they
-ship.
+ship (see [Temporary patches](#temporary-patches)). This is temporary,
+pending review by William Candillon, who maintains both libraries.
 
 | Change | Needed for |
 | :-- | :-- |
