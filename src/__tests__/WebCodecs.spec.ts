@@ -170,9 +170,14 @@ const adb = (args: string[], input?: Buffer) =>
   );
 
 const pushAsset = (name: string) =>
+  pushFile(path.join(__dirname, "assets", name));
+
+// Copies a file of this machine into the app's cache directory, as
+// e2e-<its name>.
+const pushFile = (source: string) =>
   appCache().then((dir) => {
+    const name = path.basename(source);
     const destination = `${dir}/e2e-${name}`;
-    const source = path.join(__dirname, "assets", name);
     if (client.OS === "android") {
       // Written aside, then renamed: the app never sees a partial file. The
       // rename is its own command: `adb exec-in` can end the shell as soon
@@ -494,6 +499,296 @@ const expectOk = (result: Export) => {
   }
   expect(result.kind).toBe("ok");
   return result as Required<Export>;
+};
+
+// Runs `fn` on the device with the eval context, for longer than one call
+// to the app may take: started in one call, then polled until it settles.
+const runOnDevice = async <R>(
+  fn: (context: { example: any; ctx: any }) => Promise<R>,
+  ctx: object,
+  limitMs: number,
+): Promise<R> => {
+  const key = `__e2e_${Math.random().toString(36).slice(2)}`;
+  await client.eval(
+    ({ example, ctx: c }) => {
+      const g = globalThis as any;
+      const run = eval(`(${c.fn})`);
+      g[c.key] = null;
+      Promise.resolve()
+        .then(() => run({ example, ctx: c.args }))
+        .then(
+          (value: any) => (g[c.key] = { value }),
+          (e: any) => (g[c.key] = { error: String((e && e.stack) || e) }),
+        );
+      return true;
+    },
+    { ctx: { fn: fn.toString(), key, args: ctx } },
+  );
+  const deadline = Date.now() + limitMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    const settled = (await client.eval(
+      ({ ctx: c }) => {
+        const g = globalThis as any;
+        const r = g[c.key];
+        if (r) {
+          delete g[c.key];
+        }
+        return r;
+      },
+      { ctx: { key } },
+    )) as { value?: R; error?: string } | null;
+    if (settled) {
+      if (settled.error !== undefined) {
+        throw new Error(settled.error);
+      }
+      return settled.value as R;
+    }
+  }
+  throw new Error(`timed out after ${limitMs} ms`);
+};
+
+interface CardExport {
+  path: string;
+  frames: number;
+  duration: number;
+  ms: number;
+}
+
+// The Video Export screen's export (example/src/VideoExport), on the device.
+const exportCard = async (o: { hdr: boolean; sound: boolean }) => {
+  const result = await runOnDevice<CardExport | null>(
+    ({ example, ctx }) =>
+      example.loadCardAssets().then((assets: any) => {
+        const animation = example.makeCard(assets, ctx.hdr);
+        const done = () => animation.dispose && animation.dispose();
+        return (ctx.sound ? example.loadSound() : Promise.resolve(null))
+          .then((sound: any) =>
+            example.exportVideo(
+              animation,
+              sound,
+              ctx.hdr,
+              new AbortController().signal,
+              () => {},
+            ),
+          )
+          .then(
+            (r: any) => {
+              done();
+              return r;
+            },
+            (e: any) => {
+              done();
+              throw e;
+            },
+          );
+      }),
+    o,
+    // AV1 in software on the Android emulator is slow.
+    o.hdr && client.OS === "android" ? 1440000 : 540000,
+  );
+  if (!result) {
+    throw new Error("the export was cancelled");
+  }
+  console.log(
+    `card ${o.hdr ? "HDR" : "SDR"}${o.sound ? " + sound" : ""}: ${result.frames} frames in ${Math.round(result.ms)} ms`,
+  );
+  return result;
+};
+
+interface Compressed {
+  skipped?: boolean;
+  supported?: string[];
+  source: { width: number; height: number; rotation: number };
+  target: { width: number; height: number };
+  result: {
+    path: string;
+    size: number;
+    width: number;
+    height: number;
+    ms: number;
+  };
+}
+
+// The Compress screen's compression (example/src/Compress) of a file in
+// the app's cache, at 480p and medium quality unless told otherwise; with
+// a `codec` the device's supportedCodecs does not list, `skipped`.
+const compressOnDevice = (
+  file: string,
+  options: { codec?: string; audio?: boolean; frameRate?: number },
+) =>
+  runOnDevice<Compressed>(
+    ({ example, ctx }) =>
+      example
+        .openSource({ name: "source.mp4", path: ctx.file, size: 0 })
+        .then((source: any) =>
+          example
+            .supportedCodecs(source.width, source.height)
+            .then((supported: string[]) => {
+              if (supported.indexOf(ctx.codec) < 0) {
+                return { skipped: true, supported };
+              }
+              const s = example.settings;
+              const settings = {
+                resolution: "480",
+                quality: "medium",
+                codec: ctx.codec,
+                frameRate: ctx.frameRate,
+                audio: ctx.audio,
+                videoBitrate: s.videoBitrate(
+                  source,
+                  "480",
+                  "medium",
+                  ctx.codec,
+                  ctx.frameRate,
+                ),
+              };
+              return example
+                .compress(
+                  source,
+                  settings,
+                  new AbortController().signal,
+                  () => {},
+                )
+                .then((result: any) => ({
+                  source,
+                  target: s.targetSize(source, "480"),
+                  result,
+                }));
+            }),
+        ),
+    {
+      file,
+      codec: options.codec ?? "avc",
+      audio: options.audio ?? true,
+      frameRate: options.frameRate ?? null,
+    },
+    540000,
+  );
+
+// The clips to compress, made with ffmpeg once (kept in the temporary
+// directory) and pushed to the app's cache once per run.
+const clipDirectory = path.join(os.tmpdir(), "rnwc-e2e-clips");
+const clips = new Map<boolean, Promise<string>>();
+const sourceClip = (rotated: boolean) => {
+  let clip = clips.get(rotated);
+  if (!clip) {
+    const plain = path.join(clipDirectory, "clip.mp4");
+    fs.mkdirSync(clipDirectory, { recursive: true });
+    if (!fs.existsSync(plain)) {
+      execFileSync("ffmpeg", [
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=1280x720:rate=30:duration=3",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000:duration=3",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "high",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        plain,
+      ]);
+    }
+    let file = plain;
+    if (rotated) {
+      file = path.join(clipDirectory, "clip-portrait.mp4");
+      // ffmpeg counts counterclockwise: -90 is 90° clockwise, the tag of
+      // a phone held upright, which stores its frames landscape.
+      execFileSync("ffmpeg", [
+        "-loglevel",
+        "error",
+        "-y",
+        "-display_rotation:v:0",
+        "-90",
+        "-i",
+        plain,
+        "-c",
+        "copy",
+        file,
+      ]);
+    }
+    clip = pushFile(file);
+    clips.set(rotated, clip);
+  }
+  return clip;
+};
+
+interface Probed extends Stream {
+  profile?: string;
+  pix_fmt?: string;
+  color_transfer?: string;
+  nb_read_packets?: string;
+  side_data_list?: { rotation?: number }[];
+}
+
+const probe = (file: string): { streams: Probed[] } =>
+  JSON.parse(
+    execFileSync(
+      "ffprobe",
+      ["-v", "error", "-count_packets", "-show_streams", "-of", "json", file],
+      { encoding: "utf8" },
+    ),
+  );
+
+const rotationOf = (stream: Probed) =>
+  Math.abs(
+    stream.side_data_list?.find((d) => d.rotation !== undefined)?.rotation ?? 0,
+  );
+
+// The video packets' presentation times, in the order they are stored.
+const videoPacketTimes = (file: string) =>
+  execFileSync(
+    "ffprobe",
+    [
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-show_entries",
+      "packet=pts_time",
+      "-of",
+      "csv=p=0",
+      file,
+    ],
+    { encoding: "utf8" },
+  )
+    .trim()
+    .split("\n")
+    .map(Number);
+
+// The MP4's top-level boxes, in order.
+const topLevelBoxes = (file: string) => {
+  const bytes = fs.readFileSync(file);
+  const boxes: string[] = [];
+  let at = 0;
+  while (at + 8 <= bytes.length) {
+    let size = bytes.readUInt32BE(at);
+    boxes.push(bytes.toString("latin1", at + 4, at + 8));
+    if (size === 1) {
+      size = Number(bytes.readBigUInt64BE(at + 8));
+    } else if (size === 0) {
+      size = bytes.length - at;
+    }
+    if (size < 8) {
+      break;
+    }
+    at += size;
+  }
+  return boxes;
 };
 
 const ios = () => client.OS === "ios";
@@ -1042,6 +1337,210 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(result.size).toBe(5);
     expect(result.bytes).toEqual([1, 2, 3, 4, 5]);
   }, 60000);
+
+  // The example app's screens, through its own code (example/src/Tests.tsx
+  // hands it over): the Lottie share card exported as the Video Export
+  // screens do, and videos compressed as the Compress screen does.
+  describe("the example app", () => {
+    // The card: 7 s at 30 fps, 1080x1920.
+    const CARD_FRAMES = 210;
+    const CARD_SECONDS = 7;
+
+    it("exports the Lottie card to H.264, silent", async () => {
+      if (!supported()) {
+        return;
+      }
+      const result = await exportCard({ hdr: false, sound: false });
+      const local = copyLocal(result.path);
+      if (!probes()) {
+        return;
+      }
+      const { streams } = probe(local);
+      expectCardVideo(streams, "h264");
+      expect(streams.some((s) => s.codec_type === "audio")).toBe(false);
+    }, 600000);
+
+    it("exports the Lottie card to H.264 with its sound", async () => {
+      if (!supported()) {
+        return;
+      }
+      const result = await exportCard({ hdr: false, sound: true });
+      if (!probes()) {
+        return;
+      }
+      const { streams } = probe(copyLocal(result.path));
+      const video = expectCardVideo(streams, "h264");
+      const audio = streams.find((s) => s.codec_type === "audio")!;
+      expect(audio.codec_name).toBe("aac");
+      // Cut where the video ends: the last AAC frame (21 ms at 48 kHz)
+      // starts before it.
+      expect(
+        Math.abs(Number(audio.duration) - Number(video.duration)),
+      ).toBeLessThan(0.05);
+    }, 600000);
+
+    // HEVC Main 10 on iOS, AV1 Main 10 on Android, where a device without
+    // a 10-bit AV1 encoder (the emulator) skips it.
+    it("exports the Lottie card to 10-bit HLG", async () => {
+      if (!supported()) {
+        return;
+      }
+      let result: CardExport;
+      try {
+        result = await exportCard({ hdr: true, sound: false });
+      } catch (e) {
+        // The app's own check (isConfigSupported): the Android emulator's
+        // software AV1 encoder has no 10-bit profile.
+        if (/has no .* Main 10 encoder/.test(String(e))) {
+          console.log(`HDR skipped: ${String(e)}`);
+          return;
+        }
+        throw e;
+      }
+      if (!probes()) {
+        return;
+      }
+      const { streams } = probe(copyLocal(result.path));
+      const video = expectCardVideo(streams, ios() ? "hevc" : "av1");
+      expect(video.profile).toBe(ios() ? "Main 10" : "Main");
+      expect(video.pix_fmt).toBe("yuv420p10le");
+      expect(video.color_transfer).toBe("arib-std-b67");
+      expect(video.color_primaries).toBe("bt2020");
+      expect(video.color_space).toBe("bt2020nc");
+    }, 1500000);
+
+    // 3 s of 1280x720 H.264 at 30 fps with an AAC sine, made here with
+    // ffmpeg (no video files in the repository); the second is tagged to
+    // play turned 90° clockwise, as a phone's portrait recording is.
+    const SOURCE_SECONDS = 3;
+
+    it.each(["avc", "hevc", "av1"])(
+      "compresses a video to %s, if the device encodes it",
+      async (codec) => {
+        if (!supported() || !probes()) {
+          return;
+        }
+        const run = await compressOnDevice(await sourceClip(false), {
+          codec,
+        });
+        if (run.skipped) {
+          console.log(`${codec}: not in supportedCodecs (${run.supported})`);
+          return;
+        }
+        expectCompressed(run, {
+          codec: { avc: "h264", hevc: "hevc", av1: "av1" }[codec]!,
+          width: 854,
+          height: 480,
+          frameRate: 30,
+          audio: true,
+        });
+      },
+      600000,
+    );
+
+    it("compresses a video without its sound", async () => {
+      if (!supported() || !probes()) {
+        return;
+      }
+      const run = await compressOnDevice(await sourceClip(false), {
+        audio: false,
+      });
+      expectCompressed(run, {
+        codec: "h264",
+        width: 854,
+        height: 480,
+        frameRate: 30,
+        audio: false,
+      });
+    }, 600000);
+
+    it("compresses a video to another frame rate", async () => {
+      if (!supported() || !probes()) {
+        return;
+      }
+      const run = await compressOnDevice(await sourceClip(false), {
+        frameRate: 15,
+      });
+      expectCompressed(run, {
+        codec: "h264",
+        width: 854,
+        height: 480,
+        frameRate: 15,
+        audio: true,
+      });
+    }, 600000);
+
+    it("compresses a phone's portrait video upright", async () => {
+      if (!supported() || !probes()) {
+        return;
+      }
+      const run = await compressOnDevice(await sourceClip(true), {});
+      expect(run.source.rotation).toBe(90);
+      expect([run.source.width, run.source.height]).toEqual([720, 1280]);
+      expectCompressed(run, {
+        codec: "h264",
+        width: 480,
+        height: 854,
+        frameRate: 30,
+        audio: true,
+      });
+    }, 600000);
+
+    const expectCardVideo = (streams: Probed[], codec: string) => {
+      const video = streams.find((s) => s.codec_type === "video")!;
+      expect(video.codec_name).toBe(codec);
+      expect(video.width).toBe(1080);
+      expect(video.height).toBe(1920);
+      expect(Number(video.nb_read_packets)).toBe(CARD_FRAMES);
+      expect(Number(video.duration)).toBeCloseTo(CARD_SECONDS, 2);
+      return video;
+    };
+
+    const expectCompressed = (
+      run: Compressed,
+      want: {
+        codec: string;
+        width: number;
+        height: number;
+        frameRate: number;
+        audio: boolean;
+      },
+    ) => {
+      expect([run.result.width, run.result.height]).toEqual([
+        want.width,
+        want.height,
+      ]);
+      expect([run.target.width, run.target.height]).toEqual([
+        want.width,
+        want.height,
+      ]);
+      const local = copyLocal(run.result.path);
+      const { streams } = probe(local);
+      const video = streams.find((s) => s.codec_type === "video")!;
+      expect(video.codec_name).toBe(want.codec);
+      expect([video.width, video.height]).toEqual([want.width, want.height]);
+      // No rotation tag left: the frames are upright.
+      expect(rotationOf(video)).toBe(0);
+      expect(
+        Math.abs(Number(video.duration) - SOURCE_SECONDS),
+      ).toBeLessThanOrEqual(1 / want.frameRate + 1e-3);
+      expect(Number(video.nb_read_packets)).toBe(
+        SOURCE_SECONDS * want.frameRate,
+      );
+      expect(streams.some((s) => s.codec_type === "audio")).toBe(want.audio);
+      // In order: the encoders make no B-frames, so each frame is later than
+      // the one before it (frames decoded out of order would not be).
+      const times = videoPacketTimes(local);
+      expect(times.filter((t, i) => i > 0 && t <= times[i - 1]).length).toBe(0);
+      // Fast start: the index ahead of the media.
+      const boxes = topLevelBoxes(local);
+      expect(boxes.indexOf("moov")).toBeGreaterThanOrEqual(0);
+      expect(boxes.indexOf("moov")).toBeLessThan(boxes.indexOf("mdat"));
+      console.log(
+        `compressed to ${want.codec} ${want.width}x${want.height}@${want.frameRate}${want.audio ? " + AAC" : ""}: ${run.result.size} bytes in ${Math.round(run.result.ms)} ms`,
+      );
+    };
+  });
 
   // iOS takes the hardware codecs away from a backgrounded app. Two exports,
   // one after the other, each sent to the background by opening Settings on

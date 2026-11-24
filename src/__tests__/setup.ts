@@ -30,6 +30,8 @@ interface TestingContext {
   mediabunny: any;
   webcodecs: any;
   AppState: any;
+  // The example app's own export and compression code (Tests.tsx).
+  example: any;
 }
 
 type Ctx = Record<string, unknown>;
