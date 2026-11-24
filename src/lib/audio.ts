@@ -13,6 +13,7 @@ import {
   domError,
   native,
   nativeError,
+  nextMacrotask,
   rethrow,
   toArrayBuffer,
   toBytes,
@@ -267,7 +268,7 @@ export class AudioEncoder extends CodecBase {
       );
       return;
     }
-    this._encoder?.close();
+    this._replaceNative();
     this._config = config;
     try {
       this._encoder = native().createAudioEncoder(
@@ -277,8 +278,8 @@ export class AudioEncoder extends CodecBase {
           numberOfChannels: config.numberOfChannels,
           bitrate: config.bitrate,
         },
-        (chunk) => this._onChunk(chunk),
-        (message) => this._fail(nativeError(message)),
+        this._bind((chunk: NativeEncodedChunk) => this._onChunk(chunk)),
+        this._bind((message: string) => this._fail(nativeError(message))),
       );
     } catch (e) {
       this._fail(nativeError((e as Error).message));
@@ -291,6 +292,9 @@ export class AudioEncoder extends CodecBase {
     this._assertConfigured();
     if (!(data instanceof AudioData)) {
       throw new TypeError("data must be an AudioData");
+    }
+    if (!data._data) {
+      throw new TypeError("the AudioData is closed");
     }
     if (
       data.sampleRate !== this._config!.sampleRate ||
@@ -314,27 +318,29 @@ export class AudioEncoder extends CodecBase {
     setTimeout(() => this._drain(), 0);
   }
 
-  async flush() {
-    this._assertConfigured();
-    try {
+  flush() {
+    return this._flush(async () => {
       await this._encoder!.flush();
-    } catch (e) {
-      rethrow(e);
-    }
-    await new Promise<void>((resolve) => setTimeout(() => resolve(), 0));
+      await nextMacrotask();
+    });
   }
 
   reset() {
-    this._encoder?.close();
-    this._encoder = null;
-    this._state = "unconfigured";
-    this._reset();
+    this._resetCodec();
   }
 
   close() {
-    this._encoder?.close();
-    this._encoder = null;
     this._close();
+  }
+
+  _releaseNative() {
+    const encoder = this._encoder;
+    this._encoder = null;
+    try {
+      encoder?.close();
+    } catch {
+      // Already closed natively.
+    }
   }
 
   _onChunk(chunk: NativeEncodedChunk) {
@@ -420,7 +426,7 @@ export class AudioDecoder extends CodecBase {
       );
       return;
     }
-    this._decoder?.close();
+    this._replaceNative();
     try {
       this._decoder = native().createAudioDecoder(
         {
@@ -431,8 +437,8 @@ export class AudioDecoder extends CodecBase {
             ? toArrayBuffer(config.description)
             : undefined,
         },
-        (data) => this._onData(data),
-        (message) => this._fail(nativeError(message)),
+        this._bind((data: NativeDecodedAudio) => this._onData(data)),
+        this._bind((message: string) => this._fail(nativeError(message))),
       );
     } catch (e) {
       this._fail(nativeError((e as Error).message));
@@ -456,27 +462,29 @@ export class AudioDecoder extends CodecBase {
     setTimeout(() => this._drain(), 0);
   }
 
-  async flush() {
-    this._assertConfigured();
-    try {
+  flush() {
+    return this._flush(async () => {
       await this._decoder!.flush();
-    } catch (e) {
-      rethrow(e);
-    }
-    await new Promise<void>((resolve) => setTimeout(() => resolve(), 0));
+      await nextMacrotask();
+    });
   }
 
   reset() {
-    this._decoder?.close();
-    this._decoder = null;
-    this._state = "unconfigured";
-    this._reset();
+    this._resetCodec();
   }
 
   close() {
-    this._decoder?.close();
-    this._decoder = null;
     this._close();
+  }
+
+  _releaseNative() {
+    const decoder = this._decoder;
+    this._decoder = null;
+    try {
+      decoder?.close();
+    } catch {
+      // Already closed natively.
+    }
   }
 
   _onData(data: NativeDecodedAudio) {

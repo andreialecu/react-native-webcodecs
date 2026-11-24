@@ -40,18 +40,27 @@ export const domError = (name: string, message: string, code?: string) => {
   return e;
 };
 
-// Native messages are "Name: code: message" (or "Name: message").
+// Native messages are "Name: code: message" (or "Name: message"). Nitro
+// prefixes what a native method throws with the method's name
+// ("WebCodecs.createVideoEncoder(...): Name: message"), hence no anchor.
+const NATIVE_ERROR = /(\w+Error): (?:([a-z-]+): )?([\s\S]*)$/;
+
 export const nativeError = (message: string) => {
-  const m = /^(\w+Error): (?:([a-z-]+): )?([\s\S]*)$/.exec(message);
+  const m = NATIVE_ERROR.exec(message);
   return m ? domError(m[1], m[3], m[2]) : domError("EncodingError", message);
 };
 
 // A native call that throws "Name: message": rethrow as that DOMException.
 export const rethrow = (e: unknown): never => {
   const message = e instanceof Error ? e.message : String(e);
-  const m = /(\w+Error): (?:([a-z-]+): )?([\s\S]*)$/.exec(message);
+  const m = NATIVE_ERROR.exec(message);
   throw m ? domError(m[1], m[3], m[2]) : e;
 };
+
+// After a native flush resolved: the outputs it sent come back through the
+// JS thread's queue first.
+export const nextMacrotask = () =>
+  new Promise<void>((resolve) => setTimeout(() => resolve(), 0));
 
 export const toArrayBuffer = (
   data: ArrayBuffer | ArrayBufferView,
@@ -77,8 +86,8 @@ export const toBytes = (data: ArrayBuffer | ArrayBufferView) =>
 
 type Listener = (event: { type: string }) => void;
 
-// The control queue of a WebCodecs codec: state, the "dequeue" event, and
-// flush() waiting for the outputs of what was submitted.
+// The control queue of a WebCodecs codec: state, the "dequeue" event,
+// flush(), and which native codec's callbacks still count.
 export class CodecBase {
   _state: "unconfigured" | "configured" | "closed" = "unconfigured";
   // Submitted calls the codec has not taken yet.
@@ -88,6 +97,11 @@ export class CodecBase {
   _listeners = new Map<string, Set<{ fn: Listener; once: boolean }>>();
   ondequeue: Listener | null = null;
   _errorCallback: (error: Error) => void;
+  // Bumped whenever the native codec is replaced or let go: callbacks of an
+  // older one are ignored (reset() discards pending outputs).
+  _generation = 0;
+  // flush() calls not settled yet: reset() and close() reject them.
+  _flushes = new Set<(error: Error) => void>();
 
   constructor(error: (error: Error) => void) {
     this._errorCallback = error;
@@ -144,16 +158,58 @@ export class CodecBase {
     }
   }
 
-  // Waits until every frame taken has come back.
-  async _waitPending() {
-    while (this._pending > 0 && this._state === "configured") {
-      await new Promise((resolve) =>
-        this.addEventListener("output", resolve, { once: true }),
+  /**
+   * Wraps a callback of the native codec created now (after
+   * _replaceNative()): once that codec is replaced or let go, its late
+   * callbacks go to `stale` instead.
+   */
+  _bind<T>(fn: (value: T) => void, stale?: (value: T) => void) {
+    const generation = this._generation;
+    return (value: T) => {
+      if (generation === this._generation) {
+        fn(value);
+      } else {
+        stale?.(value);
+      }
+    };
+  }
+
+  /**
+   * flush(): runs `flushNative` (the native flush, then whatever waits for
+   * its outputs), and rejects with AbortError if reset() or close() comes
+   * first, as the specification does.
+   */
+  _flush(flushNative: () => Promise<void>): Promise<void> {
+    try {
+      this._assertConfigured();
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    const generation = this._generation;
+    return new Promise<void>((resolve, reject) => {
+      this._flushes.add(reject);
+      flushNative().then(
+        () => {
+          this._flushes.delete(reject);
+          resolve();
+        },
+        (e: unknown) => {
+          this._flushes.delete(reject);
+          // A configure() since let the codec go, with what it held: there
+          // is nothing left to flush. (reset() and close() already
+          // rejected this flush with AbortError.)
+          if (generation !== this._generation) {
+            resolve();
+            return;
+          }
+          try {
+            rethrow(e);
+          } catch (error) {
+            reject(error);
+          }
+        },
       );
-    }
-    if (this._state !== "configured") {
-      throw domError("AbortError", "the codec was closed during flush");
-    }
+    });
   }
 
   _outputSeen() {
@@ -161,13 +217,37 @@ export class CodecBase {
     this._dispatch("output");
   }
 
-  _reset() {
+  /** Lets go of the native codec. Each codec implements it. */
+  _releaseNative() {}
+
+  /**
+   * Forgets what the native codec held (it was let go, so it will not come
+   * back), and wakes whoever waits on the queue: Mediabunny waits for
+   * "dequeue" while encodeQueueSize >= 4.
+   */
+  _discardPending() {
     this._queue = 0;
     this._pending = 0;
-    // Wake whoever waits on the queue (Mediabunny waits for "dequeue" when
-    // encodeQueueSize >= 4) or on outputs (flush()).
     this._dispatch("dequeue");
     this._dispatch("output");
+  }
+
+  /** A new config: the old native codec goes, with what it held. */
+  _replaceNative() {
+    this._releaseNative();
+    this._generation++;
+    this._discardPending();
+  }
+
+  _reset() {
+    this._replaceNative();
+    const flushes = [...this._flushes];
+    this._flushes.clear();
+    for (const reject of flushes) {
+      reject(
+        domError("AbortError", "the codec was reset or closed during flush"),
+      );
+    }
   }
 
   _fail(error: Error) {
@@ -176,6 +256,15 @@ export class CodecBase {
     }
     this._close();
     this._errorCallback(error);
+  }
+
+  /** reset() of the specification: back to unconfigured. */
+  _resetCodec() {
+    if (this._state === "closed") {
+      throw domError("InvalidStateError", "the codec is closed");
+    }
+    this._state = "unconfigured";
+    this._reset();
   }
 
   _close() {
