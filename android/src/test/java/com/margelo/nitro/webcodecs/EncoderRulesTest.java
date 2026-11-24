@@ -63,6 +63,11 @@ public class EncoderRulesTest {
     }
 
     @Override
+    public boolean hardware() {
+      return hardware;
+    }
+
+    @Override
     public int widthAlignment() {
       return widthAlignment;
     }
@@ -189,5 +194,20 @@ public class EncoderRulesTest {
     assertFalse(EncoderRules.fits(hevc, 3840, 2160, 0, SURFACE, none));
     assertFalse(EncoderRules.fits(avc, 1280, 1080, 0, SURFACE, both));
     assertFalse(EncoderRules.fits(hevc, 3840, 2160, 0, SURFACE, height -> height == 1080));
+  }
+
+  // A hardware encoder that takes the config is chosen over a software one,
+  // wherever the platform lists it; software when no hardware one fits.
+  @Test
+  public void prefersHardwareThatFitsOverSoftware() {
+    Fake software = new Fake("c2.android.avc.encoder").software().size(2048, 2048);
+    Fake hardware = new Fake("c2.qti.avc.encoder").size(1920, 1088).align(16, 16);
+    Fake small = new Fake("c2.small.avc.encoder").size(640, 480);
+    // Through the lenient reading: 1080x1920 portrait, 1080 aligned to 1088.
+    assertEquals("c2.qti.avc.encoder",
+        EncoderRules.choose(Arrays.asList(software, small, hardware), 1080, 1920, 0, SURFACE, h -> false));
+    assertEquals("c2.android.avc.encoder",
+        EncoderRules.choose(Arrays.asList(small, software, hardware), 2048, 2048, 0, SURFACE, h -> false));
+    assertNull(EncoderRules.choose(Arrays.asList(small, software, hardware), 4096, 4096, 0, SURFACE, h -> false));
   }
 }

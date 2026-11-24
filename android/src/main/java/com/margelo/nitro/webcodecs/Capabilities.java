@@ -20,12 +20,13 @@ public final class Capabilities {
   private Capabilities() {}
 
   /**
-   * The name of the first encoder for `mime` (in the platform's order, as
-   * MediaCodec.createEncoderByType picks) that takes frames of this size
+   * The name of the encoder for `mime` that takes frames of this size
    * (read leniently, as in Media3: see EncoderRules.sizeSupported), in
    * this profile (ignored when 0 or less) and input color format; or null
-   * when none does. The frame rate and bitrate are hints, as in Media3: they
-   * refuse no encoder (see videoBitrate).
+   * when none does: the first hardware one in the platform's order (the
+   * order MediaCodec.createEncoderByType tries), else the first software
+   * one. The frame rate and bitrate are hints, as in Media3: they refuse no
+   * encoder (see videoBitrate).
    */
   @Keep
   @Nullable
@@ -119,6 +120,11 @@ public final class Capabilities {
     @Override
     public boolean isSizeSupported(int width, int height) {
       return video.isSizeSupported(width, height);
+    }
+
+    @Override
+    public boolean hardware() {
+      return !isSoftwareOnly(info);
     }
 
     @Override

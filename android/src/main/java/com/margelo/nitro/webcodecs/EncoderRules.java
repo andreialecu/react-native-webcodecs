@@ -13,6 +13,9 @@ final class EncoderRules {
   interface Encoder {
     String name();
 
+    /** False for software-only encoders (c2.android.*, OMX.google.*). */
+    boolean hardware();
+
     boolean isSizeSupported(int width, int height);
 
     int widthAlignment();
@@ -49,15 +52,25 @@ final class EncoderRules {
     return fits(encoder, width, height, profile, colorFormat, h -> false);
   }
 
-  /** The first encoder, in the platform's order, that fits; or null. */
+  /**
+   * The first hardware encoder, in the platform's order, that fits; else
+   * the first software one; or null. A hardware encoder the lenient checks
+   * let through beats a software one the platform lists first.
+   */
   static String choose(
       List<? extends Encoder> encoders, int width, int height, int profile, int colorFormat, IntPredicate camcorderHasHeight) {
+    String software = null;
     for (Encoder encoder : encoders) {
       if (fits(encoder, width, height, profile, colorFormat, camcorderHasHeight)) {
-        return encoder.name();
+        if (encoder.hardware()) {
+          return encoder.name();
+        }
+        if (software == null) {
+          software = encoder.name();
+        }
       }
     }
-    return null;
+    return software;
   }
 
   /**

@@ -104,8 +104,8 @@ struct ColorAspects {
 constexpr int32_t kColorFormatYuvP010 = 0x36;
 
 // The encoder MediaCodecList says takes this config (size, profile, and the
-// input: a surface, or P010 buffers for 10-bit HDR), the first in the
-// platform's order; none when no encoder does. The frame rate and bitrate
+// input: a surface, or P010 buffers for 10-bit HDR), a hardware one before
+// a software one; none when no encoder does. The frame rate and bitrate
 // are hints, as in Media3: start() clamps the bitrate into the range of the
 // encoder it made.
 //
