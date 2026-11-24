@@ -20,6 +20,245 @@ private func withParameterSetPointers<R>(
   }
 }
 
+// Reads a NAL unit's RBSP (emulation prevention bytes removed) bit by bit.
+// Reading past the end throws, so a truncated parameter set gives no answer
+// rather than a wrong one.
+struct BitReader {
+  private let bytes: [UInt8]
+  private var bit = 0
+
+  struct End: Error {}
+
+  init(nal: [UInt8]) {
+    var out: [UInt8] = []
+    out.reserveCapacity(nal.count)
+    var zeros = 0
+    for b in nal {
+      if zeros >= 2 && b == 3 {
+        zeros = 0
+        continue
+      }
+      zeros = b == 0 ? zeros + 1 : 0
+      out.append(b)
+    }
+    bytes = out
+  }
+
+  mutating func u(_ n: Int) throws -> Int {
+    var v = 0
+    for _ in 0..<n {
+      guard bit / 8 < bytes.count else { throw End() }
+      v = (v << 1) | Int((bytes[bit / 8] >> (7 - UInt8(bit % 8))) & 1)
+      bit += 1
+    }
+    return v
+  }
+
+  mutating func skip(_ n: Int) throws { _ = try u(n) }
+
+  mutating func ue() throws -> Int {
+    var zeros = 0
+    while try u(1) == 0 {
+      zeros += 1
+      if zeros > 31 { throw End() }
+    }
+    let rest = try u(zeros)
+    return (1 << zeros) - 1 + rest
+  }
+
+  mutating func se() throws -> Int {
+    let k = try ue()
+    return k % 2 == 1 ? (k + 1) / 2 : -(k / 2)
+  }
+}
+
+// How many frames a stream may decode ahead of the one it shows next: its
+// SPS's max_num_reorder_frames (H.264, in the VUI) or
+// sps_max_num_reorder_pics (HEVC). nil when the SPS does not say.
+enum ReorderDepth {
+  static func h264(sps nal: [UInt8]) -> Int? {
+    var r = BitReader(nal: nal)
+    do {
+      try r.skip(8)  // NAL header
+      let profile = try r.u(8)
+      try r.skip(16)  // constraint flags, level
+      _ = try r.ue()  // seq_parameter_set_id
+      if [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].contains(profile) {
+        let chroma = try r.ue()
+        if chroma == 3 { try r.skip(1) }
+        _ = try r.ue()  // bit depths
+        _ = try r.ue()
+        try r.skip(1)
+        if try r.u(1) == 1 {  // seq_scaling_matrix_present_flag
+          for i in 0..<(chroma == 3 ? 12 : 8) {
+            guard try r.u(1) == 1 else { continue }
+            var last = 8
+            var next = 8
+            for _ in 0..<(i < 6 ? 16 : 64) {
+              if next != 0 {
+                let delta = try r.se()
+                next = (last + delta + 256) % 256
+              }
+              last = next == 0 ? last : next
+            }
+          }
+        }
+      }
+      _ = try r.ue()  // log2_max_frame_num_minus4
+      let pocType = try r.ue()
+      if pocType == 0 {
+        _ = try r.ue()
+      } else if pocType == 1 {
+        try r.skip(1)
+        _ = try r.se()
+        _ = try r.se()
+        let cycle = try r.ue()
+        for _ in 0..<cycle { _ = try r.se() }
+      }
+      // Picture order count type 2: shown in decoding order.
+      if pocType == 2 { return 0 }
+      _ = try r.ue()  // max_num_ref_frames
+      try r.skip(1)
+      _ = try r.ue()  // width, height
+      _ = try r.ue()
+      if try r.u(1) == 0 { try r.skip(1) }  // frame_mbs_only_flag
+      try r.skip(1)
+      if try r.u(1) == 1 {  // frame_cropping_flag
+        for _ in 0..<4 { _ = try r.ue() }
+      }
+      // Baseline and Constrained Baseline have no B-frames.
+      let noReordering: Int? = profile == 66 ? 0 : nil
+      guard try r.u(1) == 1 else { return noReordering }  // vui_parameters_present_flag
+      if try r.u(1) == 1 {  // aspect_ratio_info_present_flag
+        if try r.u(8) == 255 { try r.skip(32) }
+      }
+      if try r.u(1) == 1 { try r.skip(1) }  // overscan
+      if try r.u(1) == 1 {  // video_signal_type_present_flag
+        try r.skip(4)
+        if try r.u(1) == 1 { try r.skip(24) }
+      }
+      if try r.u(1) == 1 {  // chroma_loc_info_present_flag
+        _ = try r.ue()
+        _ = try r.ue()
+      }
+      if try r.u(1) == 1 { try r.skip(65) }  // timing_info
+      let nalHrd = try r.u(1) == 1
+      if nalHrd { try hrd(&r) }
+      let vclHrd = try r.u(1) == 1
+      if vclHrd { try hrd(&r) }
+      if nalHrd || vclHrd { try r.skip(1) }
+      try r.skip(1)  // pic_struct_present_flag
+      guard try r.u(1) == 1 else { return noReordering }  // bitstream_restriction_flag
+      try r.skip(1)
+      for _ in 0..<4 { _ = try r.ue() }
+      return try r.ue()  // max_num_reorder_frames
+    } catch {
+      return nil
+    }
+  }
+
+  private static func hrd(_ r: inout BitReader) throws {
+    let count = try r.ue() + 1
+    try r.skip(8)
+    for _ in 0..<count {
+      _ = try r.ue()
+      _ = try r.ue()
+      try r.skip(1)
+    }
+    try r.skip(20)
+  }
+
+  static func hevc(sps nal: [UInt8]) -> Int? {
+    var r = BitReader(nal: nal)
+    do {
+      try r.skip(16)  // NAL header
+      try r.skip(4)  // sps_video_parameter_set_id
+      let subLayers = try r.u(3)  // sps_max_sub_layers_minus1
+      try r.skip(1)
+      // profile_tier_level
+      try r.skip(2 + 1 + 5 + 32 + 48 + 8)
+      var profilePresent: [Bool] = []
+      var levelPresent: [Bool] = []
+      for _ in 0..<subLayers {
+        profilePresent.append(try r.u(1) == 1)
+        levelPresent.append(try r.u(1) == 1)
+      }
+      if subLayers > 0 {
+        for _ in subLayers..<8 { try r.skip(2) }
+      }
+      for i in 0..<subLayers {
+        if profilePresent[i] { try r.skip(88) }
+        if levelPresent[i] { try r.skip(8) }
+      }
+      _ = try r.ue()  // sps_seq_parameter_set_id
+      if try r.ue() == 3 { try r.skip(1) }  // chroma_format_idc
+      _ = try r.ue()  // width, height
+      _ = try r.ue()
+      if try r.u(1) == 1 {  // conformance_window_flag
+        for _ in 0..<4 { _ = try r.ue() }
+      }
+      _ = try r.ue()  // bit depths
+      _ = try r.ue()
+      _ = try r.ue()  // log2_max_pic_order_cnt_lsb_minus4
+      let all = try r.u(1) == 1  // sps_sub_layer_ordering_info_present_flag
+      var reorder = 0
+      for _ in (all ? 0 : subLayers)...subLayers {
+        _ = try r.ue()  // sps_max_dec_pic_buffering_minus1
+        reorder = try r.ue()  // sps_max_num_reorder_pics
+        _ = try r.ue()
+      }
+      return reorder
+    } catch {
+      return nil
+    }
+  }
+
+  // The SPS NAL units of an hvcC record.
+  static func hevcParameterSets(hvcC: Data, type: Int) -> [[UInt8]] {
+    let b = [UInt8](hvcC)
+    guard b.count > 23 else { return [] }
+    var sets: [[UInt8]] = []
+    var i = 23
+    for _ in 0..<Int(b[22]) {
+      guard i + 3 <= b.count else { break }
+      let nalType = Int(b[i] & 0x3f)
+      let count = Int(b[i + 1]) << 8 | Int(b[i + 2])
+      i += 3
+      for _ in 0..<count {
+        guard i + 2 <= b.count else { return sets }
+        let length = Int(b[i]) << 8 | Int(b[i + 1])
+        i += 2
+        guard i + length <= b.count else { return sets }
+        if nalType == type { sets.append(Array(b[i..<i + length])) }
+        i += length
+      }
+    }
+    return sets
+  }
+
+  // Without an answer from the stream: enough for the B-frame pyramids
+  // encoders make (x264's default needs 2, phones' HEVC up to 3 or 4).
+  static let fallback = 4
+  // The most H.264 and HEVC allow (a DPB of 16 frames).
+  static let most = 16
+
+  static func of(_ config: NativeVideoDecoderConfig) -> Int {
+    guard let description = config.description else { return fallback }
+    let record = description.toData(copyIfNeeded: true)
+    let depth: Int?
+    if config.codec.hasPrefix("avc") {
+      if let sps = HybridNativeVideoDecoder.parameterSets(avcC: record)?.first {
+        depth = h264(sps: [UInt8](sps))
+      } else {
+        depth = nil
+      }
+    } else {
+      depth = hevcParameterSets(hvcC: record, type: 33).first.flatMap { hevc(sps: $0) }
+    }
+    return min(depth ?? fallback, most)
+  }
+}
+
 final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
   private var session: VTDecompressionSession?
   private let format: CMVideoFormatDescription
@@ -28,6 +267,15 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
   private let queue = DispatchQueue(label: "webcodecs.video-decoder")
   private var failed = false
   private var background: BackgroundWatch?
+  // VideoToolbox may output frames in decoding order (the Simulator's
+  // decoder does, temporal processing or not), and WebCodecs outputs them in
+  // presentation order: decoded frames wait here, sorted by timestamp, until
+  // more than the stream's reorder depth are held, then the earliest goes
+  // out. Frames that already come in order only wait, they are not moved.
+  private let reorder = NSLock()
+  private var held: [NativeDecodedFrame] = []
+  private var depth: Int
+  private var lastOut = -Double.infinity
 
   init(
     config: NativeVideoDecoderConfig,
@@ -37,6 +285,7 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
     self.output = output
     self.error = error
     format = try HybridNativeVideoDecoder.formatDescription(config)
+    depth = ReorderDepth.of(config)
     super.init()
 
     let attributes: [CFString: Any] = [
@@ -118,8 +367,45 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
     queue.async {
       if self.failed { return }
       self.failed = true
+      self.discardHeld()
       self.error(message)
     }
+  }
+
+  // From VideoToolbox's output callback.
+  private func hold(_ frame: NativeDecodedFrame) {
+    reorder.lock()
+    defer { reorder.unlock() }
+    if failed { return }
+    // Later than its turn: the stream reorders more than it said. It goes
+    // out next (out of order, which cannot be helped now), and later
+    // frames wait for one more.
+    if frame.timestamp < lastOut && depth < ReorderDepth.most {
+      depth += 1
+    }
+    let at = held.firstIndex { $0.timestamp > frame.timestamp } ?? held.count
+    held.insert(frame, at: at)
+    while held.count > depth {
+      emit(held.removeFirst())
+    }
+  }
+
+  private func emit(_ frame: NativeDecodedFrame) {
+    lastOut = max(lastOut, frame.timestamp)
+    output(frame)
+  }
+
+  private func drainHeld() {
+    reorder.lock()
+    defer { reorder.unlock() }
+    while !held.isEmpty { emit(held.removeFirst()) }
+  }
+
+  // Their surfaces go back to the decoder's pool unseen.
+  private func discardHeld() {
+    reorder.lock()
+    held.removeAll()
+    reorder.unlock()
   }
 
   func decode(data: ArrayBuffer, timestamp: Double, duration: Double, key: Bool) throws {
@@ -169,7 +455,7 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
         guard let imageBuffer else { return }  // dropped
         let ts = pts.isValid ? Double(CMTimeConvertScale(pts, timescale: 1_000_000, method: .roundHalfAwayFromZero).value) : timestamp
         let d = dur.isValid ? Double(CMTimeConvertScale(dur, timescale: 1_000_000, method: .roundHalfAwayFromZero).value) : duration
-        self.output(NativeDecodedFrame(surface: HybridNativeSurface(pixelBuffer: imageBuffer), timestamp: ts, duration: d))
+        self.hold(NativeDecodedFrame(surface: HybridNativeSurface(pixelBuffer: imageBuffer), timestamp: ts, duration: d))
       }
       if status != noErr {
         self.fail(HybridNativeVideoEncoder.describe(status).replacingOccurrences(of: "encoder", with: "decoder"))
@@ -182,6 +468,11 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
     return Promise.parallel(queue) {
       VTDecompressionSessionFinishDelayedFrames(session)
       VTDecompressionSessionWaitForAsynchronousFrames(session)
+      if !self.failed { self.drainHeld() }
+      // A flush ends the stream: what follows starts from a key frame.
+      self.reorder.lock()
+      self.lastOut = -Double.infinity
+      self.reorder.unlock()
     }
   }
 
@@ -191,6 +482,7 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
       queue.async {
         self.failed = true
         VTDecompressionSessionInvalidate(session)
+        self.discardHeld()
       }
     }
     session = nil

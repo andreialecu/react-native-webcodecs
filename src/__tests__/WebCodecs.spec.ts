@@ -504,18 +504,23 @@ const expectOk = (result: Export) => {
 // Runs `fn` on the device with the eval context, for longer than one call
 // to the app may take: started in one call, then polled until it settles.
 const runOnDevice = async <R>(
-  fn: (context: { example: any; ctx: any }) => Promise<R>,
+  fn: (context: {
+    example: any;
+    mediabunny: any;
+    webcodecs: any;
+    ctx: any;
+  }) => Promise<R>,
   ctx: object,
   limitMs: number,
 ): Promise<R> => {
   const key = `__e2e_${Math.random().toString(36).slice(2)}`;
   await client.eval(
-    ({ example, ctx: c }) => {
+    ({ example, mediabunny, webcodecs, ctx: c }) => {
       const g = globalThis as any;
       const run = eval(`(${c.fn})`);
       g[c.key] = null;
       Promise.resolve()
-        .then(() => run({ example, ctx: c.args }))
+        .then(() => run({ example, mediabunny, webcodecs, ctx: c.args }))
         .then(
           (value: any) => (g[c.key] = { value }),
           (e: any) => (g[c.key] = { error: String((e && e.stack) || e) }),
@@ -1337,6 +1342,63 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(result.size).toBe(5);
     expect(result.bytes).toEqual([1, 2, 3, 4, 5]);
   }, 60000);
+
+  // x264's High profile reorders frames (B-frames): the decoder must still
+  // output them in presentation order, as WebCodecs does, whatever order
+  // the platform's decoder returns them in.
+  it("decodes a video with B-frames into frames in presentation order", async () => {
+    if (!supported() || !probes()) {
+      return;
+    }
+    const file = await sourceClip(false);
+    const out = await runOnDevice<(number | string)[]>(
+      ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+        const input = new mb.Input({
+          source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+          formats: mb.ALL_FORMATS,
+        });
+        return input.getPrimaryVideoTrack().then((track: any) =>
+          track.getDecoderConfig().then((config: any) => {
+            const times: (number | string)[] = [];
+            const decoder = new wc.VideoDecoder({
+              output: (frame: any) => {
+                times.push(frame.timestamp);
+                frame.close();
+              },
+              error: (e: any) => times.push(String(e)),
+            });
+            decoder.configure(config);
+            const packets = new mb.EncodedPacketSink(track).packets();
+            const step = (): Promise<void> =>
+              packets.next().then((r: any) => {
+                if (r.done) {
+                  return undefined;
+                }
+                decoder.decode(r.value.toEncodedVideoChunk());
+                return step();
+              });
+            return step()
+              .then(() => decoder.flush())
+              .then(() => {
+                decoder.close();
+                input.dispose();
+                return times;
+              });
+          }),
+        );
+      },
+      { file },
+      120000,
+    );
+    // The source does reorder: its packets are not stored in time order.
+    const local = path.join(os.tmpdir(), "rnwc-e2e-clips", "clip.mp4");
+    const stored = videoPacketTimes(local);
+    expect(stored.some((t, i) => i > 0 && t < stored[i - 1])).toBe(true);
+    expect(out.filter((t) => typeof t === "string")).toEqual([]);
+    expect(out).toHaveLength(90);
+    const times = out as number[];
+    expect(times.filter((t, i) => i > 0 && t <= times[i - 1])).toEqual([]);
+  }, 180000);
 
   // The example app's screens, through its own code (example/src/Tests.tsx
   // hands it over): the Lottie share card exported as the Video Export
