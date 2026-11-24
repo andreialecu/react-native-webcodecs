@@ -1890,6 +1890,82 @@ describe("react-native-webcodecs + Mediabunny", () => {
     }
   }, 60000);
 
+  it("encodes 1, 2 and 3 frames to one chunk each, again and again", async () => {
+    if (!supported()) {
+      return;
+    }
+    const result = (await client.eval(({ webcodecs: wc }) => {
+      const encodeFew = (count: number) => {
+        const chunks: { timestamp: number; type: string; size: number }[] = [];
+        const errors: string[] = [];
+        const encoder = new wc.VideoEncoder({
+          output: (chunk: any) =>
+            chunks.push({
+              timestamp: chunk.timestamp,
+              type: chunk.type,
+              size: chunk.byteLength,
+            }),
+          error: (e: any) => errors.push(String(e)),
+        });
+        encoder.configure({ codec: "avc1.42001f", width: 64, height: 64 });
+        const pool = wc.createSurfacePool(64, 64);
+        // Each round is a short stream of its own: flush() ends it right
+        // after its last frame.
+        const round = (r: number): Promise<void> => {
+          for (let i = 0; i < count; i++) {
+            const frame = new wc.VideoFrame(pool.acquire(), {
+              timestamp: (r * count + i) * 33333,
+            });
+            encoder.encode(frame, { keyFrame: i === 0 });
+            frame.close();
+          }
+          return encoder.flush();
+        };
+        return [0, 1, 2]
+          .reduce(
+            (p: Promise<void>, r: number) => p.then(() => round(r)),
+            Promise.resolve(),
+          )
+          .then(
+            () => {
+              encoder.close();
+              return { chunks, errors };
+            },
+            (e: any) => {
+              encoder.close();
+              return { chunks, errors: errors.concat([String(e)]) };
+            },
+          );
+      };
+      const runs: any[] = [];
+      return [1, 2, 3]
+        .reduce(
+          (p: Promise<void>, count: number) =>
+            p.then(() =>
+              encodeFew(count).then((r: any) => {
+                runs.push(r);
+              }),
+            ),
+          Promise.resolve(),
+        )
+        .then(() => runs);
+    })) as any;
+    result.forEach((run: any, n: number) => {
+      const count = n + 1;
+      expect(run.errors).toEqual([]);
+      expect(run.chunks.map((c: any) => c.timestamp)).toEqual(
+        Array.from({ length: 3 * count }, (_, i) => i * 33333),
+      );
+      run.chunks.forEach((c: any, i: number) => {
+        expect(c.size).toBeGreaterThan(0);
+        // The first frame of each round starts a new stream: a key frame.
+        if (i % count === 0) {
+          expect(c.type).toBe("key");
+        }
+      });
+    });
+  }, 120000);
+
   it("writes into missing directories and reads percent-encoded file:// URLs", async () => {
     if (!supported()) {
       return;

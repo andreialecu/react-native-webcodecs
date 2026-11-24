@@ -49,6 +49,10 @@ constexpr auto kStallTimeout = std::chrono::seconds(20);
 // How long a key frame request waits for the frames before it to come out.
 constexpr auto kKeyFrameDrainTimeout = std::chrono::milliseconds(200);
 
+// How long flush() waits for the frames drawn to come out before it ends the
+// stream (Media3 waits 100 ms).
+constexpr auto kEndOfStreamDrainTimeout = std::chrono::milliseconds(200);
+
 inline std::string describeCodecStatus(media_status_t status, const std::string& what, const std::string& prefix) {
   // The system takes a codec back from an app in the background when another
   // needs it (MediaCodec.CodecException.ERROR_RECLAIMED).
@@ -333,6 +337,16 @@ public:
       if (_ended || _framesIn == 0) {
         promise->resolve();
         return;
+      }
+      if (!_aspects.hdr()) {
+        // Some encoders lose the last frame when the end of stream follows
+        // it at once (b/301603935): a short encode would then come out with
+        // no frame. As Media3 does, first let what was drawn come out, for a
+        // bounded time (encoders that hold frames until more come or the
+        // stream ends wait it out).
+        std::unique_lock<std::mutex> lock(_mutex);
+        _cv.wait_for(lock, kEndOfStreamDrainTimeout,
+                     [this] { return _framesOut + _framesSkipped >= _framesIn || _failed || _closed; });
       }
       // MediaCodec has no flush for a surface input: end the stream (the
       // next encode() starts a new one).
