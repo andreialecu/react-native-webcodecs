@@ -1854,6 +1854,67 @@ describe("react-native-webcodecs + Mediabunny", () => {
     });
   }, 300000);
 
+  // close() while JS holds every picture and the decoder waits for it
+  // (input and drain both blocked on Android) returns at once.
+  it("closes a VideoDecoder at once while JS holds every decoded picture", async () => {
+    if (!supported() || !probes()) {
+      return;
+    }
+    const file = await sourceClip(false);
+    const result = await runOnDevice<any>(
+      ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+        const input = new mb.Input({
+          source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+          formats: mb.ALL_FORMATS,
+        });
+        return input.getPrimaryVideoTrack().then((track: any) =>
+          track.getDecoderConfig().then((config: any) => {
+            const errors: string[] = [];
+            const held: any[] = [];
+            const decoder = new wc.VideoDecoder({
+              output: (frame: any) => held.push(frame),
+              error: (e: any) => errors.push(String(e)),
+            });
+            decoder.configure(config);
+            const packets = new mb.EncodedPacketSink(track).packets();
+            const step = (): Promise<void> =>
+              packets.next().then((r: any) => {
+                if (r.done) {
+                  return undefined;
+                }
+                decoder.decode(r.value.toEncodedVideoChunk());
+                return step();
+              });
+            return step()
+              .then(
+                () => new Promise((resolve) => setTimeout(resolve, ctx.holdMs)),
+              )
+              .then(() => {
+                const t0 = Date.now();
+                decoder.close();
+                const ms = Date.now() - t0;
+                const frames = held.length;
+                for (const f of held) {
+                  f.close();
+                }
+                input.dispose();
+                return { errors, frames, ms, state: decoder.state };
+              });
+          }),
+        );
+      },
+      { file, holdMs: 7000 },
+      120000,
+    );
+    console.log(`close held: ${JSON.stringify(result)}`);
+    expect(result.errors).toEqual([]);
+    expect(result.state).toBe("closed");
+    expect(result.ms).toBeLessThan(1000);
+    if (client.OS === "android") {
+      expect(result.frames).toBe(16);
+    }
+  }, 180000);
+
   // hardwareAcceleration picks the decoder: "prefer-software" a software
   // one (on the emulator c2.android.avc.decoder rather than goldfish's),
   // "prefer-hardware" none of those. iOS takes the preference as a hint.
