@@ -1367,19 +1367,19 @@ describe("react-native-webcodecs + Mediabunny", () => {
             };
             const out: any = { errors };
             return timedFlush()
-              .then((first) => {
+              .then((first: any) => {
                 out.first = first;
                 return pass();
               })
-              .then((one) => {
+              .then((one: any) => {
                 out.one = one;
                 return timedFlush();
               })
-              .then((again) => {
+              .then((again: any) => {
                 out.again = again;
                 return pass();
               })
-              .then((two) => {
+              .then((two: any) => {
                 out.two = two;
                 decoder.close();
                 input.dispose();
