@@ -39,9 +39,9 @@ public:
     if (config.width <= 0 || config.height <= 0 || !videoEncodingAvailable()) {
       return false;
     }
-    // MediaCodecList: an encoder that takes this size, frame rate, bitrate
-    // and profile, from a surface (8-bit) or P010 buffers (Main 10, which
-    // HDR export uses), as the encoder will be created.
+    // MediaCodecList: an encoder that takes this size and profile, from a
+    // surface (8-bit) or P010 buffers (Main 10, which HDR export uses), as
+    // the encoder will be created. The frame rate and bitrate are hints.
     if (config.codec == "avc" || config.codec == "av1") {
       bool tenBit = config.profile.value_or("") == "main10";
       return findVideoEncoder(config, tenBit).has_value();

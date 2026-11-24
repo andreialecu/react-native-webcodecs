@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstring>
 #include <future>
 #include <map>
@@ -102,9 +103,11 @@ struct ColorAspects {
 
 constexpr int32_t kColorFormatYuvP010 = 0x36;
 
-// The encoder MediaCodecList says takes this config (size, frame rate,
-// bitrate, profile, and the input: a surface, or P010 buffers for 10-bit
-// HDR), the first in the platform's order; none when no encoder does.
+// The encoder MediaCodecList says takes this config (size, profile, and the
+// input: a surface, or P010 buffers for 10-bit HDR), the first in the
+// platform's order; none when no encoder does. The frame rate and bitrate
+// are hints, as in Media3: start() clamps the bitrate into the range of the
+// encoder it made.
 //
 // An H.264 profile is a preference, as configure() treats it: when no encoder
 // lists it (the emulator's software encoder has no High), any encoder that
@@ -112,9 +115,8 @@ constexpr int32_t kColorFormatYuvP010 = 0x36;
 // of the output says. AV1's Main 10 is required: HDR depends on it.
 inline std::optional<std::string> findVideoEncoder(const NativeVideoEncoderConfig& config, bool hdr) {
   auto find = [&](int32_t profile) {
-    return JCapabilities::findVideoEncoder(videoMime(config.codec), static_cast<int>(config.width), static_cast<int>(config.height),
-                                           config.framerate.value_or(0), static_cast<int>(std::min(config.bitrate.value_or(0), 2e9)),
-                                           profile, hdr ? kColorFormatYuvP010 : kColorFormatSurface);
+    return JCapabilities::findVideoEncoder(videoMime(config.codec), static_cast<int>(config.width), static_cast<int>(config.height), profile,
+                                           hdr ? kColorFormatYuvP010 : kColorFormatSurface);
   };
   int32_t profile = mediaCodecProfile(config);
   auto name = find(profile);
@@ -397,6 +399,22 @@ private:
     return AMediaCodec_createEncoderByType(videoMime(_config.codec).c_str());
   }
 
+  // The codec's name ("" when unknown). AMediaCodec_getName is API 28,
+  // above this library's minimum (26).
+  static std::string codecName(AMediaCodec* codec) {
+    using GetName = media_status_t (*)(AMediaCodec*, char**);
+    using ReleaseName = void (*)(AMediaCodec*, char*);
+    static auto getName = reinterpret_cast<GetName>(dlsym(RTLD_DEFAULT, "AMediaCodec_getName"));
+    static auto releaseName = reinterpret_cast<ReleaseName>(dlsym(RTLD_DEFAULT, "AMediaCodec_releaseName"));
+    std::string result;
+    char* name = nullptr;
+    if (getName && releaseName && getName(codec, &name) == AMEDIA_OK && name) {
+      result = name;
+      releaseName(codec, name);
+    }
+    return result;
+  }
+
   void start() {
     _codec = createCodec();
     if (!_codec) {
@@ -404,14 +422,15 @@ private:
     }
     int32_t width = static_cast<int32_t>(_config.width);
     int32_t height = static_cast<int32_t>(_config.height);
-    double framerate = _config.framerate.value_or(30);
-    if (framerate <= 0) {
+    // Hints: the frame rate floored, and below 1 the default; the bitrate
+    // (or the default one) clamped into the range of the encoder made.
+    double framerate = std::floor(_config.framerate.value_or(0));
+    if (!(framerate >= 1)) {
       framerate = 30;
     }
-    double bitrate = _config.bitrate.value_or(0);
-    if (bitrate <= 0) {
-      bitrate = width * height * framerate * 0.1;
-    }
+    std::string encoderName = codecName(_codec);
+    double bitrate = JCapabilities::videoBitrate(encoderName, videoMime(_config.codec), _config.bitrate.value_or(0), width, height,
+                                                 _config.framerate.value_or(0));
     // From the most to the least demanding: each attempt drops a setting some
     // encoders refuse at configure time (as #641's writer, after Media3 and
     // react-native-skia-video). A codec a configure failed on is in an error
@@ -486,17 +505,9 @@ private:
                                std::to_string(configured) + ")");
     }
     // Software codecs are Codec2's c2.android.* (and OMX.google.*).
-    // AMediaCodec_getName is API 28, above this library's minimum (26).
-    using GetName = media_status_t (*)(AMediaCodec*, char**);
-    using ReleaseName = void (*)(AMediaCodec*, char*);
-    static auto getName = reinterpret_cast<GetName>(dlsym(RTLD_DEFAULT, "AMediaCodec_getName"));
-    static auto releaseName = reinterpret_cast<ReleaseName>(dlsym(RTLD_DEFAULT, "AMediaCodec_releaseName"));
-    char* name = nullptr;
-    if (getName && releaseName && getName(_codec, &name) == AMEDIA_OK && name) {
-      std::string codecName(name);
-      _hardware = codecName.rfind("c2.android.", 0) != 0 && codecName.rfind("OMX.google.", 0) != 0;
-      WC_LOG("video encoder: %s", name);
-      releaseName(_codec, name);
+    if (!encoderName.empty()) {
+      _hardware = encoderName.rfind("c2.android.", 0) != 0 && encoderName.rfind("OMX.google.", 0) != 0;
+      WC_LOG("video encoder: %s, %dx%d at %lld bps, %g fps", encoderName.c_str(), width, height, static_cast<long long>(bitrate), framerate);
     }
     media_status_t status = AMEDIA_OK;
     if (!_aspects.hdr()) {

@@ -17,7 +17,7 @@ public class EncoderRulesTest {
   static final int AVC_HIGH = 8;
 
   // An encoder taking sizes up to maxWidth x maxHeight, each a multiple of
-  // its alignment, up to maxFps at any size, and bitrates in [1, maxBitrate].
+  // its alignment, and bitrates in [1, maxBitrate].
   static class Fake implements EncoderRules.Encoder {
     final String name;
     boolean hardware = true;
@@ -25,7 +25,6 @@ public class EncoderRulesTest {
     int maxHeight = 4096;
     int widthAlignment = 2;
     int heightAlignment = 2;
-    double maxFps = 30;
     int maxBitrate = 12_000_000;
     int[] profiles = {AVC_BASELINE};
     int[] colorFormats = {SURFACE};
@@ -63,11 +62,6 @@ public class EncoderRulesTest {
     }
 
     @Override
-    public boolean areSizeAndRateSupported(int width, int height, double frameRate) {
-      return isSizeSupported(width, height) && frameRate <= maxFps;
-    }
-
-    @Override
     public int bitrateLower() {
       return 1;
     }
@@ -91,11 +85,11 @@ public class EncoderRulesTest {
   @Test
   public void fitsSizeProfileAndColorFormat() {
     Fake encoder = new Fake("c2.android.avc.encoder").size(2048, 2048);
-    assertTrue(EncoderRules.fits(encoder, 1280, 720, 0, 0, 0, SURFACE));
-    assertTrue(EncoderRules.fits(encoder, 1280, 720, 0, 0, AVC_BASELINE, SURFACE));
-    assertFalse(EncoderRules.fits(encoder, 1280, 720, 0, 0, AVC_HIGH, SURFACE));
-    assertFalse(EncoderRules.fits(encoder, 1280, 720, 0, 0, 0, P010));
-    assertFalse(EncoderRules.fits(encoder, 16384, 16384, 0, 0, 0, SURFACE));
+    assertTrue(EncoderRules.fits(encoder, 1280, 720, 0, SURFACE));
+    assertTrue(EncoderRules.fits(encoder, 1280, 720, AVC_BASELINE, SURFACE));
+    assertFalse(EncoderRules.fits(encoder, 1280, 720, AVC_HIGH, SURFACE));
+    assertFalse(EncoderRules.fits(encoder, 1280, 720, 0, P010));
+    assertFalse(EncoderRules.fits(encoder, 16384, 16384, 0, SURFACE));
   }
 
   @Test
@@ -103,7 +97,35 @@ public class EncoderRulesTest {
     Fake small = new Fake("small").size(640, 480);
     Fake a = new Fake("a");
     Fake b = new Fake("b");
-    assertEquals("a", EncoderRules.choose(Arrays.asList(small, a, b), 1280, 720, 0, 0, 0, SURFACE));
-    assertNull(EncoderRules.choose(Arrays.asList(small), 1280, 720, 0, 0, 0, SURFACE));
+    assertEquals("a", EncoderRules.choose(Arrays.asList(small, a, b), 1280, 720, 0, SURFACE));
+    assertNull(EncoderRules.choose(Arrays.asList(small), 1280, 720, 0, SURFACE));
+  }
+
+  // The frame rate and bitrate are hints (as in Media3): an encoder is not
+  // refused for them, the bitrate is clamped into its range.
+  @Test
+  public void frameRateAndBitrateDoNotRefuseAnEncoder() {
+    Fake encoder = new Fake("c2.android.avc.encoder").size(2048, 2048);
+    // The check knows neither: c2.android.avc.encoder lists at most
+    // 12 Mbps, and about 30 fps at 1080x1920, yet takes more once configured.
+    assertTrue(EncoderRules.fits(encoder, 1080, 1920, 0, SURFACE));
+    assertTrue(EncoderRules.fits(encoder, 1280, 720, 0, SURFACE));
+  }
+
+  @Test
+  public void frameRateIsFlooredAndIgnoredBelowOne() {
+    assertEquals(29, EncoderRules.frameRate(29.97), 0);
+    assertEquals(60, EncoderRules.frameRate(60), 0);
+    assertEquals(0, EncoderRules.frameRate(0.5), 0);
+    assertEquals(0, EncoderRules.frameRate(-1), 0);
+    assertEquals(0, EncoderRules.frameRate(Double.NaN), 0);
+  }
+
+  @Test
+  public void aGivenBitrateIsClampedIntoTheRange() {
+    assertEquals(12_000_000, EncoderRules.bitrate(100e6, 1280, 720, 30, 1, 12_000_000));
+    assertEquals(5_000_000, EncoderRules.bitrate(5e6, 1280, 720, 30, 1, 12_000_000));
+    assertEquals(64_000, EncoderRules.bitrate(1000, 1280, 720, 30, 64_000, 12_000_000));
+    assertEquals(Integer.MAX_VALUE, EncoderRules.bitrate(5e12, 1280, 720, 30, 1, Integer.MAX_VALUE));
   }
 }

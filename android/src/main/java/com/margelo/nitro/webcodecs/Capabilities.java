@@ -20,16 +20,34 @@ public final class Capabilities {
 
   /**
    * The name of the first encoder for `mime` (in the platform's order, as
-   * MediaCodec.createEncoderByType picks) that takes frames of this size, at
-   * this frame rate and bitrate, in this profile and input color format; or
-   * null when none does. `frameRate`, `bitrate` and `profile` are ignored
-   * when 0 or less.
+   * MediaCodec.createEncoderByType picks) that takes frames of this size, in
+   * this profile (ignored when 0 or less) and input color format; or null
+   * when none does. The frame rate and bitrate are hints, as in Media3: they
+   * refuse no encoder (see videoBitrate).
    */
   @Keep
   @Nullable
-  public static String findVideoEncoder(
-      String mime, int width, int height, double frameRate, int bitrate, int profile, int colorFormat) {
-    return EncoderRules.choose(videoEncoders(mime), width, height, frameRate, bitrate, profile, colorFormat);
+  public static String findVideoEncoder(String mime, int width, int height, int profile, int colorFormat) {
+    return EncoderRules.choose(videoEncoders(mime), width, height, profile, colorFormat);
+  }
+
+  /**
+   * The bitrate to configure the encoder `name` with: `requested`, or when
+   * 0 or less width * height * fps * 0.1, clamped into the encoder's range
+   * when it lists one. `frameRate` is floored, and ignored below 1.
+   */
+  @Keep
+  public static int videoBitrate(String name, String mime, double requested, int width, int height, double frameRate) {
+    int lower = 1;
+    int upper = Integer.MAX_VALUE;
+    for (EncoderRules.Encoder encoder : videoEncoders(mime)) {
+      if (encoder.name().equals(name)) {
+        lower = encoder.bitrateLower();
+        upper = encoder.bitrateUpper();
+        break;
+      }
+    }
+    return EncoderRules.bitrate(requested, width, height, frameRate, lower, upper);
   }
 
   // The encoders for `mime`, in the platform's order, aliases left out.
@@ -80,11 +98,6 @@ public final class Capabilities {
     @Override
     public boolean isSizeSupported(int width, int height) {
       return video.isSizeSupported(width, height);
-    }
-
-    @Override
-    public boolean areSizeAndRateSupported(int width, int height, double frameRate) {
-      return video.areSizeAndRateSupported(width, height, frameRate);
     }
 
     @Override

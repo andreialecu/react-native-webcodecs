@@ -14,8 +14,6 @@ final class EncoderRules {
 
     boolean isSizeSupported(int width, int height);
 
-    boolean areSizeAndRateSupported(int width, int height, double frameRate);
-
     int bitrateLower();
 
     int bitrateUpper();
@@ -26,18 +24,13 @@ final class EncoderRules {
   }
 
   /**
-   * Whether the encoder takes frames of this size, at this frame rate and
-   * bitrate, in this profile and input color format. `frameRate`, `bitrate`
-   * and `profile` are ignored when 0 or less.
+   * Whether the encoder takes frames of this size, in this profile (ignored
+   * when 0 or less) and input color format. The frame rate and bitrate are
+   * hints, as in Media3: they never refuse an encoder (the bitrate is
+   * clamped into its range, see bitrate()).
    */
-  static boolean fits(Encoder encoder, int width, int height, double frameRate, int bitrate, int profile, int colorFormat) {
-    boolean size = frameRate > 0
-        ? encoder.areSizeAndRateSupported(width, height, frameRate)
-        : encoder.isSizeSupported(width, height);
-    if (!size) {
-      return false;
-    }
-    if (bitrate > 0 && (bitrate < encoder.bitrateLower() || bitrate > encoder.bitrateUpper())) {
+  static boolean fits(Encoder encoder, int width, int height, int profile, int colorFormat) {
+    if (!encoder.isSizeSupported(width, height)) {
       return false;
     }
     if (profile > 0 && !contains(encoder.profiles(), profile)) {
@@ -47,14 +40,37 @@ final class EncoderRules {
   }
 
   /** The first encoder, in the platform's order, that fits; or null. */
-  static String choose(
-      List<? extends Encoder> encoders, int width, int height, double frameRate, int bitrate, int profile, int colorFormat) {
+  static String choose(List<? extends Encoder> encoders, int width, int height, int profile, int colorFormat) {
     for (Encoder encoder : encoders) {
-      if (fits(encoder, width, height, frameRate, bitrate, profile, colorFormat)) {
+      if (fits(encoder, width, height, profile, colorFormat)) {
         return encoder.name();
       }
     }
     return null;
+  }
+
+  /**
+   * The frame rate to configure: a hint, floored to whole frames (some
+   * encoders refuse a fractional one); 0 (none: the default) below 1.
+   */
+  static double frameRate(double frameRate) {
+    if (!(frameRate >= 1)) {
+      return 0;
+    }
+    return Math.floor(frameRate);
+  }
+
+  /**
+   * The bitrate to configure: the one asked for, or when none (0 or less)
+   * width * height * fps * 0.1; a hint, clamped into the encoder's range
+   * [lower, upper] when one was asked for.
+   */
+  static int bitrate(double requested, int width, int height, double frameRate, int lower, int upper) {
+    if (requested > 0) {
+      return (int) Math.max(lower, Math.min(upper, requested));
+    }
+    double fps = frameRate(frameRate) > 0 ? frameRate(frameRate) : 30;
+    return (int) Math.min((double) width * height * fps * 0.1, Integer.MAX_VALUE);
   }
 
   static boolean contains(int[] values, int value) {

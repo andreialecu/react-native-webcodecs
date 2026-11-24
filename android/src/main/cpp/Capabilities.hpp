@@ -20,21 +20,37 @@ struct JCapabilities : facebook::jni::JavaClass<JCapabilities> {
     javaClassStatic();
   }
 
-  // The name of the first encoder for `mime` that takes this config, or none.
-  // frameRate, bitrate and profile are ignored when 0 or less.
-  static std::optional<std::string> findVideoEncoder(const std::string& mime, int width, int height, double frameRate, int bitrate,
-                                                     int profile, int colorFormat) {
+  // The name of the first encoder for `mime` that takes this size, profile
+  // (ignored when 0 or less) and input color format, or none. The frame rate
+  // and bitrate are hints, which refuse no encoder.
+  static std::optional<std::string> findVideoEncoder(const std::string& mime, int width, int height, int profile, int colorFormat) {
     std::optional<std::string> name;
     facebook::jni::ThreadScope::WithClassLoader([&] {
       static const auto method =
-          javaClassStatic()->getStaticMethod<facebook::jni::local_ref<facebook::jni::JString>(facebook::jni::alias_ref<facebook::jni::JString>, jint, jint, jdouble, jint, jint, jint)>(
+          javaClassStatic()->getStaticMethod<facebook::jni::local_ref<facebook::jni::JString>(facebook::jni::alias_ref<facebook::jni::JString>, jint, jint, jint, jint)>(
               "findVideoEncoder");
-      auto result = method(javaClassStatic(), facebook::jni::make_jstring(mime), width, height, frameRate, bitrate, profile, colorFormat);
+      auto result = method(javaClassStatic(), facebook::jni::make_jstring(mime), width, height, profile, colorFormat);
       if (result) {
         name = result->toStdString();
       }
     });
     return name;
+  }
+
+  // The bitrate to configure the encoder `name` with: `requested`, or when 0
+  // or less width * height * fps * 0.1, clamped into the encoder's range.
+  static int32_t videoBitrate(const std::string& name, const std::string& mime, double requested, int width, int height,
+                              double frameRate) {
+    int32_t bitrate = 0;
+    facebook::jni::ThreadScope::WithClassLoader([&] {
+      static const auto method =
+          javaClassStatic()
+              ->getStaticMethod<jint(facebook::jni::alias_ref<facebook::jni::JString>, facebook::jni::alias_ref<facebook::jni::JString>, jdouble,
+                                     jint, jint, jdouble)>("videoBitrate");
+      bitrate = method(javaClassStatic(), facebook::jni::make_jstring(name), facebook::jni::make_jstring(mime), requested, width, height,
+                       frameRate);
+    });
+    return bitrate;
   }
 
   // The decoders for `mime` that take this size, in the platform's order:

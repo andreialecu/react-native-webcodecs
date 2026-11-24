@@ -1283,6 +1283,64 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(result.huge).toBe(false);
   }, 60000);
 
+  // The frame rate and bitrate are hints, as in Media3: an encoder is not
+  // refused for them (the emulator's c2.android.avc.encoder lists at most
+  // 12 Mbps, and about 30 fps at 1080x1920). The bitrate is clamped into the
+  // encoder's range, the frame rate floored, and below 1 ignored.
+  it("treats framerate and bitrate as hints", async () => {
+    if (!supported()) {
+      return;
+    }
+    const result = (await client.eval(({ webcodecs: wc }) => {
+      const configs = [
+        { codec: "avc1.42001f", width: 1280, height: 720, bitrate: 100e6 },
+        { codec: "avc1.42001f", width: 1080, height: 1920, framerate: 120 },
+        { codec: "avc1.42001f", width: 640, height: 480, framerate: 0.5 },
+      ];
+      const run = (config: any) =>
+        wc.VideoEncoder.isConfigSupported(config).then((support: any) => {
+          const chunks: number[] = [];
+          const errors: string[] = [];
+          const encoder = new wc.VideoEncoder({
+            output: (chunk: any) => chunks.push(chunk.byteLength),
+            error: (e: any) => errors.push(`${e.name}: ${e.message}`),
+          });
+          encoder.configure(config);
+          const pool = wc.createSurfacePool(config.width, config.height);
+          [0, 33333, 66666].forEach((timestamp) => {
+            const frame = new wc.VideoFrame(pool.acquire(), { timestamp });
+            encoder.encode(frame, { keyFrame: timestamp === 0 });
+            frame.close();
+          });
+          return encoder
+            .flush()
+            .catch((e: any) => errors.push(`flush: ${e.name}: ${e.message}`))
+            .then(() => {
+              if (encoder.state !== "closed") {
+                encoder.close();
+              }
+              return {
+                supported: support.supported,
+                chunks: chunks.filter((n) => n > 0).length,
+                errors,
+              };
+            });
+        });
+      // One at a time: a 1080x1920 software encode next to another one is
+      // slow on the emulator.
+      return configs.reduce(
+        (done: Promise<any[]>, config) =>
+          done.then((all) => run(config).then((r: any) => [...all, r])),
+        Promise.resolve([]),
+      );
+    })) as any[];
+    expect(result).toEqual([
+      { supported: true, chunks: 3, errors: [] },
+      { supported: true, chunks: 3, errors: [] },
+      { supported: true, chunks: 3, errors: [] },
+    ]);
+  }, 120000);
+
   // AudioEncoder alone, fed a 440 Hz sine in 1000-frame AudioData (not
   // multiples of an AAC frame): `segments` runs, each from its own start
   // time and followed by a flush. Returns each chunk's timestamp and
