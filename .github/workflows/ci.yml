@@ -78,8 +78,39 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Most of installing ffmpeg is downloading its bottles and those of its
+      # dependencies. They are kept between runs, keyed on the runner image
+      # and the ffmpeg version Homebrew would install, so a new image or a new
+      # ffmpeg starts from an empty download cache. brew still installs from
+      # them and checks their checksums.
+      - name: Find ffmpeg version
+        id: ffmpeg
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          echo "version=$(brew info --json=v2 ffmpeg | jq -r '.formulae[0].versions.stable')" >> "$GITHUB_OUTPUT"
+          echo "dir=$(brew --cache)/downloads" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Homebrew downloads
+        id: brew
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.ffmpeg.outputs.dir }}
+          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-${{ env.ImageVersion }}-ffmpeg-${{ steps.ffmpeg.outputs.version }}
+
       - name: Install ffmpeg
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
         run: command -v ffprobe >/dev/null || brew install ffmpeg
+
+      - name: Save Homebrew downloads
+        if: steps.brew.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.ffmpeg.outputs.dir }}
+          key: ${{ steps.brew.outputs.cache-primary-key }}
 
       # xcpretty is a gem, not part of the macOS runner image.
       - name: Install xcpretty
