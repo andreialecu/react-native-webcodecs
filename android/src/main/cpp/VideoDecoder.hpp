@@ -177,6 +177,18 @@ public:
       _durations[ts] = duration;
     }
     _input.post([this, annexB = std::move(annexB), ts, key] {
+      // A key frame earlier than a chunk before it (a GOP that goes back in
+      // time, without a flush): a new stream, as on iOS. The frames still
+      // held for reordering go out first, as a flush puts them out, and the
+      // codec starts over. Without this, c2.goldfish.h264.decoder (the
+      // emulator's) held the previous GOP's last frames until the end of
+      // the stream and put out the earlier GOP in decoding order (right
+      // pictures, wrong order).
+      if (key && _queuedSinceFlush > 0 && ts < _latestQueued) {
+        if (!drainCodec()) {
+          return;
+        }
+      }
       queueInput(annexB.data(), annexB.size(), ts, key ? kBufferFlagKeyFrame : 0);
     });
   }
@@ -204,58 +216,14 @@ public:
         }
         return;
       }
-      if (!_failed) {
-        queueInput(nullptr, 0, 0, kBufferFlagEndOfStream);
-      }
-      // Every rendered picture is taken before the next one (waitAcquired),
-      // so all of them come; a second without any is a lost one.
-      // Stuck once nothing came for 10 s (from the flush or the last picture).
-      std::unique_lock<std::mutex> lock(_mutex);
-      auto flushStart = std::chrono::steady_clock::now();
-      bool ended = false;
-      while (!_failed) {
-        auto now = std::chrono::steady_clock::now();
-        if (_eos && (_delivered >= _rendered || now - _lastImage > std::chrono::seconds(1))) {
-          ended = true;
-          break;
-        }
-        if (_heldByJs) {
-          // Not stuck: waiting for JS to close a frame.
-          flushStart = now;
-        }
-        if (now - std::max(flushStart, _lastImage) > std::chrono::seconds(10)) {
-          break;
-        }
-        _cv.wait_for(lock, std::chrono::milliseconds(20));
-      }
-      lock.unlock();
-      if (!ended && !_failed) {
-        fail(errorMessage("EncodingError", "decoder-failed", "timed out waiting for the decoder to flush"));
-      }
-      if (_failed) {
+      if (!drainCodec()) {
         promise->reject(std::make_exception_ptr(std::runtime_error(_failure)));
         return;
       }
       {
-        // Stops the drain thread if the stream did not end in time.
         std::lock_guard<std::mutex> l(_mutex);
-        _draining = false;
-      }
-      if (_drain.joinable()) {
-        _drain.join();
-      }
-      // Ready for more input (from a key frame).
-      AMediaCodec_flush(_codec);
-      {
-        std::lock_guard<std::mutex> l(_mutex);
-        _eos = false;
-        _rendered = 0;
-        _delivered = 0;
-        _acquired = 0;
         _durations.clear();
       }
-      _queuedSinceFlush = 0;
-      startDrain();
       promise->resolve();
     });
     return promise;
@@ -269,6 +237,64 @@ private:
   static int32_t maxInputSize(int32_t width, int32_t height) {
     int64_t pixels = static_cast<int64_t>((width + 15) / 16) * ((height + 15) / 16) * 256;
     return static_cast<int32_t>(std::min<int64_t>(pixels * 3 / 4, INT32_MAX));
+  }
+
+  // On the input thread: ends the stream, waits for every picture to be
+  // delivered, then flushes the codec, ready for input from a key frame.
+  // False (and failed) when the decoder failed or did not end in time.
+  bool drainCodec() {
+    if (!_failed) {
+      queueInput(nullptr, 0, 0, kBufferFlagEndOfStream);
+    }
+    // Every rendered picture is taken before the next one (waitAcquired),
+    // so all of them come; a second without any is a lost one.
+    // Stuck once nothing came for 10 s (from the flush or the last picture).
+    std::unique_lock<std::mutex> lock(_mutex);
+    auto flushStart = std::chrono::steady_clock::now();
+    bool ended = false;
+    while (!_failed) {
+      auto now = std::chrono::steady_clock::now();
+      if (_eos && (_delivered >= _rendered || now - _lastImage > std::chrono::seconds(1))) {
+        ended = true;
+        break;
+      }
+      if (_heldByJs) {
+        // Not stuck: waiting for JS to close a frame.
+        flushStart = now;
+      }
+      if (now - std::max(flushStart, _lastImage) > std::chrono::seconds(10)) {
+        break;
+      }
+      _cv.wait_for(lock, std::chrono::milliseconds(20));
+    }
+    lock.unlock();
+    if (!ended && !_failed) {
+      fail(errorMessage("EncodingError", "decoder-failed", "timed out waiting for the decoder to flush"));
+    }
+    if (_failed) {
+      return false;
+    }
+    {
+      // Stops the drain thread if the stream did not end in time.
+      std::lock_guard<std::mutex> l(_mutex);
+      _draining = false;
+    }
+    if (_drain.joinable()) {
+      _drain.join();
+    }
+    // Ready for more input (from a key frame).
+    AMediaCodec_flush(_codec);
+    {
+      std::lock_guard<std::mutex> l(_mutex);
+      _eos = false;
+      _rendered = 0;
+      _delivered = 0;
+      _acquired = 0;
+    }
+    _queuedSinceFlush = 0;
+    _latestQueued = INT64_MIN;
+    startDrain();
+    return true;
   }
 
   void startDrain() {
@@ -317,6 +343,7 @@ private:
       fail(describeCodecStatus(status, "decoder", "decoder"));
     } else if ((flags & kBufferFlagEndOfStream) == 0) {
       _queuedSinceFlush++;
+      _latestQueued = std::max(_latestQueued, ts);
     }
   }
 
@@ -466,7 +493,8 @@ private:
       return 0;
     }
     double duration = it->second;
-    _durations.erase(_durations.begin(), std::next(it));
+    // Only this one: those before it may be a GOP queued to go back in time.
+    _durations.erase(it);
     return duration;
   }
 
@@ -562,6 +590,8 @@ private:
   std::thread _drain;
   // Chunks queued since configure() or the last flush (the input thread's).
   int64_t _queuedSinceFlush = 0;
+  // The latest timestamp queued since then (the input thread's).
+  int64_t _latestQueued = INT64_MIN;
 
   SerialQueue _input{"wc-vdec-input"};
   SerialQueue _deliver{"wc-vdec-out"};
