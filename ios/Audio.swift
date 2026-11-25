@@ -27,6 +27,30 @@ private func floatFormat(sampleRate: Double, channels: Int) -> AudioStreamBasicD
     mChannelsPerFrame: UInt32(channels), mBitsPerChannel: 32, mReserved: 0)
 }
 
+// A converter between two formats, with the decoder's magic cookie if any.
+private func makeConverter(
+  _ source: AudioStreamBasicDescription, _ destination: AudioStreamBasicDescription, _ cookie: Data?
+) throws -> AudioConverterRef {
+  var source = source
+  var destination = destination
+  var converter: AudioConverterRef?
+  let status = AudioConverterNew(&source, &destination, &converter)
+  guard status == noErr, let converter else {
+    throw WebCodecsError.notSupported("AudioConverterNew failed (\(status))")
+  }
+  if let cookie {
+    let status = cookie.withUnsafeBytes {
+      AudioConverterSetProperty(
+        converter, kAudioConverterDecompressionMagicCookie, UInt32($0.count), $0.baseAddress!)
+    }
+    guard status == noErr else {
+      AudioConverterDispose(converter)
+      throw WebCodecsError.notSupported("the AAC magic cookie (\(status))")
+    }
+  }
+  return converter
+}
+
 private func compressedFormat(codec: String, sampleRate: Double, channels: Int) throws
   -> AudioStreamBasicDescription
 {
@@ -135,13 +159,9 @@ final class HybridNativeAudioEncoder: HybridNativeAudioEncoderSpec {
     else {
       throw WebCodecsError.notSupported("AAC-LC, 1 or 2 channels, at a standard sample rate")
     }
-    var source = floatFormat(sampleRate: sampleRate, channels: channels)
-    var destination = try compressedFormat(codec: "aac", sampleRate: sampleRate, channels: channels)
-    var converter: AudioConverterRef?
-    let status = AudioConverterNew(&source, &destination, &converter)
-    guard status == noErr, let converter else {
-      throw WebCodecsError.notSupported("AudioConverterNew failed (\(status))")
-    }
+    let converter = try makeConverter(
+      floatFormat(sampleRate: sampleRate, channels: channels),
+      compressedFormat(codec: "aac", sampleRate: sampleRate, channels: channels), nil)
     self.converter = converter
     if let bitrate = config.bitrate, bitrate > 0 {
       var rate = UInt32(bitrate)
@@ -286,29 +306,6 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
   private let destinationFormat: AudioStreamBasicDescription
   private let cookie: Data?
 
-  private static func makeConverter(
-    _ source: AudioStreamBasicDescription, _ destination: AudioStreamBasicDescription, _ cookie: Data?
-  ) throws -> AudioConverterRef {
-    var source = source
-    var destination = destination
-    var converter: AudioConverterRef?
-    let status = AudioConverterNew(&source, &destination, &converter)
-    guard status == noErr, let converter else {
-      throw WebCodecsError.notSupported("AudioConverterNew failed (\(status))")
-    }
-    if let cookie {
-      let status = cookie.withUnsafeBytes {
-        AudioConverterSetProperty(
-          converter, kAudioConverterDecompressionMagicCookie, UInt32($0.count), $0.baseAddress!)
-      }
-      guard status == noErr else {
-        AudioConverterDispose(converter)
-        throw WebCodecsError.notSupported("the AAC magic cookie (\(status))")
-      }
-    }
-    return converter
-  }
-
   init(
     config: NativeAudioDecoderConfig,
     output: @escaping (NativeDecodedAudio) -> Void,
@@ -335,7 +332,7 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
     sourceFormat = source
     destinationFormat = destination
     self.cookie = cookie
-    let converter = try HybridNativeAudioDecoder.makeConverter(source, destination, cookie)
+    let converter = try makeConverter(source, destination, cookie)
     // What the converter outputs, which the AudioData say.
     var current = destination
     var currentSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
@@ -394,9 +391,10 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
   private func pull() {
     guard let converter else { return }
     let capacity = framesPerPacket * 2
+    // Scratch space for each pass, copied out before the next.
+    var samples = [Float](repeating: 0, count: capacity * channels)
     var done = false
     while !done {
-      var samples = [Float](repeating: 0, count: capacity * channels)
       var total = 0
       while total < capacity {
         var frames = UInt32(capacity - total)
@@ -451,7 +449,7 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
       // stream, a reset converter put out nothing more on the CI Simulator.
       if let old = self.converter {
         do {
-          self.converter = try HybridNativeAudioDecoder.makeConverter(
+          self.converter = try makeConverter(
             self.sourceFormat, self.destinationFormat, self.cookie)
         } catch {
           self.failed = true

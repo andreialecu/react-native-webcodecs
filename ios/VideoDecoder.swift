@@ -297,9 +297,16 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
     let base = ReorderDepth.of(config)
     baseDepth = base
     depth = base
-    if config.codec == "hevc", let description = config.description {
-      let record = [UInt8](description.toData(copyIfNeeded: true))
-      hevcNalLength = record.count > 22 ? Int(record[21] & 0x3) + 1 : nil
+    // From the format VideoToolbox made of the hvcC record, rather than
+    // reading the record a second time.
+    var nalLength: Int32 = 0
+    if CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC,
+      CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+        format, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil,
+        parameterSetCountOut: nil, nalUnitHeaderLengthOut: &nalLength) == noErr,
+      nalLength > 0
+    {
+      hevcNalLength = Int(nalLength)
     } else {
       hevcNalLength = nil
     }
@@ -449,6 +456,15 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
     output(frame)
   }
 
+  // On `queue`: the frames VideoToolbox still has, then those held for
+  // reordering, go out, and what follows starts a new stream.
+  private func endStream(_ session: VTDecompressionSession) {
+    VTDecompressionSessionFinishDelayedFrames(session)
+    VTDecompressionSessionWaitForAsynchronousFrames(session)
+    if !failed { drainHeld() }
+    restart()
+  }
+
   private func drainHeld() {
     reorder.lock()
     defer { reorder.unlock() }
@@ -466,10 +482,7 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
       // new stream. The frames held for reordering go out first, rather
       // than being sorted in with the new stream's.
       if key && timestamp < self.lastIn {
-        VTDecompressionSessionFinishDelayedFrames(session)
-        VTDecompressionSessionWaitForAsynchronousFrames(session)
-        if !self.failed { self.drainHeld() }
-        self.restart()
+        self.endStream(session)
       }
       self.lastIn = max(self.lastIn, timestamp)
       let first = key && self.start
@@ -552,11 +565,8 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
   func flush() throws -> Promise<Void> {
     guard let session else { return Promise.rejected(withError: WebCodecsError.invalidState("the decoder is closed")) }
     return Promise.parallel(queue) {
-      VTDecompressionSessionFinishDelayedFrames(session)
-      VTDecompressionSessionWaitForAsynchronousFrames(session)
-      if !self.failed { self.drainHeld() }
       // A flush ends the stream: what follows starts from a key frame.
-      self.restart()
+      self.endStream(session)
     }
   }
 
