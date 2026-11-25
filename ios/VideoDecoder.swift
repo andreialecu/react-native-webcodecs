@@ -285,6 +285,11 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
   // CRA or BLA whose leading RASL pictures are still to be skipped.
   private let hevcNalLength: Int?
   private var skipRASL = false
+  // H.264: the NAL unit length size, and, when the stream started at a
+  // key frame that is not an IDR (a recovery point), that key frame's
+  // timestamp: the pictures shown before it are still to be skipped.
+  private let h264NalLength: Int?
+  private var leadingBefore: Double?
 
   init(
     config: NativeVideoDecoderConfig,
@@ -309,6 +314,16 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
       hevcNalLength = Int(nalLength)
     } else {
       hevcNalLength = nil
+    }
+    if CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_H264,
+      CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+        format, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil,
+        parameterSetCountOut: nil, nalUnitHeaderLengthOut: &nalLength) == noErr,
+      nalLength > 0
+    {
+      h264NalLength = Int(nalLength)
+    } else {
+      h264NalLength = nil
     }
     super.init()
 
@@ -411,6 +426,7 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
   private func restart() {
     lastIn = -Double.infinity
     start = true
+    leadingBefore = nil
     reorder.lock()
     lastOut = -Double.infinity
     depth = baseDepth
@@ -420,14 +436,32 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
   // The type of an HEVC sample's first picture (VCL) NAL unit, nil when it
   // cannot be read.
   static func hevcPictureType(_ bytes: Data, nalLength: Int) -> Int? {
+    pictureType(bytes, nalLength: nalLength) { header in
+      let type = Int(header >> 1) & 0x3f
+      return type < 32 ? type : nil
+    }
+  }
+
+  // The type of an H.264 sample's first picture (VCL) NAL unit: 5 for an
+  // IDR picture, 1 to 4 for others; nil when it cannot be read.
+  static func h264PictureType(_ bytes: Data, nalLength: Int) -> Int? {
+    pictureType(bytes, nalLength: nalLength) { header in
+      let type = Int(header & 0x1f)
+      return (1...5).contains(type) ? type : nil
+    }
+  }
+
+  // The NAL units of a sample are each preceded by their length, in
+  // `nalLength` bytes (from the avcC or hvcC record). `picture` gives the
+  // type of a NAL unit from its first byte when it is a picture's.
+  private static func pictureType(_ bytes: Data, nalLength: Int, picture: (UInt8) -> Int?) -> Int? {
     var i = bytes.startIndex
     while i + nalLength < bytes.endIndex {
       var length = 0
       for k in 0..<nalLength { length = length << 8 | Int(bytes[i + k]) }
       i += nalLength
       guard length > 0, i + length <= bytes.endIndex else { return nil }
-      let type = Int(bytes[i] >> 1) & 0x3f
-      if type < 32 { return type }
+      if let type = picture(bytes[i]) { return type }
       i += length
     }
     return nil
@@ -476,6 +510,7 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
     let bytes = data.toData(copyIfNeeded: true)
     let format = format
     let hevcNalLength = hevcNalLength
+    let h264NalLength = h264NalLength
     queue.async {
       if self.failed { return }
       // A key frame earlier than what came before it, without a flush: a
@@ -497,6 +532,25 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
         } else if (16...23).contains(type) {
           self.skipRASL = false
         } else if self.skipRASL && (type == 8 || type == 9) {
+          return
+        }
+      }
+      // Started at a recovery point, a key frame that is not an IDR (a seek
+      // in an open-GOP stream, or after any flush or configure): the
+      // pictures after it in decoding order but shown before it (leading
+      // pictures) may reference frames before it, which the decoder does
+      // not have. VideoToolbox fails them, with
+      // kVTVideoDecoderReferenceMissingErr or as bad data (-8969), which
+      // could also be real corruption. So they are skipped, by timestamp,
+      // until the next key frame, as FFmpeg and Chromium leave them out.
+      // A sample that cannot be read is decoded.
+      if let h264NalLength {
+        if first {
+          let type = HybridNativeVideoDecoder.h264PictureType(bytes, nalLength: h264NalLength)
+          self.leadingBefore = type.map { (1...4).contains($0) } == true ? timestamp : nil
+        } else if key {
+          self.leadingBefore = nil
+        } else if let before = self.leadingBefore, timestamp < before {
           return
         }
       }
@@ -530,7 +584,11 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
       // The first key frame of a stream may be a recovery point or CRA
       // rather than an IDR: without a reset, VideoToolbox may decode it
       // against stale state, silently corrupted (Apple's advice to
-      // Chromium, crbug 451536366).
+      // Chromium, crbug 451536366), or fail it (-12350 for an H.264
+      // recovery point after a seek). This is after a flush too: a flush
+      // requires a key frame next (WebCodecs' [[key chunk required]]), and
+      // whether it continues the stream or comes from a seek cannot be
+      // told, so it starts one, and its leading pictures are skipped above.
       if first {
         CMSetAttachment(
           sample, key: kCMSampleBufferAttachmentKey_ResetDecoderBeforeDecoding, value: kCFBooleanTrue,
