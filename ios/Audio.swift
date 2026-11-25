@@ -281,6 +281,33 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
   private var failed = false
   // flush(): the input procedure ends the stream when it has nothing more.
   private var endOfStream = false
+  // What flush() makes a new converter from.
+  private let sourceFormat: AudioStreamBasicDescription
+  private let destinationFormat: AudioStreamBasicDescription
+  private let cookie: Data?
+
+  private static func makeConverter(
+    _ source: AudioStreamBasicDescription, _ destination: AudioStreamBasicDescription, _ cookie: Data?
+  ) throws -> AudioConverterRef {
+    var source = source
+    var destination = destination
+    var converter: AudioConverterRef?
+    let status = AudioConverterNew(&source, &destination, &converter)
+    guard status == noErr, let converter else {
+      throw WebCodecsError.notSupported("AudioConverterNew failed (\(status))")
+    }
+    if let cookie {
+      let status = cookie.withUnsafeBytes {
+        AudioConverterSetProperty(
+          converter, kAudioConverterDecompressionMagicCookie, UInt32($0.count), $0.baseAddress!)
+      }
+      guard status == noErr else {
+        AudioConverterDispose(converter)
+        throw WebCodecsError.notSupported("the AAC magic cookie (\(status))")
+      }
+    }
+    return converter
+  }
 
   init(
     config: NativeAudioDecoderConfig,
@@ -304,22 +331,11 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
     if source.mSampleRate <= 0 { source.mSampleRate = config.sampleRate }
     if source.mChannelsPerFrame == 0 { source.mChannelsPerFrame = UInt32(config.numberOfChannels) }
     framesPerPacket = max(Int(source.mFramesPerPacket), 1024)
-    var destination = floatFormat(sampleRate: source.mSampleRate, channels: Int(source.mChannelsPerFrame))
-    var converter: AudioConverterRef?
-    let status = AudioConverterNew(&source, &destination, &converter)
-    guard status == noErr, let converter else {
-      throw WebCodecsError.notSupported("AudioConverterNew failed (\(status))")
-    }
-    if let cookie {
-      let status = cookie.withUnsafeBytes {
-        AudioConverterSetProperty(
-          converter, kAudioConverterDecompressionMagicCookie, UInt32($0.count), $0.baseAddress!)
-      }
-      guard status == noErr else {
-        AudioConverterDispose(converter)
-        throw WebCodecsError.notSupported("the AAC magic cookie (\(status))")
-      }
-    }
+    let destination = floatFormat(sampleRate: source.mSampleRate, channels: Int(source.mChannelsPerFrame))
+    sourceFormat = source
+    destinationFormat = destination
+    self.cookie = cookie
+    let converter = try HybridNativeAudioDecoder.makeConverter(source, destination, cookie)
     // What the converter outputs, which the AudioData say.
     var current = destination
     var currentSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
@@ -431,7 +447,19 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
       // (MDCT and SBR state), as after a seek.
       self.endOfStream = true
       self.pull()
-      if let converter = self.converter { AudioConverterReset(converter) }
+      // A new converter, not AudioConverterReset: after the end of the
+      // stream, a reset converter put out nothing more on the CI Simulator.
+      if let old = self.converter {
+        do {
+          self.converter = try HybridNativeAudioDecoder.makeConverter(
+            self.sourceFormat, self.destinationFormat, self.cookie)
+        } catch {
+          self.failed = true
+          self.error(errorMessage("EncodingError", "audio-failed", "\(error)"))
+          return
+        }
+        AudioConverterDispose(old)
+      }
       self.endOfStream = false
       self.packet = nil
       // A later decode() may jump: start timing from its timestamp again.
