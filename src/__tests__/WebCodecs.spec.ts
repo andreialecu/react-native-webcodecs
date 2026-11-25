@@ -906,6 +906,7 @@ const allocatedCodecs = () =>
     .filter((name): name is string => !!name);
 
 const ios = () => client.OS === "ios";
+const onAndroid = () => client.OS === "android";
 const supported = () => client.OS === "ios" || client.OS === "android";
 
 describe("react-native-webcodecs + Mediabunny", () => {
@@ -4156,6 +4157,13 @@ describe("react-native-webcodecs + Mediabunny", () => {
     }, 300000);
 
     // An x264 open-GOP clip: its second key frame is a recovery point.
+    // What Android's emulator decoder (c2.goldfish.h264.decoder, API 35)
+    // reports when decoding from it after a flush: a known failure, to be
+    // fixed separately.
+    const androidRecoveryPointErrors = [
+      "EncodingError: no input buffer",
+      "flush: AbortError: the codec was reset or closed during flush",
+    ];
     const h264OpenGopName = "clip-h264-open-gop.mp4";
     const h264OpenGopClip = () =>
       gopClip(h264OpenGopName, [
@@ -4200,15 +4208,13 @@ describe("react-native-webcodecs + Mediabunny", () => {
     // on this clip outputs the 30 frames from the I picture on) and as
     // Chromium, WebKit and VLC do on VideoToolbox (issue #2); the pictures
     // from the I picture on are whole (exact_match_flag 1), so they all come
-    // out, as they look in the whole clip. On iOS, VideoToolbox would fail
-    // the leading pictures (-8969, codecBadDataErr): they are skipped before
-    // decoding.
-    // Android is not there yet, so only the whole clip's decode is checked
-    // there. On the emulator (API 35), c2.goldfish.h264.decoder takes no
-    // more input after the recovery point ("EncodingError: no input
-    // buffer", then "flush: AbortError: the codec was reset or closed
-    // during flush"), and c2.android.avc.decoder (prefer-software) outputs
-    // only some of the frames after it, without an error.
+    // out, without an error, as they look in the whole clip. On iOS the
+    // leading pictures are skipped before decoding.
+    // On Android this records a known failure of the emulator's decoders,
+    // to be fixed separately: the whole clip decodes without an error, then
+    // c2.goldfish.h264.decoder (API 35) takes no more input after the
+    // recovery point, and the run from it is empty. The exact outcome is
+    // checked, so that any change, a fix included, shows up here.
     it("decodes H.264 from a recovery point (non-IDR key frame) after a flush", async () => {
       if (!supported() || !probes()) {
         return;
@@ -4268,40 +4274,44 @@ describe("react-native-webcodecs + Mediabunny", () => {
       const fromKey = sorted(second.filter((t) => t >= key));
       expect(second.length - fromKey.length).toBeGreaterThan(0);
       expect(decoded.runs[0]).toEqual(sorted(all));
-      if (ios()) {
-        expect({ errors: decoded.errors, second: decoded.runs[1] }).toEqual({
-          errors: [],
-          second: fromKey,
+      if (onAndroid()) {
+        // Known failure (see above): errors only once the recovery point
+        // is decoded, as the whole clip's run is complete.
+        expect({ errors: decoded.errors, runs: decoded.runs }).toEqual({
+          errors: androidRecoveryPointErrors,
+          runs: [sorted(all), []],
         });
-        // From the key frame on, each picture is the one its timestamp
-        // says: closest to the frame of that timestamp in the whole clip's
-        // decode.
-        expect(
-          closestPictures(fromKey, decoded.grids[1]!, decoded.grids[0]!),
-        ).toEqual(fromKey.map(String));
+        return;
       }
+      expect({ errors: decoded.errors, second: decoded.runs[1] }).toEqual({
+        errors: [],
+        second: fromKey,
+      });
+      // From the key frame on, each picture is the one its timestamp says:
+      // closest to the frame of that timestamp in the whole clip's decode.
+      expect(
+        closestPictures(fromKey, decoded.grids[1]!, decoded.grids[0]!),
+      ).toEqual(fromKey.map(String));
     }, 300000);
 
     // The same clip's first GOP, a flush, then its second GOP from the
     // recovery point: playback that flushes at a GOP boundary and goes on.
     // flush() sets [[key chunk required]] (WebCodecs, VideoDecoder flush()
-    // step 2), so the chunk after it must be a key chunk, one that "does
-    // not depend on any other frames for decoding", and the AVC
-    // registration expects an avc key chunk to be an IDR picture. A
-    // decoder cannot tell this from a seek to the same key chunk, so it
-    // starts there as from any key chunk, and the leading B pictures,
-    // which reference the first GOP, may be left out, as after a seek.
-    // Chromium does the same: its H264Decoder::Flush() outputs the
-    // pictures it holds and clears its DPB (media/gpu/h264_decoder.cc).
-    // What the spec does not allow is failing: the chunks are valid and
-    // came in a valid order. On iOS the leading pictures are left out
-    // (30 frames rather than 32): the deliberate cost of starting cleanly
-    // from any key chunk. Each frame that comes out must look as it does
-    // in the whole clip. On Android only the first two decodes are checked:
-    // on the emulator (API 35), the third fails as after a seek
-    // (c2.goldfish.h264.decoder: "EncodingError: no input buffer", then
-    // "flush: AbortError: the codec was reset or closed during flush";
-    // c2.android.avc.decoder: only some of its frames, without an error).
+    // step 2), so the chunk after it must be a key chunk. The recovery
+    // point is one: the MP4 lists it as a sync sample, and Chromium takes
+    // an H.264 chunk with a recovery point SEI as a key chunk too
+    // (ParseH264KeyFrame, third_party/blink/renderer/modules/webcodecs/
+    // video_decoder.cc). A decoder cannot tell this from a seek to the same
+    // chunk, so it may start there as from any key chunk: the leading B
+    // pictures, which reference the first GOP, may be left out, as after a
+    // seek, or output, as the spec allows. Chromium's H264Decoder::Flush()
+    // outputs the pictures it holds and clears its DPB
+    // (media/gpu/h264_decoder.cc). The chunks are valid and come in a valid
+    // order, so there is no error, and each frame that comes out looks as
+    // it does in the whole clip.
+    // On Android this records the same known failure of the emulator's
+    // decoder as after a seek (see above): the first two decodes are
+    // complete, the third is empty.
     it("decodes H.264 from a recovery point after a flush following the GOP before it", async () => {
       if (!supported() || !probes()) {
         return;
@@ -4327,15 +4337,23 @@ describe("react-native-webcodecs + Mediabunny", () => {
       const fromKey = sorted(second.filter((t) => t >= key));
       expect(second.length - fromKey.length).toBeGreaterThan(0);
       expect(decoded.runs.slice(0, 2)).toEqual([sorted(all), first]);
-      if (ios()) {
-        expect({ errors: decoded.errors, third: decoded.runs[2] }).toEqual({
-          errors: [],
-          third: fromKey,
+      if (onAndroid()) {
+        // Known failure (see above): errors only once the recovery point
+        // is decoded, as the first two runs are complete.
+        expect({ errors: decoded.errors, runs: decoded.runs }).toEqual({
+          errors: androidRecoveryPointErrors,
+          runs: [sorted(all), first, []],
         });
-        expect(
-          closestPictures(fromKey, decoded.grids[2]!, decoded.grids[0]!),
-        ).toEqual(fromKey.map(String));
+        return;
       }
+      // The frames from the key frame on, with or without the leading
+      // pictures.
+      const third = decoded.runs[2] ?? [];
+      expect(decoded.errors).toEqual([]);
+      expect([fromKey, sorted(second)]).toContainEqual(third);
+      expect(
+        closestPictures(third, decoded.grids[2]!, decoded.grids[0]!),
+      ).toEqual(third.map(String));
     }, 300000);
 
     // A key frame earlier than the frames before it, without a flush: the
