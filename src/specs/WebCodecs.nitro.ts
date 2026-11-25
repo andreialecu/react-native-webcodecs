@@ -78,6 +78,9 @@ export interface NativeVideoEncoderConfig {
   // H.264's level_idc, from avc1.PPCCLL (e.g. 40 for 4.0): the highest the
   // stream may need. Android sets it with the profile; iOS picks the level.
   level?: number;
+  // WebCodecs' bitrateMode: "constant", "variable" or "quantizer". Android
+  // ignores it.
+  bitrateMode?: string;
 }
 
 export interface NativeVideoEncoder extends HybridObject<Native> {

@@ -177,7 +177,9 @@ export class VideoFrame {
    *   a decoder. The frame takes it over: close the frame, not the surface.
    * - `new VideoFrame({ handle }, init)`: any native surface handle, such as
    *   a react-native-webgpu NativeBuffer. The frame takes its own reference,
-   *   so the source can be released right after. On Android, encode()
+   *   so the source can be released right after. On iOS it also keeps the
+   *   producer's pool from reusing the surface until the frame is closed:
+   *   frames held open can starve a camera's pool. On Android, encode()
    *   returns once such a frame has been read, so its producer may then
    *   write into the buffer again (encode() waits for the frames queued
    *   before it).
@@ -382,6 +384,7 @@ export interface VideoEncoderConfig {
   bitrate?: number;
   framerate?: number;
   latencyMode?: "quality" | "realtime";
+  bitrateMode?: "constant" | "variable" | "quantizer";
   hardwareAcceleration?: string;
   avc?: { format?: "avc" | "annexb" };
   hevc?: { format?: "hevc" | "annexb" };
@@ -458,6 +461,7 @@ const toNativeEncoderConfig = (
     realtime: config.latencyMode === "realtime",
     profile,
     level,
+    bitrateMode: config.bitrateMode,
   };
 };
 
@@ -618,6 +622,18 @@ export class VideoEncoder extends CodecBase {
     }
   }
 
+  // The color space the stream says, for the decoder config: the frames'
+  // own, but limited range whatever they say, since that is what the
+  // encoders write (VideoToolbox converts to video range, Android sets
+  // color-range 2). A full-range tag there makes muxers write a colr box
+  // that disagrees with the stream.
+  _streamColorSpace() {
+    return new VideoColorSpace({
+      ...this._colorSpace,
+      fullRange: false,
+    }).toJSON();
+  }
+
   _onChunk(chunk: NativeEncodedChunk) {
     if (this._state !== "configured") {
       return;
@@ -639,7 +655,7 @@ export class VideoEncoder extends CodecBase {
             codec: this._config!.codec,
             codedWidth: this._config!.width,
             codedHeight: this._config!.height,
-            colorSpace: new VideoColorSpace(this._colorSpace).toJSON(),
+            colorSpace: this._streamColorSpace(),
           },
         };
       }
@@ -655,7 +671,7 @@ export class VideoEncoder extends CodecBase {
             description: chunk.description,
             codedWidth: this._config!.width,
             codedHeight: this._config!.height,
-            colorSpace: new VideoColorSpace(this._colorSpace).toJSON(),
+            colorSpace: this._streamColorSpace(),
           },
         };
       }
@@ -838,10 +854,16 @@ export class VideoDecoder extends CodecBase {
       frame.surface.release();
       return;
     }
+    // RGB pictures were converted from the stream's YCbCr to full range,
+    // whatever range the stream has; NV12 ones keep the stream's tags.
+    const rgb =
+      frame.surface.format === "BGRA" || frame.surface.format === "RGBA";
     const videoFrame = new VideoFrame(frame.surface, {
       timestamp: frame.timestamp,
       duration: frame.duration || undefined,
-      colorSpace: this._colorSpace,
+      colorSpace: rgb
+        ? { ...this._colorSpace, fullRange: true }
+        : this._colorSpace,
     });
     try {
       this._output(videoFrame);

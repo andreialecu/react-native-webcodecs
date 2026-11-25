@@ -90,11 +90,18 @@ final class HybridNativeSurface: HybridNativeSurfaceSpec {
   let height: Double
   let format: String
 
+  // Whether `surface` holds a use count, released with it.
+  private var inUse = false
+
   init(surface: IOSurfaceRef) {
     self.surface = surface
     width = Double(IOSurfaceGetWidth(surface))
     height = Double(IOSurfaceGetHeight(surface))
     format = webCodecsFormat(IOSurfaceGetPixelFormat(surface))
+    // A producer's CVPixelBufferPool reuses a surface once its use count is
+    // zero, whatever its retain count: pin it until the frame is closed.
+    IOSurfaceIncrementUseCount(surface)
+    inUse = true
     super.init()
   }
 
@@ -148,10 +155,20 @@ final class HybridNativeSurface: HybridNativeSurfaceSpec {
     return copy
   }
 
+  private func unpin() {
+    if inUse, let surface { IOSurfaceDecrementUseCount(surface) }
+    inUse = false
+  }
+
   func release() throws {
+    unpin()
     surface = nil
     buffer = nil
     fence = nil
+  }
+
+  deinit {
+    unpin()
   }
 }
 

@@ -1527,6 +1527,272 @@ describe("react-native-webcodecs + Mediabunny", () => {
     }
   }, 60000);
 
+  // bitrateMode: VideoToolbox takes no per-frame quantizer outside its
+  // low-latency H.264 mode, so iOS refuses "quantizer" (Android takes the
+  // config and encodes at its default bitrate). "constant" (CBR where the
+  // encoder has it, else the average bitrate) and "variable" (the average
+  // bitrate, capped at 1.5x over each second on iOS) encode on both.
+  it("refuses bitrateMode quantizer on iOS, and encodes constant and variable", async () => {
+    if (!supported()) {
+      return;
+    }
+    const result = (await client.eval(({ webcodecs: wc }) => {
+      const base = { codec: "avc1.42001f", width: 640, height: 480 };
+      const run = (bitrateMode: string) => {
+        const config = Object.assign({}, base, {
+          bitrateMode,
+          bitrate: bitrateMode === "quantizer" ? undefined : 1_000_000,
+        });
+        return wc.VideoEncoder.isConfigSupported(config).then(
+          (support: any) => {
+            if (bitrateMode === "quantizer") {
+              return { bitrateMode, supported: support.supported };
+            }
+            const chunks: number[] = [];
+            const errors: string[] = [];
+            const encoder = new wc.VideoEncoder({
+              output: (chunk: any) => chunks.push(chunk.byteLength),
+              error: (e: any) => errors.push(`${e.name}: ${e.message}`),
+            });
+            encoder.configure(config);
+            const pool = wc.createSurfacePool(base.width, base.height);
+            [0, 33333, 66666].forEach((timestamp) => {
+              const frame = new wc.VideoFrame(pool.acquire(), { timestamp });
+              encoder.encode(frame, { keyFrame: timestamp === 0 });
+              frame.close();
+            });
+            return encoder
+              .flush()
+              .catch((e: any) => errors.push(`flush: ${e.name}: ${e.message}`))
+              .then(() => {
+                if (encoder.state !== "closed") {
+                  encoder.close();
+                }
+                return {
+                  bitrateMode,
+                  supported: support.supported,
+                  chunks: chunks.filter((n) => n > 0).length,
+                  errors,
+                };
+              });
+          },
+        );
+      };
+      return ["quantizer", "constant", "variable"].reduce(
+        (done: Promise<any[]>, mode) =>
+          done.then((all) => run(mode).then((r: any) => all.concat([r]))),
+        Promise.resolve([]),
+      );
+    })) as any[];
+    expect(result).toEqual([
+      { bitrateMode: "quantizer", supported: !ios() },
+      { bitrateMode: "constant", supported: true, chunks: 3, errors: [] },
+      { bitrateMode: "variable", supported: true, chunks: 3, errors: [] },
+    ]);
+  }, 120000);
+
+  // A Mediabunny Quality without a bitrate (QUALITY_HIGH) tries a quantizer
+  // config first, then a bitrate one. iOS refuses the quantizer, so the
+  // encoder gets a bitrate rather than running at VideoToolbox's default
+  // rate; Android takes the quantizer config, as before.
+  it("configures a bitrate for a Mediabunny Quality preset on iOS", async () => {
+    if (!supported()) {
+      return;
+    }
+    const result = (await client.eval(({ mediabunny: mb, webcodecs: wc }) => {
+      wc.installWebCodecs();
+      const configs: any[] = [];
+      const proto = wc.VideoEncoder.prototype;
+      const { configure } = proto;
+      proto.configure = function (this: any, config: any) {
+        configs.push({
+          bitrate: config.bitrate,
+          bitrateMode: config.bitrateMode,
+        });
+        return configure.call(this, config);
+      };
+      const output = new mb.Output({
+        format: new mb.Mp4OutputFormat({ fastStart: "in-memory" }),
+        target: new mb.BufferTarget(),
+      });
+      const video = new mb.VideoSampleSource({
+        codec: "avc",
+        quality: mb.QUALITY_HIGH,
+      });
+      output.addVideoTrack(video, { frameRate: 30 });
+      const pool = wc.createSurfacePool(128, 128);
+      const add = (i: number): Promise<void> => {
+        if (i === 10) {
+          return Promise.resolve();
+        }
+        const frame = new wc.VideoFrame(pool.acquire(), {
+          timestamp: Math.round((i * 1e6) / 30),
+          duration: Math.round(1e6 / 30),
+        });
+        const sample = new mb.VideoSample(frame);
+        return video.add(sample).then(
+          () => {
+            sample.close();
+            return add(i + 1);
+          },
+          (e: unknown) => {
+            sample.close();
+            throw e;
+          },
+        );
+      };
+      return output
+        .start()
+        .then(() => add(0))
+        .then(() => {
+          video.close();
+          return output.finalize();
+        })
+        .then(
+          () => ({ configs, bytes: output.target.buffer.byteLength }),
+          (e: any) => ({ configs, error: `${e && e.name}: ${e && e.message}` }),
+        )
+        .then((r: any) => {
+          // The app outlives this test.
+          proto.configure = configure;
+          return r;
+        });
+    })) as any;
+    expect(result.error).toBeUndefined();
+    expect(result.bytes).toBeGreaterThan(0);
+    expect(result.configs.length).toBe(1);
+    if (ios()) {
+      expect(result.configs[0].bitrateMode).not.toBe("quantizer");
+      expect(result.configs[0].bitrate).toBeGreaterThan(0);
+    }
+  }, 120000);
+
+  // The encoders write limited range whatever the frames say (VideoToolbox
+  // converts to video range, MediaCodec is set to color-range 2), so the
+  // decoder config says so too: a full-range frame must not make Mediabunny
+  // write a colr box with full_range_flag over a video-range SPS. And a
+  // decoder's RGB (BGRA) frames are full range, whatever the stream's range.
+  it("tags the stream's range, not the frames', in the decoder config and colr box", async () => {
+    if (!supported()) {
+      return;
+    }
+    const result = (await client.eval(({ mediabunny: mb, webcodecs: wc }) => {
+      const errors: string[] = [];
+      const chunks: any[] = [];
+      let decoderConfig: any = null;
+      const target = new mb.BufferTarget();
+      const output = new mb.Output({
+        format: new mb.Mp4OutputFormat({ fastStart: "in-memory" }),
+        target,
+      });
+      const source = new mb.EncodedVideoPacketSource("avc");
+      output.addVideoTrack(source, { frameRate: 30 });
+      let written = Promise.resolve();
+      const encoder = new wc.VideoEncoder({
+        output: (chunk: any, meta: any) => {
+          chunks.push(chunk);
+          if (meta && meta.decoderConfig && !decoderConfig) {
+            ({ decoderConfig } = meta);
+          }
+          const data = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(data);
+          const packet = new mb.EncodedPacket(
+            data,
+            chunk.type,
+            chunk.timestamp / 1e6,
+            (chunk.duration || 0) / 1e6,
+          );
+          written = written.then(() => source.add(packet, meta));
+        },
+        error: (e: any) => errors.push(`encoder: ${e}`),
+      });
+      encoder.configure({ codec: "avc1.42001f", width: 128, height: 128 });
+      const pool = wc.createSurfacePool(128, 128);
+      [0, 33333, 66666].forEach((timestamp) => {
+        const frame = new wc.VideoFrame(pool.acquire(), {
+          timestamp,
+          duration: 33333,
+          colorSpace: {
+            primaries: "bt709",
+            transfer: "bt709",
+            matrix: "bt709",
+            fullRange: true,
+          },
+        });
+        encoder.encode(frame, { keyFrame: timestamp === 0 });
+        frame.close();
+      });
+      let decoded: any = null;
+      return output
+        .start()
+        .then(() => encoder.flush())
+        .then(() => written)
+        .then(() => output.finalize())
+        .then(() => {
+          encoder.close();
+          const decoder = new wc.VideoDecoder({
+            output: (frame: any) => {
+              if (!decoded) {
+                decoded = {
+                  format: frame.format,
+                  fullRange: frame.colorSpace.fullRange,
+                };
+              }
+              frame.close();
+            },
+            error: (e: any) => errors.push(`decoder: ${e}`),
+          });
+          // Said limited explicitly, so that RGB frames show their own tag.
+          decoder.configure(
+            Object.assign({}, decoderConfig, {
+              colorSpace: Object.assign({}, decoderConfig.colorSpace, {
+                fullRange: false,
+              }),
+            }),
+          );
+          chunks.forEach((chunk) => decoder.decode(chunk));
+          return decoder.flush().then(() => decoder.close());
+        })
+        .then(() => ({
+          errors,
+          configRange: decoderConfig && decoderConfig.colorSpace.fullRange,
+          decoded,
+          path: wc.writeFile("e2e-range.mp4", target.buffer),
+        }));
+    })) as any;
+    expect(result.errors).toEqual([]);
+    expect(result.configRange).toBe(false);
+    // NV12 keeps the stream's tags; RGB is full range.
+    expect(result.decoded.fullRange).toBe(result.decoded.format !== "NV12");
+    if (!probes()) {
+      return;
+    }
+    const local = copyLocal(result.path);
+    const bytes = fs.readFileSync(local);
+    const colr = bytes.indexOf("colr");
+    expect(colr).toBeGreaterThan(0);
+    expect(bytes.toString("latin1", colr + 4, colr + 8)).toBe("nclx");
+    // nclx: primaries, transfer and matrix (2 bytes each), then the flag.
+    const colrFullRange = bytes[colr + 14] >> 7;
+    // The SPS's VUI video_full_range_flag (0 when the VUI does not say).
+    const trace = execFileSync(
+      "sh",
+      [
+        "-c",
+        'ffmpeg -hide_banner -i "$0" -c:v copy -bsf:v trace_headers -f null - 2>&1',
+        local,
+      ],
+      { encoding: "utf8" },
+    );
+    const spsFullRange = Number(
+      /video_full_range_flag\s+[01]+\s*=\s*(\d+)/.exec(trace)?.[1] ?? 0,
+    );
+    expect({ colr: colrFullRange, sps: spsFullRange }).toEqual({
+      colr: 0,
+      sps: 0,
+    });
+  }, 120000);
+
   // AudioEncoder alone, fed a 440 Hz sine in 1000-frame AudioData (not
   // multiples of an AAC frame): `segments` runs, each from its own start
   // time and followed by a flush. Returns each chunk's timestamp and
