@@ -294,17 +294,19 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
   private let error: (String) -> Void
   private let queue = DispatchQueue(label: "webcodecs.audio-decoder")
   private var packet: Data?
-  private var packetDescription = AudioStreamPacketDescription()
-  private var held: Data?
+  // The packet the converter reads, and its description: AudioToolbox keeps
+  // both pointers until the next input call, so they must not move. (A
+  // pointer from Data.withUnsafeBytes is only valid inside the closure: for
+  // a packet of 14 bytes or less, such as silent AAC, it points at a
+  // temporary copy.)
+  private var held: UnsafeMutableRawPointer?
+  private let packetDescription = UnsafeMutablePointer<AudioStreamPacketDescription>.allocate(
+    capacity: 1)
   private var start: Double?
   private var framesOut: Int64 = 0
   private var failed = false
   // flush(): the input procedure ends the stream when it has nothing more.
   private var endOfStream = false
-  // What flush() makes a new converter from.
-  private let sourceFormat: AudioStreamBasicDescription
-  private let destinationFormat: AudioStreamBasicDescription
-  private let cookie: Data?
 
   init(
     config: NativeAudioDecoderConfig,
@@ -329,9 +331,6 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
     if source.mChannelsPerFrame == 0 { source.mChannelsPerFrame = UInt32(config.numberOfChannels) }
     framesPerPacket = max(Int(source.mFramesPerPacket), 1024)
     let destination = floatFormat(sampleRate: source.mSampleRate, channels: Int(source.mChannelsPerFrame))
-    sourceFormat = source
-    destinationFormat = destination
-    self.cookie = cookie
     let converter = try makeConverter(source, destination, cookie)
     // What the converter outputs, which the AudioData say.
     var current = destination
@@ -349,6 +348,8 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
   }
 
   deinit {
+    held?.deallocate()
+    packetDescription.deallocate()
     if let converter { AudioConverterDispose(converter) }
   }
 
@@ -360,17 +361,18 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
       packets.pointee = 0
       return endOfStream ? noErr : noMoreInputNow
     }
-    held = packet  // valid until the next call
+    held?.deallocate()
+    let bytes = UnsafeMutableRawPointer.allocate(byteCount: max(packet.count, 1), alignment: 16)
+    packet.copyBytes(to: bytes.assumingMemoryBound(to: UInt8.self), count: packet.count)
+    held = bytes  // valid until the next call
     self.packet = nil
-    packetDescription = AudioStreamPacketDescription(
+    packetDescription.pointee = AudioStreamPacketDescription(
       mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(packet.count))
-    held!.withUnsafeMutableBytes { raw in
-      data.pointee.mNumberBuffers = 1
-      data.pointee.mBuffers.mData = raw.baseAddress
-      data.pointee.mBuffers.mDataByteSize = UInt32(raw.count)
-      data.pointee.mBuffers.mNumberChannels = UInt32(channels)
-    }
-    withUnsafeMutablePointer(to: &packetDescription) { descriptions?.pointee = $0 }
+    data.pointee.mNumberBuffers = 1
+    data.pointee.mBuffers.mData = bytes
+    data.pointee.mBuffers.mDataByteSize = UInt32(packet.count)
+    data.pointee.mBuffers.mNumberChannels = UInt32(channels)
+    descriptions?.pointee = packetDescription
     packets.pointee = 1
     return noErr
   }
@@ -413,14 +415,15 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
             Unmanaged.passUnretained(self).toOpaque(), &frames, &list, nil)
         }
         total += Int(frames)
-        if status == noMoreInputNow || frames == 0 {
-          done = true
-          break
-        }
-        if status != noErr {
+        // An error first: with 0 frames it would otherwise pass for the end.
+        if status != noErr && status != noMoreInputNow {
           failed = true
           error(errorMessage("EncodingError", "audio-failed", "AudioConverter failed (\(status))"))
           return
+        }
+        if status == noMoreInputNow || frames == 0 {
+          done = true
+          break
         }
       }
       if total > 0 {
@@ -445,19 +448,7 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
       // (MDCT and SBR state), as after a seek.
       self.endOfStream = true
       self.pull()
-      // A new converter, not AudioConverterReset: after the end of the
-      // stream, a reset converter put out nothing more on the CI Simulator.
-      if let old = self.converter {
-        do {
-          self.converter = try makeConverter(
-            self.sourceFormat, self.destinationFormat, self.cookie)
-        } catch {
-          self.failed = true
-          self.error(errorMessage("EncodingError", "audio-failed", "\(error)"))
-          return
-        }
-        AudioConverterDispose(old)
-      }
+      if let converter = self.converter { AudioConverterReset(converter) }
       self.endOfStream = false
       self.packet = nil
       // A later decode() may jump: start timing from its timestamp again.
