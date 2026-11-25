@@ -1748,6 +1748,300 @@ describe("react-native-webcodecs + Mediabunny", () => {
     );
   }, 180000);
 
+  // A sound made with ffmpeg here (a 440 Hz sine, at ffmpeg's level of 1/8),
+  // pushed to the app once.
+  const soundClip = (name: string, args: string[]) => {
+    const clip = path.join(clipDirectory, name);
+    fs.mkdirSync(clipDirectory, { recursive: true });
+    if (!fs.existsSync(clip)) {
+      execFileSync("ffmpeg", ["-loglevel", "error", "-y"].concat(args, [clip]));
+    }
+    return pushFile(clip);
+  };
+  const hasEncoder = (name: string) =>
+    execFileSync("ffmpeg", ["-hide_banner", "-encoders"], {
+      encoding: "utf8",
+    })
+      .split("\n")
+      .some((line) => line.trim().split(/\s+/)[1] === name);
+
+  // Decodes a file's sound track with AudioDecoder (Mediabunny demuxes), and
+  // measures it: frames, format, level and pitch (from channel 0's upward
+  // swings through zero, between the first and the last, so priming and
+  // padding do not count).
+  const decodeSoundOnDevice = (file: string) =>
+    runOnDevice<any>(
+      ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+        const input = new mb.Input({
+          source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+          formats: mb.ALL_FORMATS,
+        });
+        return input.getPrimaryAudioTrack().then((track: any) =>
+          track.getDecoderConfig().then((config: any) =>
+            wc.AudioDecoder.isConfigSupported(config).then((support: any) => {
+              const out: any = {
+                errors: [],
+                supported: support.supported,
+                config: {
+                  codec: config.codec,
+                  sampleRate: config.sampleRate,
+                  numberOfChannels: config.numberOfChannels,
+                  description: !!config.description,
+                },
+                packets: 0,
+                frames: 0,
+                sampleRates: [],
+                channels: [],
+              };
+              let sum = 0;
+              let count = 0;
+              let crossings = 0;
+              let below = false;
+              let first = -1;
+              let lastCrossing = -1;
+              let index = 0;
+              const decoder = new wc.AudioDecoder({
+                output: (data: any) => {
+                  out.frames += data.numberOfFrames;
+                  if (out.sampleRates.indexOf(data.sampleRate) < 0) {
+                    out.sampleRates.push(data.sampleRate);
+                  }
+                  if (out.channels.indexOf(data.numberOfChannels) < 0) {
+                    out.channels.push(data.numberOfChannels);
+                  }
+                  const n = data.numberOfChannels;
+                  const samples = new Float32Array(data.numberOfFrames * n);
+                  data.copyTo(samples, { planeIndex: 0, format: "f32" });
+                  for (let i = 0; i < samples.length; i++) {
+                    sum += samples[i] * samples[i];
+                  }
+                  for (let i = 0; i < samples.length; i += n, index++) {
+                    if (samples[i] < -0.01) {
+                      below = true;
+                    } else if (below && samples[i] > 0.01) {
+                      below = false;
+                      crossings++;
+                      if (first < 0) {
+                        first = index;
+                      }
+                      lastCrossing = index;
+                    }
+                  }
+                  count += samples.length;
+                  data.close();
+                },
+                error: (e: any) => out.errors.push(String(e)),
+              });
+              decoder.configure(config);
+              const packets = new mb.EncodedPacketSink(track).packets();
+              const step = (): Promise<void> =>
+                packets.next().then((r: any) => {
+                  if (r.done) {
+                    return undefined;
+                  }
+                  out.packets++;
+                  decoder.decode(r.value.toEncodedAudioChunk());
+                  return step();
+                });
+              return step()
+                .then(() => decoder.flush())
+                .then(
+                  () => undefined,
+                  (e: any) => out.errors.push(String(e)),
+                )
+                .then(() => {
+                  const rate = out.sampleRates[0] || 1;
+                  out.rms = Math.sqrt(sum / Math.max(1, count));
+                  out.seconds = out.frames / rate;
+                  out.hz =
+                    ((crossings - 1) * rate) /
+                    Math.max(1, lastCrossing - first);
+                  if (decoder.state !== "closed") {
+                    decoder.close();
+                  }
+                  input.dispose();
+                  return out;
+                });
+            }),
+          ),
+        );
+      },
+      { file },
+      120000,
+    );
+
+  // The decoded sound is ffmpeg's: as long, at its rate, as loud, at its
+  // pitch (garbage, or a decode at the wrong rate, is not).
+  const expectSine = (sound: any, o: { rate: number; channels: number }) => {
+    expect(sound.errors).toEqual([]);
+    expect(sound.sampleRates).toEqual([o.rate]);
+    expect(sound.channels).toEqual([o.channels]);
+    // 3 s, give or take the priming and the last frame's padding.
+    expect(sound.seconds).toBeGreaterThan(2.9);
+    expect(sound.seconds).toBeLessThan(3.3);
+    // 1/8 (0.088), or 3 dB below for a mono sine made stereo.
+    expect(sound.rms).toBeGreaterThan(0.04);
+    expect(sound.rms).toBeLessThan(0.12);
+    expect(Math.abs(sound.hz - 440)).toBeLessThan(15);
+  };
+
+  // WebCodecs: AAC without a description is ADTS, a header on every frame,
+  // as Mediabunny's .aac and MPEG-TS demuxers give it.
+  it("decodes ADTS AAC (no description)", async () => {
+    if (!supported() || !probes()) {
+      return;
+    }
+    const file = await soundClip("sine-48k.aac", [
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440:sample_rate=48000:duration=3",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "96k",
+      "-f",
+      "adts",
+    ]);
+    const sound = await decodeSoundOnDevice(file);
+    expect(sound.config.description).toBe(false);
+    expect(sound.supported).toBe(true);
+    expectSine(sound, { rate: 48000, channels: 1 });
+    // One frame of 1024 samples per packet.
+    expect(sound.frames).toBeGreaterThan((sound.packets - 4) * 1024);
+    expect(sound.frames).toBeLessThanOrEqual((sound.packets + 1) * 1024);
+  }, 180000);
+
+  // HE-AAC (SBR) and HE-AAC v2 (SBR and PS) as AudioToolbox's encoder writes
+  // them: an AudioSpecificConfig of AAC-LC at half the rate (mono for v2),
+  // with the SBR and PS layers in its extension, and 2048 samples a packet.
+  // (macOS hosts: ffmpeg's aac_at encoder.)
+  for (const [name, profile, bitrate] of [
+    ["HE-AAC", "4", "48k"],
+    ["HE-AACv2", "28", "32k"],
+  ]) {
+    it(`decodes ${name} at its full rate and channels`, async () => {
+      if (!supported() || !probes() || !hasEncoder("aac_at")) {
+        return;
+      }
+      const file = await soundClip(`sine-${name}.m4a`, [
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=44100:duration=3",
+        "-ac",
+        "2",
+        "-c:a",
+        "aac_at",
+        "-profile:a",
+        profile,
+        "-b:a",
+        bitrate,
+      ]);
+      const sound = await decodeSoundOnDevice(file);
+      expect(sound.supported).toBe(true);
+      expectSine(sound, { rate: 44100, channels: 2 });
+      expect(sound.frames).toBeGreaterThan((sound.packets - 4) * 2048);
+      expect(sound.frames).toBeLessThanOrEqual((sound.packets + 1) * 2048);
+    }, 180000);
+  }
+
+  // flush() ends the stream and starts a new one: what is decoded after it
+  // does not overlap the sound before it. A tone, then digital silence:
+  // decoding the tone, a flush, then the silence must give silence. (iOS:
+  // Android's MediaCodec flush is its own, and out of scope here.)
+  it("starts an AudioDecoder over after a flush (iOS)", async () => {
+    if (!ios() || !probes()) {
+      return;
+    }
+    const file = await soundClip("tone-then-silence.m4a", [
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440:sample_rate=48000:duration=4",
+      "-af",
+      "volume=volume=0:enable='gte(t,2)'",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+    ]);
+    const result = await runOnDevice<any>(
+      ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+        const input = new mb.Input({
+          source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+          formats: mb.ALL_FORMATS,
+        });
+        return input.getPrimaryAudioTrack().then((track: any) =>
+          track.getDecoderConfig().then((config: any) => {
+            const all: any[] = [];
+            const packets = new mb.EncodedPacketSink(track).packets();
+            const read = (): Promise<void> =>
+              packets.next().then((r: any) => {
+                if (r.done) {
+                  return undefined;
+                }
+                all.push(r.value);
+                return read();
+              });
+            const errors: string[] = [];
+            let samples: number[] = [];
+            const decoder = new wc.AudioDecoder({
+              output: (data: any) => {
+                const n = data.numberOfFrames * data.numberOfChannels;
+                const buffer = new Float32Array(n);
+                data.copyTo(buffer, { planeIndex: 0, format: "f32" });
+                for (let i = 0; i < n; i++) {
+                  samples.push(buffer[i]);
+                }
+                data.close();
+              },
+              error: (e: any) => errors.push(String(e)),
+            });
+            decoder.configure(config);
+            // The level of the first `count` samples.
+            const rms = (from: number[], count: number) => {
+              let sum = 0;
+              const n = Math.min(from.length, count);
+              for (let i = 0; i < n; i++) {
+                sum += from[i] * from[i];
+              }
+              return Math.sqrt(sum / Math.max(1, n));
+            };
+            const decodeRange = (start: number, end: number) => {
+              all
+                .filter((p: any) => p.timestamp >= start && p.timestamp < end)
+                .forEach((p: any) => decoder.decode(p.toEncodedAudioChunk()));
+              return decoder.flush();
+            };
+            const out: any = { errors };
+            return read()
+              .then(() => decodeRange(-1, 1.5))
+              .then(() => {
+                out.tone = rms(samples, samples.length);
+                samples = [];
+                return decodeRange(3, 3.5);
+              })
+              .then(() => {
+                out.samples = samples.length;
+                out.after = rms(samples, 1024);
+                decoder.close();
+                input.dispose();
+                return out;
+              });
+          }),
+        );
+      },
+      { file },
+      120000,
+    );
+    expect(result.errors).toEqual([]);
+    expect(result.tone).toBeGreaterThan(0.05);
+    expect(result.samples).toBeGreaterThan(0);
+    // Not the tone's last frame overlapping the first of the silence.
+    expect(result.after).toBeLessThan(0.001);
+  }, 180000);
+
   it("flushes a VideoEncoder given two frames with one timestamp", async () => {
     if (!supported()) {
       return;
