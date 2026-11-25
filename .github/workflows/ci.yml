@@ -88,15 +88,18 @@ jobs:
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1
         run: |
-          echo "version=$(brew info --json=v2 ffmpeg | jq -r '.formulae[0].versions.stable')" >> "$GITHUB_OUTPUT"
-          echo "dir=$(brew --cache)/downloads" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$(brew info --json=v2 ffmpeg | jq -r '.formulae[0].versions.stable')"
+            echo "dir=$(brew --cache)/downloads"
+            echo "image=$ImageOS-$ImageVersion"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Restore Homebrew downloads
         id: brew
         uses: actions/cache/restore@v4
         with:
           path: ${{ steps.ffmpeg.outputs.dir }}
-          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-${{ env.ImageVersion }}-ffmpeg-${{ steps.ffmpeg.outputs.version }}
+          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ steps.ffmpeg.outputs.image }}-ffmpeg-${{ steps.ffmpeg.outputs.version }}
 
       - name: Install ffmpeg
         env:
