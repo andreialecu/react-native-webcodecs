@@ -399,8 +399,9 @@ const AAC_RATES = [
 // HE-AAC there being implicit), or undefined when there is none.
 const adtsConfig = (sampleRate: number, channels: number) => {
   const index = AAC_RATES.indexOf(sampleRate);
+  // channelConfiguration 7 is 8 channels; there is none for 7.
   const layout = channels === 8 ? 7 : channels;
-  if (index < 0 || layout < 1 || layout > 7) {
+  if (index < 0 || channels < 1 || channels > 8 || channels === 7) {
     return undefined;
   }
   return new Uint8Array([

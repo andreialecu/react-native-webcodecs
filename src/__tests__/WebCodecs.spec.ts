@@ -1767,7 +1767,8 @@ describe("react-native-webcodecs + Mediabunny", () => {
 
   // Decodes a file's sound track with AudioDecoder (Mediabunny demuxes), and
   // measures it: frames, format, level and pitch (from channel 0's upward
-  // zero crossings).
+  // swings through zero, between the first and the last, so priming and
+  // padding do not count).
   const decodeSoundOnDevice = (file: string) =>
     runOnDevice<any>(
       ({ mediabunny: mb, webcodecs: wc, ctx }) => {
@@ -1795,7 +1796,10 @@ describe("react-native-webcodecs + Mediabunny", () => {
               let sum = 0;
               let count = 0;
               let crossings = 0;
-              let previous = 0;
+              let below = false;
+              let first = -1;
+              let lastCrossing = -1;
+              let index = 0;
               const decoder = new wc.AudioDecoder({
                 output: (data: any) => {
                   out.frames += data.numberOfFrames;
@@ -1811,11 +1815,17 @@ describe("react-native-webcodecs + Mediabunny", () => {
                   for (let i = 0; i < samples.length; i++) {
                     sum += samples[i] * samples[i];
                   }
-                  for (let i = 0; i < samples.length; i += n) {
-                    if (previous <= 0 && samples[i] > 0) {
+                  for (let i = 0; i < samples.length; i += n, index++) {
+                    if (samples[i] < -0.01) {
+                      below = true;
+                    } else if (below && samples[i] > 0.01) {
+                      below = false;
                       crossings++;
+                      if (first < 0) {
+                        first = index;
+                      }
+                      lastCrossing = index;
                     }
-                    previous = samples[i];
                   }
                   count += samples.length;
                   data.close();
@@ -1843,7 +1853,9 @@ describe("react-native-webcodecs + Mediabunny", () => {
                   const rate = out.sampleRates[0] || 1;
                   out.rms = Math.sqrt(sum / Math.max(1, count));
                   out.seconds = out.frames / rate;
-                  out.hz = crossings / Math.max(1e-6, out.seconds);
+                  out.hz =
+                    ((crossings - 1) * rate) /
+                    Math.max(1, lastCrossing - first);
                   if (decoder.state !== "closed") {
                     decoder.close();
                   }
@@ -1866,8 +1878,9 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(sound.channels).toEqual([o.channels]);
     // 3 s, give or take the priming and the last frame's padding.
     expect(sound.seconds).toBeGreaterThan(2.9);
-    expect(sound.seconds).toBeLessThan(3.25);
-    expect(sound.rms).toBeGreaterThan(0.06);
+    expect(sound.seconds).toBeLessThan(3.3);
+    // 1/8 (0.088), or 3 dB below for a mono sine made stereo.
+    expect(sound.rms).toBeGreaterThan(0.04);
     expect(sound.rms).toBeLessThan(0.12);
     expect(Math.abs(sound.hz - 440)).toBeLessThan(15);
   };
