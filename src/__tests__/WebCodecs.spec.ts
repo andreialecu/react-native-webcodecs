@@ -1742,7 +1742,14 @@ describe("react-native-webcodecs + Mediabunny", () => {
             },
             error: (e: any) => errors.push(`decoder: ${e}`),
           });
-          decoder.configure(decoderConfig);
+          // Said limited explicitly, so that RGB frames show their own tag.
+          decoder.configure(
+            Object.assign({}, decoderConfig, {
+              colorSpace: Object.assign({}, decoderConfig.colorSpace, {
+                fullRange: false,
+              }),
+            }),
+          );
           chunks.forEach((chunk) => decoder.decode(chunk));
           return decoder.flush().then(() => decoder.close());
         })
