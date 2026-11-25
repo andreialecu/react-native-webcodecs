@@ -3,6 +3,7 @@
 // and frames the codec never returns.
 import { AudioData, AudioDecoder, AudioEncoder } from "../../lib/audio";
 import {
+  EncodedAudioChunk,
   EncodedVideoChunk,
   VideoDecoder,
   VideoEncoder,
@@ -71,10 +72,10 @@ const mockNative = {
     e: (m: string) => void,
   ) => fakeCodec(o, e),
   createAudioDecoder: (
-    _c: unknown,
+    c: unknown,
     o: Output<unknown>,
     e: (m: string) => void,
-  ) => fakeCodec(o, e),
+  ) => fakeCodec(o, e, c),
 };
 
 jest.mock("react-native-nitro-modules", () => ({
@@ -463,5 +464,63 @@ describe("AudioDecoder", () => {
       timestamp: 0,
     });
     expect(output).not.toHaveBeenCalled();
+  });
+
+  // AAC without a description is ADTS: the native decoders get the
+  // AudioSpecificConfig and each raw raw, without its header.
+  it("decodes ADTS as an AudioSpecificConfig and raw frames", () => {
+    const decoder = new AudioDecoder({ output: jest.fn(), error: jest.fn() });
+    decoder.configure({
+      codec: "mp4a.40.2",
+      sampleRate: 48_000,
+      numberOfChannels: 1,
+    });
+    const codec = last();
+    const { description } = codec.config as { description?: ArrayBuffer };
+    // AAC-LC (2), 48 kHz (index 3), mono.
+    expect(Array.from(new Uint8Array(description!))).toEqual([0x11, 0x88]);
+    // A 7-byte header (protection_absent) and one with a CRC (9 bytes).
+    const raw = [0x21, 0x10, 0x05];
+    const plain = [0xff, 0xf1, 0x4c, 0x40, 0x01, 0x5f, 0xfc];
+    const crc = [0xff, 0xf0, 0x4c, 0x40, 0x01, 0x9f, 0xfc, 0x12, 0x34];
+    for (const header of [plain, crc]) {
+      decoder.decode(
+        new EncodedAudioChunk({
+          type: "key",
+          timestamp: 0,
+          data: new Uint8Array(header.concat(raw)),
+        }),
+      );
+    }
+    // A chunk without the sync word goes through as it is.
+    decoder.decode(
+      new EncodedAudioChunk({
+        type: "key",
+        timestamp: 0,
+        data: new Uint8Array(raw),
+      }),
+    );
+    const sent = codec.decode.mock.calls.map((c) =>
+      Array.from(new Uint8Array(c[0] as ArrayBuffer)),
+    );
+    expect(sent).toEqual([raw, raw, raw]);
+  });
+
+  it("passes the description and HE-AAC codec strings to native", () => {
+    const decoder = new AudioDecoder({ output: jest.fn(), error: jest.fn() });
+    decoder.configure({
+      codec: "mp4a.40.5",
+      sampleRate: 44_100,
+      numberOfChannels: 2,
+      description: new Uint8Array([0x13, 0x90, 0x56, 0xe5, 0xa0]),
+    });
+    const { codec, description } = last().config as {
+      codec: string;
+      description?: ArrayBuffer;
+    };
+    expect(codec).toBe("aac");
+    expect(Array.from(new Uint8Array(description!))).toEqual([
+      0x13, 0x90, 0x56, 0xe5, 0xa0,
+    ]);
   });
 });

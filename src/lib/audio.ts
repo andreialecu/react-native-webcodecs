@@ -384,18 +384,67 @@ export interface AudioDecoderConfig {
   [key: string]: unknown;
 }
 
+// The decoders also take HE-AAC and HE-AAC v2 (the encoder makes AAC-LC).
+const audioDecoderCodec = (c: string) =>
+  /^mp4a\.40\.(0?5|29)$/.test(c) ? "aac" : audioCodec(c);
+
+const AAC_RATES = [
+  96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025,
+  8000, 7350,
+];
+
+// AAC without a description is ADTS (WebCodecs AAC registration): a header
+// on each frame and no AudioSpecificConfig, which the platform decoders need
+// instead. This is the AAC-LC one for the config (what an ADTS header says,
+// HE-AAC there being implicit), or undefined when there is none.
+const adtsConfig = (sampleRate: number, channels: number) => {
+  const index = AAC_RATES.indexOf(sampleRate);
+  const layout = channels === 8 ? 7 : channels;
+  if (index < 0 || layout < 1 || layout > 7) {
+    return undefined;
+  }
+  return new Uint8Array([
+    (2 << 3) | (index >> 1),
+    ((index & 1) << 7) | (layout << 3),
+  ]).buffer;
+};
+
+// The ADTS header's size, 9 bytes with a CRC: 0 when the chunk does not start
+// with one (sync word, layer 0).
+const adtsHeaderSize = (b: Uint8Array) => {
+  const size = b[1] & 1 ? 7 : 9;
+  return b.length >= size && b[0] === 0xff && (b[1] & 0xf6) === 0xf0 ? size : 0;
+};
+
+// The description native gets: the config's, or the ADTS one; null when an
+// ADTS config has none.
+const decoderDescription = (codec: string, config: AudioDecoderConfig) => {
+  if (config.description) {
+    return toArrayBuffer(config.description);
+  }
+  if (codec !== "aac") {
+    return undefined;
+  }
+  return adtsConfig(config.sampleRate, config.numberOfChannels) ?? null;
+};
+
 export class AudioDecoder extends CodecBase {
   _output: (data: AudioData) => void;
   _decoder: NativeAudioDecoder | null = null;
+  // ADTS: headers are stripped from the chunks.
+  _adts = false;
 
   static async isConfigSupported(config: AudioDecoderConfig) {
-    const codec = audioCodec(config.codec);
+    const codec = audioDecoderCodec(config.codec);
+    const description = codec ? decoderDescription(codec, config) : null;
     const supported =
       codec !== null &&
+      description !== null &&
       native().isAudioDecoderConfigSupported({
         codec,
         sampleRate: config.sampleRate,
         numberOfChannels: config.numberOfChannels,
+        description,
       });
     return {
       supported,
@@ -419,23 +468,28 @@ export class AudioDecoder extends CodecBase {
     if (this._state === "closed") {
       throw domError("InvalidStateError", "AudioDecoder is closed");
     }
-    const codec = audioCodec(config.codec);
-    if (!codec) {
+    const codec = audioDecoderCodec(config.codec);
+    const description = codec ? decoderDescription(codec, config) : null;
+    if (!codec || description === null) {
       this._fail(
-        domError("NotSupportedError", `Unsupported codec ${config.codec}`),
+        domError(
+          "NotSupportedError",
+          codec
+            ? "Unsupported ADTS sample rate or channels"
+            : `Unsupported codec ${config.codec}`,
+        ),
       );
       return;
     }
     this._replaceNative();
+    this._adts = codec === "aac" && !config.description;
     try {
       this._decoder = native().createAudioDecoder(
         {
           codec,
           sampleRate: config.sampleRate,
           numberOfChannels: config.numberOfChannels,
-          description: config.description
-            ? toArrayBuffer(config.description)
-            : undefined,
+          description,
         },
         this._bind((data: NativeDecodedAudio) => this._onData(data)),
         this._bind((message: string) => this._fail(nativeError(message))),
@@ -449,9 +503,10 @@ export class AudioDecoder extends CodecBase {
 
   decode(chunk: EncodedAudioChunk) {
     this._assertConfigured();
+    const header = this._adts ? adtsHeaderSize(chunk._data) : 0;
     try {
       this._decoder!.decode(
-        toArrayBuffer(chunk._data),
+        toArrayBuffer(header ? chunk._data.subarray(header) : chunk._data),
         chunk.timestamp,
         chunk.duration ?? 0,
       );
