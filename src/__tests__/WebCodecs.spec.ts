@@ -4155,6 +4155,40 @@ describe("react-native-webcodecs + Mediabunny", () => {
       }
     }, 300000);
 
+    // An x264 open-GOP clip: its second key frame is a recovery point.
+    const h264OpenGopName = "clip-h264-open-gop.mp4";
+    const h264OpenGopClip = () =>
+      gopClip(h264OpenGopName, [
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "high",
+        "-bf",
+        "3",
+        "-x264-params",
+        "open-gop=1:keyint=30:min-keyint=30:scenecut=0:b-pyramid=none:log-level=error",
+      ]);
+    // For each frame of `run` (timestamps), the timestamp of the frame of
+    // `reference` (a decode's grids) it looks most like.
+    const closestPictures = (
+      run: number[],
+      grids: Record<string, number[]>,
+      reference: Record<string, number[]>,
+    ) => {
+      const distance = (a: number[], b: number[]) =>
+        a.reduce((sum, v, i) => sum + Math.abs(v - b[i]!), 0);
+      return run.map((t) => {
+        const got = grids[String(t)]!;
+        let best = "";
+        Object.entries(reference).forEach(([at, want]) => {
+          if (!best || distance(got, want) < distance(got, reference[best]!)) {
+            best = at;
+          }
+        });
+        return best;
+      });
+    };
+
     // x264's open GOPs (open-gop=1, with B-frames): the second key frame is
     // not an IDR but an I picture (nal_unit_type 1, slice_type 7) behind a
     // recovery point SEI (payload type 6, recovery_frame_cnt 0), which the
@@ -4179,17 +4213,8 @@ describe("react-native-webcodecs + Mediabunny", () => {
       if (!supported() || !probes()) {
         return;
       }
-      const name = "clip-h264-open-gop.mp4";
-      const file = await gopClip(name, [
-        "-c:v",
-        "libx264",
-        "-profile:v",
-        "high",
-        "-bf",
-        "3",
-        "-x264-params",
-        "open-gop=1:keyint=30:min-keyint=30:scenecut=0:b-pyramid=none:log-level=error",
-      ]);
+      const name = h264OpenGopName;
+      const file = await h264OpenGopClip();
       // The second key frame, in the bitstream: a recovery point, not an
       // IDR.
       const trace = execFileSync(
@@ -4253,20 +4278,64 @@ describe("react-native-webcodecs + Mediabunny", () => {
       }
       // From the key frame on, each picture is the one its timestamp says:
       // closest to the frame of that timestamp in the whole clip's decode.
-      const reference = decoded.grids[0]!;
-      const distance = (a: number[], b: number[]) =>
-        a.reduce((sum, v, i) => sum + Math.abs(v - b[i]!), 0);
-      const pictures = fromKey.map((t) => {
-        const got = decoded.grids[1]![String(t)]!;
-        let best = "";
-        Object.entries(reference).forEach(([at, want]) => {
-          if (!best || distance(got, want) < distance(got, reference[best]!)) {
-            best = at;
-          }
-        });
-        return best;
-      });
-      expect(pictures).toEqual(fromKey.map(String));
+      expect(
+        closestPictures(fromKey, decoded.grids[1]!, decoded.grids[0]!),
+      ).toEqual(fromKey.map(String));
+    }, 300000);
+
+    // The same clip's first GOP, a flush, then its second GOP from the
+    // recovery point: playback that flushes at a GOP boundary and goes on.
+    // flush() sets [[key chunk required]] (WebCodecs, VideoDecoder flush()
+    // step 2), so the chunk after it must be a key chunk, one that "does
+    // not depend on any other frames for decoding", and the AVC
+    // registration expects an avc key chunk to be an IDR picture. A
+    // decoder cannot tell this from a seek to the same key chunk, so it
+    // starts there as from any key chunk, and the leading B pictures,
+    // which reference the first GOP, may be left out, as after a seek.
+    // Chromium does the same: its H264Decoder::Flush() outputs the
+    // pictures it holds and clears its DPB (media/gpu/h264_decoder.cc).
+    // What the spec does not allow is failing: the chunks are valid and
+    // came in a valid order. On iOS the leading pictures are left out
+    // (30 frames rather than 32): the deliberate cost of starting cleanly
+    // from any key chunk. Each frame that comes out must look as it does
+    // in the whole clip.
+    it("decodes H.264 from a recovery point after a flush following the GOP before it", async () => {
+      if (!supported() || !probes()) {
+        return;
+      }
+      const file = await h264OpenGopClip();
+      // The whole clip (for what each frame looks like), then the first
+      // GOP, then the second, each followed by a flush.
+      const decoded = await decodeRuns(
+        file,
+        [[[0, 2]], [[0, 1]], [[1, 2]]],
+        true,
+      );
+      console.log(
+        `recovery point after its GOP: ${JSON.stringify({ ...decoded, grids: undefined })}`,
+      );
+      if (!decoded.supported) {
+        return;
+      }
+      const all = decoded.packets.map((p) => p.timestamp);
+      const first = sorted(gopOf(decoded.packets, 0).map((p) => p.timestamp));
+      const second = gopOf(decoded.packets, 1).map((p) => p.timestamp);
+      const key = second[0]!;
+      const fromKey = sorted(second.filter((t) => t >= key));
+      expect(second.length - fromKey.length).toBeGreaterThan(0);
+      expect({
+        errors: decoded.errors,
+        runs: decoded.runs.slice(0, 2),
+      }).toEqual({ errors: [], runs: [sorted(all), first] });
+      if (ios()) {
+        expect(decoded.runs[2]).toEqual(fromKey);
+      } else {
+        expect([fromKey, sorted(second)]).toContainEqual(decoded.runs[2]);
+      }
+      const third = decoded.runs[2] ?? [];
+      expect(
+        closestPictures(third, decoded.grids[2]!, decoded.grids[0]!),
+      ).toEqual(third.map(String));
     }, 300000);
 
     // A key frame earlier than the frames before it, without a flush: the
