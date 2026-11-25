@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.3](https://github.com/andreialecu/react-native-webcodecs/compare/v0.1.2...v0.1.3) (2026-11-25)
+
+
+### Bug Fixes
+
+* **android:** put out a GOP that goes back in time after the one before it ([e0eb929](https://github.com/andreialecu/react-native-webcodecs/commit/e0eb9290f611e765d1503a78ee03c7f8cdf6cdb6))
+* **example:** load the export's sound in Android release builds ([0cd1af8](https://github.com/andreialecu/react-native-webcodecs/commit/0cd1af834a0b9ab56ef73847e2c4db264908d83d))
+* **ios:** decode AAC from its AudioSpecificConfig, ADTS, and restart the AudioDecoder on flush ([b78c863](https://github.com/andreialecu/react-native-webcodecs/commit/b78c8636d3a98a79ca2cd298872e8a89dd30649f)), closes [#3](https://github.com/andreialecu/react-native-webcodecs/issues/3) [#2](https://github.com/andreialecu/react-native-webcodecs/issues/2) [#10](https://github.com/andreialecu/react-native-webcodecs/issues/10) [#2](https://github.com/andreialecu/react-native-webcodecs/issues/2)
+* **ios:** decode from a CRA or recovery point, drain the reorder buffer when a key frame goes back in time ([5c3e02a](https://github.com/andreialecu/react-native-webcodecs/commit/5c3e02a1b5d586e8a3260075d0a1c47cc90dac45))
+* **ios:** forward bitrateMode, refuse quantizer, and tag the range the encoder writes ([05e9063](https://github.com/andreialecu/react-native-webcodecs/commit/05e9063dc91bddbaf5f5418b3419225cd30c9090))
+* **ios:** keep small AAC packets alive while the AudioConverter reads them ([d8f2742](https://github.com/andreialecu/react-native-webcodecs/commit/d8f27426660f069fbfb9a31dd4c00011c3a87704))
+* **ios:** pin a wrapped surface's use count until the frame is closed ([99d3aa6](https://github.com/andreialecu/react-native-webcodecs/commit/99d3aa68a85169a96d091ff51240a8f965615ab5))
+* **ios:** start an AudioDecoder over on flush with a new AudioConverter ([9cb6fd4](https://github.com/andreialecu/react-native-webcodecs/commit/9cb6fd48e02805cb70a99086322a87e818076ea7))
+
 ## [0.1.2](https://github.com/andreialecu/react-native-webcodecs/compare/v0.1.1...v0.1.2) (2026-11-24)
 
 
