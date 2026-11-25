@@ -1527,6 +1527,272 @@ describe("react-native-webcodecs + Mediabunny", () => {
     }
   }, 60000);
 
+  // bitrateMode: VideoToolbox takes no per-frame quantizer outside its
+  // low-latency H.264 mode, so iOS refuses "quantizer" (Android takes the
+  // config and encodes at its default bitrate). "constant" (CBR where the
+  // encoder has it, else the average bitrate) and "variable" (the average
+  // bitrate, capped at 1.5x over each second on iOS) encode on both.
+  it("refuses bitrateMode quantizer on iOS, and encodes constant and variable", async () => {
+    if (!supported()) {
+      return;
+    }
+    const result = (await client.eval(({ webcodecs: wc }) => {
+      const base = { codec: "avc1.42001f", width: 640, height: 480 };
+      const run = (bitrateMode: string) => {
+        const config = Object.assign({}, base, {
+          bitrateMode,
+          bitrate: bitrateMode === "quantizer" ? undefined : 1_000_000,
+        });
+        return wc.VideoEncoder.isConfigSupported(config).then(
+          (support: any) => {
+            if (bitrateMode === "quantizer") {
+              return { bitrateMode, supported: support.supported };
+            }
+            const chunks: number[] = [];
+            const errors: string[] = [];
+            const encoder = new wc.VideoEncoder({
+              output: (chunk: any) => chunks.push(chunk.byteLength),
+              error: (e: any) => errors.push(`${e.name}: ${e.message}`),
+            });
+            encoder.configure(config);
+            const pool = wc.createSurfacePool(base.width, base.height);
+            [0, 33333, 66666].forEach((timestamp) => {
+              const frame = new wc.VideoFrame(pool.acquire(), { timestamp });
+              encoder.encode(frame, { keyFrame: timestamp === 0 });
+              frame.close();
+            });
+            return encoder
+              .flush()
+              .catch((e: any) => errors.push(`flush: ${e.name}: ${e.message}`))
+              .then(() => {
+                if (encoder.state !== "closed") {
+                  encoder.close();
+                }
+                return {
+                  bitrateMode,
+                  supported: support.supported,
+                  chunks: chunks.filter((n) => n > 0).length,
+                  errors,
+                };
+              });
+          },
+        );
+      };
+      return ["quantizer", "constant", "variable"].reduce(
+        (done: Promise<any[]>, mode) =>
+          done.then((all) => run(mode).then((r: any) => all.concat([r]))),
+        Promise.resolve([]),
+      );
+    })) as any[];
+    expect(result).toEqual([
+      { bitrateMode: "quantizer", supported: !ios() },
+      { bitrateMode: "constant", supported: true, chunks: 3, errors: [] },
+      { bitrateMode: "variable", supported: true, chunks: 3, errors: [] },
+    ]);
+  }, 120000);
+
+  // A Mediabunny Quality without a bitrate (QUALITY_HIGH) tries a quantizer
+  // config first, then a bitrate one. iOS refuses the quantizer, so the
+  // encoder gets a bitrate rather than running at VideoToolbox's default
+  // rate; Android takes the quantizer config, as before.
+  it("configures a bitrate for a Mediabunny Quality preset on iOS", async () => {
+    if (!supported()) {
+      return;
+    }
+    const result = (await client.eval(({ mediabunny: mb, webcodecs: wc }) => {
+      wc.installWebCodecs();
+      const configs: any[] = [];
+      const proto = wc.VideoEncoder.prototype;
+      const { configure } = proto;
+      proto.configure = function (this: any, config: any) {
+        configs.push({
+          bitrate: config.bitrate,
+          bitrateMode: config.bitrateMode,
+        });
+        return configure.call(this, config);
+      };
+      const output = new mb.Output({
+        format: new mb.Mp4OutputFormat({ fastStart: "in-memory" }),
+        target: new mb.BufferTarget(),
+      });
+      const video = new mb.VideoSampleSource({
+        codec: "avc",
+        quality: mb.QUALITY_HIGH,
+      });
+      output.addVideoTrack(video, { frameRate: 30 });
+      const pool = wc.createSurfacePool(128, 128);
+      const add = (i: number): Promise<void> => {
+        if (i === 10) {
+          return Promise.resolve();
+        }
+        const frame = new wc.VideoFrame(pool.acquire(), {
+          timestamp: Math.round((i * 1e6) / 30),
+          duration: Math.round(1e6 / 30),
+        });
+        const sample = new mb.VideoSample(frame);
+        return video.add(sample).then(
+          () => {
+            sample.close();
+            return add(i + 1);
+          },
+          (e: unknown) => {
+            sample.close();
+            throw e;
+          },
+        );
+      };
+      return output
+        .start()
+        .then(() => add(0))
+        .then(() => {
+          video.close();
+          return output.finalize();
+        })
+        .then(
+          () => ({ configs, bytes: output.target.buffer.byteLength }),
+          (e: any) => ({ configs, error: `${e && e.name}: ${e && e.message}` }),
+        )
+        .then((r: any) => {
+          // The app outlives this test.
+          proto.configure = configure;
+          return r;
+        });
+    })) as any;
+    expect(result.error).toBeUndefined();
+    expect(result.bytes).toBeGreaterThan(0);
+    expect(result.configs.length).toBe(1);
+    if (ios()) {
+      expect(result.configs[0].bitrateMode).not.toBe("quantizer");
+      expect(result.configs[0].bitrate).toBeGreaterThan(0);
+    }
+  }, 120000);
+
+  // The encoders write limited range whatever the frames say (VideoToolbox
+  // converts to video range, MediaCodec is set to color-range 2), so the
+  // decoder config says so too: a full-range frame must not make Mediabunny
+  // write a colr box with full_range_flag over a video-range SPS. And a
+  // decoder's RGB (BGRA) frames are full range, whatever the stream's range.
+  it("tags the stream's range, not the frames', in the decoder config and colr box", async () => {
+    if (!supported()) {
+      return;
+    }
+    const result = (await client.eval(({ mediabunny: mb, webcodecs: wc }) => {
+      const errors: string[] = [];
+      const chunks: any[] = [];
+      let decoderConfig: any = null;
+      const target = new mb.BufferTarget();
+      const output = new mb.Output({
+        format: new mb.Mp4OutputFormat({ fastStart: "in-memory" }),
+        target,
+      });
+      const source = new mb.EncodedVideoPacketSource("avc");
+      output.addVideoTrack(source, { frameRate: 30 });
+      let written = Promise.resolve();
+      const encoder = new wc.VideoEncoder({
+        output: (chunk: any, meta: any) => {
+          chunks.push(chunk);
+          if (meta && meta.decoderConfig && !decoderConfig) {
+            ({ decoderConfig } = meta);
+          }
+          const data = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(data);
+          const packet = new mb.EncodedPacket(
+            data,
+            chunk.type,
+            chunk.timestamp / 1e6,
+            (chunk.duration || 0) / 1e6,
+          );
+          written = written.then(() => source.add(packet, meta));
+        },
+        error: (e: any) => errors.push(`encoder: ${e}`),
+      });
+      encoder.configure({ codec: "avc1.42001f", width: 128, height: 128 });
+      const pool = wc.createSurfacePool(128, 128);
+      [0, 33333, 66666].forEach((timestamp) => {
+        const frame = new wc.VideoFrame(pool.acquire(), {
+          timestamp,
+          duration: 33333,
+          colorSpace: {
+            primaries: "bt709",
+            transfer: "bt709",
+            matrix: "bt709",
+            fullRange: true,
+          },
+        });
+        encoder.encode(frame, { keyFrame: timestamp === 0 });
+        frame.close();
+      });
+      let decoded: any = null;
+      return output
+        .start()
+        .then(() => encoder.flush())
+        .then(() => written)
+        .then(() => output.finalize())
+        .then(() => {
+          encoder.close();
+          const decoder = new wc.VideoDecoder({
+            output: (frame: any) => {
+              if (!decoded) {
+                decoded = {
+                  format: frame.format,
+                  fullRange: frame.colorSpace.fullRange,
+                };
+              }
+              frame.close();
+            },
+            error: (e: any) => errors.push(`decoder: ${e}`),
+          });
+          // Said limited explicitly, so that RGB frames show their own tag.
+          decoder.configure(
+            Object.assign({}, decoderConfig, {
+              colorSpace: Object.assign({}, decoderConfig.colorSpace, {
+                fullRange: false,
+              }),
+            }),
+          );
+          chunks.forEach((chunk) => decoder.decode(chunk));
+          return decoder.flush().then(() => decoder.close());
+        })
+        .then(() => ({
+          errors,
+          configRange: decoderConfig && decoderConfig.colorSpace.fullRange,
+          decoded,
+          path: wc.writeFile("e2e-range.mp4", target.buffer),
+        }));
+    })) as any;
+    expect(result.errors).toEqual([]);
+    expect(result.configRange).toBe(false);
+    // NV12 keeps the stream's tags; RGB is full range.
+    expect(result.decoded.fullRange).toBe(result.decoded.format !== "NV12");
+    if (!probes()) {
+      return;
+    }
+    const local = copyLocal(result.path);
+    const bytes = fs.readFileSync(local);
+    const colr = bytes.indexOf("colr");
+    expect(colr).toBeGreaterThan(0);
+    expect(bytes.toString("latin1", colr + 4, colr + 8)).toBe("nclx");
+    // nclx: primaries, transfer and matrix (2 bytes each), then the flag.
+    const colrFullRange = bytes[colr + 14] >> 7;
+    // The SPS's VUI video_full_range_flag (0 when the VUI does not say).
+    const trace = execFileSync(
+      "sh",
+      [
+        "-c",
+        'ffmpeg -hide_banner -i "$0" -c:v copy -bsf:v trace_headers -f null - 2>&1',
+        local,
+      ],
+      { encoding: "utf8" },
+    );
+    const spsFullRange = Number(
+      /video_full_range_flag\s+[01]+\s*=\s*(\d+)/.exec(trace)?.[1] ?? 0,
+    );
+    expect({ colr: colrFullRange, sps: spsFullRange }).toEqual({
+      colr: 0,
+      sps: 0,
+    });
+  }, 120000);
+
   // AudioEncoder alone, fed a 440 Hz sine in 1000-frame AudioData (not
   // multiples of an AAC frame): `segments` runs, each from its own start
   // time and followed by a flush. Returns each chunk's timestamp and
@@ -1746,6 +2012,300 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(Math.abs(result.two.frames - result.one.frames)).toBeLessThanOrEqual(
       2048,
     );
+  }, 180000);
+
+  // A sound made with ffmpeg here (a 440 Hz sine, at ffmpeg's level of 1/8),
+  // pushed to the app once.
+  const soundClip = (name: string, args: string[]) => {
+    const clip = path.join(clipDirectory, name);
+    fs.mkdirSync(clipDirectory, { recursive: true });
+    if (!fs.existsSync(clip)) {
+      execFileSync("ffmpeg", ["-loglevel", "error", "-y"].concat(args, [clip]));
+    }
+    return pushFile(clip);
+  };
+  const hasEncoder = (name: string) =>
+    execFileSync("ffmpeg", ["-hide_banner", "-encoders"], {
+      encoding: "utf8",
+    })
+      .split("\n")
+      .some((line) => line.trim().split(/\s+/)[1] === name);
+
+  // Decodes a file's sound track with AudioDecoder (Mediabunny demuxes), and
+  // measures it: frames, format, level and pitch (from channel 0's upward
+  // swings through zero, between the first and the last, so priming and
+  // padding do not count).
+  const decodeSoundOnDevice = (file: string) =>
+    runOnDevice<any>(
+      ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+        const input = new mb.Input({
+          source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+          formats: mb.ALL_FORMATS,
+        });
+        return input.getPrimaryAudioTrack().then((track: any) =>
+          track.getDecoderConfig().then((config: any) =>
+            wc.AudioDecoder.isConfigSupported(config).then((support: any) => {
+              const out: any = {
+                errors: [],
+                supported: support.supported,
+                config: {
+                  codec: config.codec,
+                  sampleRate: config.sampleRate,
+                  numberOfChannels: config.numberOfChannels,
+                  description: !!config.description,
+                },
+                packets: 0,
+                frames: 0,
+                sampleRates: [],
+                channels: [],
+              };
+              let sum = 0;
+              let count = 0;
+              let crossings = 0;
+              let below = false;
+              let first = -1;
+              let lastCrossing = -1;
+              let index = 0;
+              const decoder = new wc.AudioDecoder({
+                output: (data: any) => {
+                  out.frames += data.numberOfFrames;
+                  if (out.sampleRates.indexOf(data.sampleRate) < 0) {
+                    out.sampleRates.push(data.sampleRate);
+                  }
+                  if (out.channels.indexOf(data.numberOfChannels) < 0) {
+                    out.channels.push(data.numberOfChannels);
+                  }
+                  const n = data.numberOfChannels;
+                  const samples = new Float32Array(data.numberOfFrames * n);
+                  data.copyTo(samples, { planeIndex: 0, format: "f32" });
+                  for (let i = 0; i < samples.length; i++) {
+                    sum += samples[i] * samples[i];
+                  }
+                  for (let i = 0; i < samples.length; i += n, index++) {
+                    if (samples[i] < -0.01) {
+                      below = true;
+                    } else if (below && samples[i] > 0.01) {
+                      below = false;
+                      crossings++;
+                      if (first < 0) {
+                        first = index;
+                      }
+                      lastCrossing = index;
+                    }
+                  }
+                  count += samples.length;
+                  data.close();
+                },
+                error: (e: any) => out.errors.push(String(e)),
+              });
+              decoder.configure(config);
+              const packets = new mb.EncodedPacketSink(track).packets();
+              const step = (): Promise<void> =>
+                packets.next().then((r: any) => {
+                  if (r.done) {
+                    return undefined;
+                  }
+                  out.packets++;
+                  decoder.decode(r.value.toEncodedAudioChunk());
+                  return step();
+                });
+              return step()
+                .then(() => decoder.flush())
+                .then(
+                  () => undefined,
+                  (e: any) => out.errors.push(String(e)),
+                )
+                .then(() => {
+                  const rate = out.sampleRates[0] || 1;
+                  out.rms = Math.sqrt(sum / Math.max(1, count));
+                  out.seconds = out.frames / rate;
+                  out.hz =
+                    ((crossings - 1) * rate) /
+                    Math.max(1, lastCrossing - first);
+                  if (decoder.state !== "closed") {
+                    decoder.close();
+                  }
+                  input.dispose();
+                  return out;
+                });
+            }),
+          ),
+        );
+      },
+      { file },
+      120000,
+    );
+
+  // The decoded sound is ffmpeg's: as long, at its rate, as loud, at its
+  // pitch (garbage, or a decode at the wrong rate, is not).
+  const expectSine = (sound: any, o: { rate: number; channels: number }) => {
+    expect(sound.errors).toEqual([]);
+    expect(sound.sampleRates).toEqual([o.rate]);
+    expect(sound.channels).toEqual([o.channels]);
+    // 3 s, give or take the priming and the last frame's padding.
+    expect(sound.seconds).toBeGreaterThan(2.9);
+    expect(sound.seconds).toBeLessThan(3.3);
+    // 1/8 (0.088), or 3 dB below for a mono sine made stereo.
+    expect(sound.rms).toBeGreaterThan(0.04);
+    expect(sound.rms).toBeLessThan(0.12);
+    expect(Math.abs(sound.hz - 440)).toBeLessThan(15);
+  };
+
+  // WebCodecs: AAC without a description is ADTS, a header on every frame,
+  // as Mediabunny's .aac and MPEG-TS demuxers give it.
+  it("decodes ADTS AAC (no description)", async () => {
+    if (!supported() || !probes()) {
+      return;
+    }
+    const file = await soundClip("sine-48k.aac", [
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440:sample_rate=48000:duration=3",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "96k",
+      "-f",
+      "adts",
+    ]);
+    const sound = await decodeSoundOnDevice(file);
+    expect(sound.config.description).toBe(false);
+    expect(sound.supported).toBe(true);
+    expectSine(sound, { rate: 48000, channels: 1 });
+    // One frame of 1024 samples per packet.
+    expect(sound.frames).toBeGreaterThan((sound.packets - 4) * 1024);
+    expect(sound.frames).toBeLessThanOrEqual((sound.packets + 1) * 1024);
+  }, 180000);
+
+  // HE-AAC (SBR) and HE-AAC v2 (SBR and PS) as AudioToolbox's encoder writes
+  // them: an AudioSpecificConfig of AAC-LC at half the rate (mono for v2),
+  // with the SBR and PS layers in its extension, and 2048 samples a packet.
+  // (macOS hosts: ffmpeg's aac_at encoder.)
+  for (const [name, profile, bitrate] of [
+    ["HE-AAC", "4", "48k"],
+    ["HE-AACv2", "28", "32k"],
+  ]) {
+    it(`decodes ${name} at its full rate and channels`, async () => {
+      if (!supported() || !probes() || !hasEncoder("aac_at")) {
+        return;
+      }
+      const file = await soundClip(`sine-${name}.m4a`, [
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=44100:duration=3",
+        "-ac",
+        "2",
+        "-c:a",
+        "aac_at",
+        "-profile:a",
+        profile,
+        "-b:a",
+        bitrate,
+      ]);
+      const sound = await decodeSoundOnDevice(file);
+      expect(sound.supported).toBe(true);
+      expectSine(sound, { rate: 44100, channels: 2 });
+      expect(sound.frames).toBeGreaterThan((sound.packets - 4) * 2048);
+      expect(sound.frames).toBeLessThanOrEqual((sound.packets + 1) * 2048);
+    }, 180000);
+  }
+
+  // flush() ends the stream and starts a new one: what is decoded after it
+  // does not overlap the sound before it. A tone, then digital silence:
+  // decoding the tone, a flush, then the silence must give silence. (iOS:
+  // Android's MediaCodec flush is its own, and out of scope here.)
+  it("starts an AudioDecoder over after a flush (iOS)", async () => {
+    if (!ios() || !probes()) {
+      return;
+    }
+    const file = await soundClip("tone-then-silence.m4a", [
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440:sample_rate=48000:duration=4",
+      "-af",
+      "volume=volume=0:enable='gte(t,2)'",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+    ]);
+    const result = await runOnDevice<any>(
+      ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+        const input = new mb.Input({
+          source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+          formats: mb.ALL_FORMATS,
+        });
+        return input.getPrimaryAudioTrack().then((track: any) =>
+          track.getDecoderConfig().then((config: any) => {
+            const all: any[] = [];
+            const packets = new mb.EncodedPacketSink(track).packets();
+            const read = (): Promise<void> =>
+              packets.next().then((r: any) => {
+                if (r.done) {
+                  return undefined;
+                }
+                all.push(r.value);
+                return read();
+              });
+            const errors: string[] = [];
+            let samples: number[] = [];
+            const decoder = new wc.AudioDecoder({
+              output: (data: any) => {
+                const n = data.numberOfFrames * data.numberOfChannels;
+                const buffer = new Float32Array(n);
+                data.copyTo(buffer, { planeIndex: 0, format: "f32" });
+                for (let i = 0; i < n; i++) {
+                  samples.push(buffer[i]);
+                }
+                data.close();
+              },
+              error: (e: any) => errors.push(String(e)),
+            });
+            decoder.configure(config);
+            // The level of the first `count` samples.
+            const rms = (from: number[], count: number) => {
+              let sum = 0;
+              const n = Math.min(from.length, count);
+              for (let i = 0; i < n; i++) {
+                sum += from[i] * from[i];
+              }
+              return Math.sqrt(sum / Math.max(1, n));
+            };
+            const decodeRange = (start: number, end: number) => {
+              all
+                .filter((p: any) => p.timestamp >= start && p.timestamp < end)
+                .forEach((p: any) => decoder.decode(p.toEncodedAudioChunk()));
+              return decoder.flush();
+            };
+            const out: any = { errors };
+            return read()
+              .then(() => decodeRange(-1, 1.5))
+              .then(() => {
+                out.tone = rms(samples, samples.length);
+                samples = [];
+                return decodeRange(3, 3.5);
+              })
+              .then(() => {
+                out.samples = samples.length;
+                out.after = rms(samples, 1024);
+                decoder.close();
+                input.dispose();
+                return out;
+              });
+          }),
+        );
+      },
+      { file },
+      120000,
+    );
+    expect(result.errors).toEqual([]);
+    expect(result.tone).toBeGreaterThan(0.05);
+    expect(result.samples).toBeGreaterThan(0);
+    // Not the tone's last frame overlapping the first of the silence.
+    expect(result.after).toBeLessThan(0.001);
   }, 180000);
 
   it("flushes a VideoEncoder given two frames with one timestamp", async () => {
@@ -3308,6 +3868,254 @@ describe("react-native-webcodecs + Mediabunny", () => {
       ).toBe(true);
     }
   }, 300000);
+
+  // Decoding from a key frame that is not the first: after a seek
+  // (flush() then a later key frame), or a GOP that goes back in time.
+  describe("decoding from a later key frame", () => {
+    interface Runs {
+      supported: boolean;
+      // Every packet, in decoding order (microseconds).
+      packets: { timestamp: number; key: boolean }[];
+      // Each run's output timestamps, in output order.
+      runs: number[][];
+      errors: string[];
+    }
+
+    const hasLibx265 = () => {
+      try {
+        return /libx265/.test(
+          execFileSync("ffmpeg", ["-hide_banner", "-encoders"], {
+            encoding: "utf8",
+          }),
+        );
+      } catch {
+        return false;
+      }
+    };
+
+    // Two GOPs of 30 frames at 30 fps, made with ffmpeg once.
+    const gopClip = (name: string, codec: string[]) => {
+      const clip = path.join(clipDirectory, name);
+      fs.mkdirSync(clipDirectory, { recursive: true });
+      if (!fs.existsSync(clip)) {
+        execFileSync(
+          "ffmpeg",
+          [
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30:duration=2",
+            "-pix_fmt",
+            "yuv420p",
+          ].concat(codec, [clip]),
+        );
+      }
+      return pushFile(clip);
+    };
+
+    // Decodes `runs` of GOPs (each a list of [first, end) GOP ranges, in
+    // that order, without a flush between them), each run followed by a
+    // flush, with one decoder.
+    const decodeRuns = (file: string, runs: number[][][]) =>
+      runOnDevice<Runs>(
+        ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+          const input = new mb.Input({
+            source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+            formats: mb.ALL_FORMATS,
+          });
+          const result: any = {
+            supported: false,
+            packets: [],
+            runs: [],
+            errors: [],
+          };
+          return input.getPrimaryVideoTrack().then((track: any) =>
+            track.getDecoderConfig().then((config: any) =>
+              wc.VideoDecoder.isConfigSupported(config).then((s: any) => {
+                result.supported = s.supported;
+                if (!s.supported) {
+                  input.dispose();
+                  return result;
+                }
+                const chunks: any[] = [];
+                const keys: number[] = [];
+                const iterator = new mb.EncodedPacketSink(track).packets();
+                const read = (): Promise<void> =>
+                  iterator.next().then((r: any) => {
+                    if (r.done) {
+                      return undefined;
+                    }
+                    const chunk = r.value.toEncodedVideoChunk();
+                    if (chunk.type === "key") {
+                      keys.push(chunks.length);
+                    }
+                    chunks.push(chunk);
+                    result.packets.push({
+                      timestamp: chunk.timestamp,
+                      key: chunk.type === "key",
+                    });
+                    return read();
+                  });
+                let current: number[] = [];
+                const decoder = new wc.VideoDecoder({
+                  output: (frame: any) => {
+                    current.push(frame.timestamp);
+                    frame.close();
+                  },
+                  error: (e: any) => result.errors.push(String(e)),
+                });
+                decoder.configure(config);
+                const order: number[][] = [];
+                const decodeFrom = (i: number): Promise<void> => {
+                  if (i >= order.length || decoder.state === "closed") {
+                    return Promise.resolve();
+                  }
+                  decoder.decode(chunks[order[i][0]]);
+                  return new Promise((resolve) => setTimeout(resolve, 0)).then(
+                    () => decodeFrom(i + 1),
+                  );
+                };
+                const run = (n: number): Promise<void> => {
+                  if (n >= ctx.runs.length || decoder.state === "closed") {
+                    return Promise.resolve();
+                  }
+                  current = [];
+                  result.runs.push(current);
+                  order.length = 0;
+                  ctx.runs[n].forEach((range: number[]) => {
+                    const end =
+                      range[1] < keys.length ? keys[range[1]] : chunks.length;
+                    for (let p = keys[range[0]]; p < end; p++) {
+                      order.push([p]);
+                    }
+                  });
+                  return decodeFrom(0)
+                    .then(() =>
+                      decoder.state === "closed" ? undefined : decoder.flush(),
+                    )
+                    .catch((e: any) => {
+                      result.errors.push(`flush: ${e}`);
+                    })
+                    .then(() => run(n + 1));
+                };
+                return read()
+                  .then(() => run(0))
+                  .then(() => {
+                    if (decoder.state !== "closed") {
+                      decoder.close();
+                    }
+                    input.dispose();
+                    return result;
+                  });
+              }),
+            ),
+          );
+        },
+        { file, runs },
+        120000,
+      );
+
+    const sorted = (values: number[]) => values.slice().sort((a, b) => a - b);
+    // The packets of GOP `gop` (0-based), in decoding order.
+    const gopOf = (packets: Runs["packets"], gop: number) => {
+      const keys = packets
+        .map((p, i) => (p.key ? i : -1))
+        .filter((i) => i >= 0);
+      return packets.slice(keys[gop], keys[gop + 1] ?? packets.length);
+    };
+
+    // x265's open GOPs: the second key frame is a CRA, and the 4 frames
+    // after it in decoding order (RASL, shown before it) reference the
+    // first GOP. Decoded from that CRA after a flush, as a seek does, they
+    // cannot be decoded: VideoToolbox fails them with
+    // kVTVideoDecoderReferenceMissingErr (-17694) or bad data, which closed
+    // the decoder. They are left out, as Chromium does (Android's decoders
+    // may output them).
+    it("decodes HEVC from an open-GOP key frame (CRA) after a flush", async () => {
+      if (!supported() || !probes() || !hasLibx265()) {
+        return;
+      }
+      const file = await gopClip("clip-hevc-open-gop.mp4", [
+        "-c:v",
+        "libx265",
+        "-tag:v",
+        "hvc1",
+        "-x265-params",
+        "open-gop=1:keyint=30:min-keyint=30:scenecut=0:log-level=error",
+      ]);
+      const decoded = await decodeRuns(file, [[[0, 2]], [[1, 2]]]);
+      console.log(`open GOP: ${JSON.stringify(decoded)}`);
+      if (!decoded.supported) {
+        return;
+      }
+      const all = decoded.packets.map((p) => p.timestamp);
+      const second = gopOf(decoded.packets, 1).map((p) => p.timestamp);
+      const cra = second[0]!;
+      const fromCra = sorted(second.filter((t) => t >= cra));
+      expect(second.length - fromCra.length).toBe(4);
+      expect({
+        errors: decoded.errors,
+        first: decoded.runs[0],
+      }).toEqual({ errors: [], first: sorted(all) });
+      if (ios()) {
+        expect(decoded.runs[1]).toEqual(fromCra);
+      } else {
+        expect([fromCra, sorted(second)]).toContainEqual(decoded.runs[1]);
+      }
+    }, 300000);
+
+    // A key frame earlier than the frames before it, without a flush: the
+    // second GOP, then the first. Each GOP's frames come out in order, all
+    // of the second's before the first's: frames held for reordering go
+    // out at that key frame instead of being sorted in with the first
+    // GOP's.
+    it("outputs a GOP that goes back in time after the one before it", async () => {
+      if (!supported() || !probes()) {
+        return;
+      }
+      const file = await gopClip("clip-h264-two-gops.mp4", [
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "high",
+        "-g",
+        "30",
+        "-keyint_min",
+        "30",
+        "-sc_threshold",
+        "0",
+      ]);
+      const decoded = await decodeRuns(file, [
+        [
+          [1, 2],
+          [0, 1],
+        ],
+      ]);
+      console.log(`back in time: ${JSON.stringify(decoded)}`);
+      if (!decoded.supported) {
+        return;
+      }
+      const times = (gop: number) =>
+        sorted(gopOf(decoded.packets, gop).map((p) => p.timestamp));
+      if (!ios()) {
+        // Android (c2 decoders on the emulator) puts out the first GOP in
+        // decode order and holds the second GOP's last frames until the
+        // end of the stream; every frame still comes out, once.
+        expect(decoded.errors).toEqual([]);
+        expect(sorted(decoded.runs[0])).toEqual(
+          sorted(times(1).concat(times(0))),
+        );
+        return;
+      }
+      expect({ errors: decoded.errors, frames: decoded.runs[0] }).toEqual({
+        errors: [],
+        frames: times(1).concat(times(0)),
+      });
+    }, 300000);
+  });
 
   // The example app's screens, through its own code (example/src/Tests.tsx
   // hands it over): the Lottie share card exported as the Video Export

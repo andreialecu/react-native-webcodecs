@@ -274,8 +274,17 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
   // out. Frames that already come in order only wait, they are not moved.
   private let reorder = NSLock()
   private var held: [NativeDecodedFrame] = []
+  private let baseDepth: Int
   private var depth: Int
   private var lastOut = -Double.infinity
+  // On `queue`: the latest timestamp decoded since the stream started, and
+  // whether the next key frame starts one (after configure or flush).
+  private var lastIn = -Double.infinity
+  private var start = true
+  // HEVC: the NAL unit length size, and whether the stream started at a
+  // CRA or BLA whose leading RASL pictures are still to be skipped.
+  private let hevcNalLength: Int?
+  private var skipRASL = false
 
   init(
     config: NativeVideoDecoderConfig,
@@ -285,7 +294,22 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
     self.output = output
     self.error = error
     format = try HybridNativeVideoDecoder.formatDescription(config)
-    depth = ReorderDepth.of(config)
+    let base = ReorderDepth.of(config)
+    baseDepth = base
+    depth = base
+    // From the format VideoToolbox made of the hvcC record, rather than
+    // reading the record a second time.
+    var nalLength: Int32 = 0
+    if CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC,
+      CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+        format, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil,
+        parameterSetCountOut: nil, nalUnitHeaderLengthOut: &nalLength) == noErr,
+      nalLength > 0
+    {
+      hevcNalLength = Int(nalLength)
+    } else {
+      hevcNalLength = nil
+    }
     super.init()
 
     let attributes: [CFString: Any] = [
@@ -368,10 +392,45 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
   private func fail(_ message: String) {
     queue.async {
       if self.failed { return }
-      self.failed = true
-      self.discardHeld()
+      self.stop()
       self.error(message)
     }
+  }
+
+  // On `queue`. `failed` is written under `reorder` too, as hold() reads it
+  // there; held surfaces go back to the decoder's pool unseen.
+  private func stop() {
+    reorder.lock()
+    failed = true
+    held.removeAll()
+    reorder.unlock()
+  }
+
+  // On `queue`: what follows starts from a key frame, with the stream's own
+  // reorder depth again.
+  private func restart() {
+    lastIn = -Double.infinity
+    start = true
+    reorder.lock()
+    lastOut = -Double.infinity
+    depth = baseDepth
+    reorder.unlock()
+  }
+
+  // The type of an HEVC sample's first picture (VCL) NAL unit, nil when it
+  // cannot be read.
+  static func hevcPictureType(_ bytes: Data, nalLength: Int) -> Int? {
+    var i = bytes.startIndex
+    while i + nalLength < bytes.endIndex {
+      var length = 0
+      for k in 0..<nalLength { length = length << 8 | Int(bytes[i + k]) }
+      i += nalLength
+      guard length > 0, i + length <= bytes.endIndex else { return nil }
+      let type = Int(bytes[i] >> 1) & 0x3f
+      if type < 32 { return type }
+      i += length
+    }
+    return nil
   }
 
   // From VideoToolbox's output callback.
@@ -397,25 +456,50 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
     output(frame)
   }
 
+  // On `queue`: the frames VideoToolbox still has, then those held for
+  // reordering, go out, and what follows starts a new stream.
+  private func endStream(_ session: VTDecompressionSession) {
+    VTDecompressionSessionFinishDelayedFrames(session)
+    VTDecompressionSessionWaitForAsynchronousFrames(session)
+    if !failed { drainHeld() }
+    restart()
+  }
+
   private func drainHeld() {
     reorder.lock()
     defer { reorder.unlock() }
     while !held.isEmpty { emit(held.removeFirst()) }
   }
 
-  // Their surfaces go back to the decoder's pool unseen.
-  private func discardHeld() {
-    reorder.lock()
-    held.removeAll()
-    reorder.unlock()
-  }
-
   func decode(data: ArrayBuffer, timestamp: Double, duration: Double, key: Bool) throws {
     guard let session else { throw WebCodecsError.invalidState("the decoder is closed") }
     let bytes = data.toData(copyIfNeeded: true)
     let format = format
+    let hevcNalLength = hevcNalLength
     queue.async {
       if self.failed { return }
+      // A key frame earlier than what came before it, without a flush: a
+      // new stream. The frames held for reordering go out first, rather
+      // than being sorted in with the new stream's.
+      if key && timestamp < self.lastIn {
+        self.endStream(session)
+      }
+      self.lastIn = max(self.lastIn, timestamp)
+      let first = key && self.start
+      if key { self.start = false }
+      // Started at a CRA or BLA (a seek in an open-GOP stream): the RASL
+      // pictures after it reference frames before it, which the decoder
+      // never had. VideoToolbox fails them, so they are skipped until the
+      // next IRAP picture, as Chromium does.
+      if let hevcNalLength, let type = HybridNativeVideoDecoder.hevcPictureType(bytes, nalLength: hevcNalLength) {
+        if first {
+          self.skipRASL = type == 21 || (16...18).contains(type)
+        } else if (16...23).contains(type) {
+          self.skipRASL = false
+        } else if self.skipRASL && (type == 8 || type == 9) {
+          return
+        }
+      }
       var block: CMBlockBuffer?
       var status = CMBlockBufferCreateWithMemoryBlock(
         allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: bytes.count,
@@ -443,6 +527,15 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
         self.fail(errorMessage("EncodingError", "decoder-failed", "CMSampleBufferCreate failed (\(status))"))
         return
       }
+      // The first key frame of a stream may be a recovery point or CRA
+      // rather than an IDR: without a reset, VideoToolbox may decode it
+      // against stale state, silently corrupted (Apple's advice to
+      // Chromium, crbug 451536366).
+      if first {
+        CMSetAttachment(
+          sample, key: kCMSampleBufferAttachmentKey_ResetDecoderBeforeDecoding, value: kCFBooleanTrue,
+          attachmentMode: CMAttachmentMode(kCMAttachmentMode_ShouldNotPropagate))
+      }
       // Temporal processing: frames come out in presentation order, as
       // WebCodecs outputs them.
       let flags: VTDecodeFrameFlags = [._EnableAsynchronousDecompression, ._EnableTemporalProcessing]
@@ -450,6 +543,10 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
         session, sampleBuffer: sample, flags: flags, infoFlagsOut: nil
       ) { [weak self] status, _, imageBuffer, pts, dur in
         guard let self else { return }
+        // A frame referencing one from before the stream's start (it
+        // started at a recovery point or open-GOP key frame): dropped, as
+        // Chromium, WebKit and FFmpeg do.
+        if status == kVTVideoDecoderReferenceMissingErr { return }
         if status != noErr {
           self.fail(HybridNativeVideoEncoder.describe(status).replacingOccurrences(of: "encoder", with: "decoder"))
           return
@@ -459,7 +556,7 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
         let d = dur.isValid ? Double(CMTimeConvertScale(dur, timescale: 1_000_000, method: .roundHalfAwayFromZero).value) : duration
         self.hold(NativeDecodedFrame(surface: HybridNativeSurface(pixelBuffer: imageBuffer), timestamp: ts, duration: d))
       }
-      if status != noErr {
+      if status != noErr && status != kVTVideoDecoderReferenceMissingErr {
         self.fail(HybridNativeVideoEncoder.describe(status).replacingOccurrences(of: "encoder", with: "decoder"))
       }
     }
@@ -468,13 +565,8 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
   func flush() throws -> Promise<Void> {
     guard let session else { return Promise.rejected(withError: WebCodecsError.invalidState("the decoder is closed")) }
     return Promise.parallel(queue) {
-      VTDecompressionSessionFinishDelayedFrames(session)
-      VTDecompressionSessionWaitForAsynchronousFrames(session)
-      if !self.failed { self.drainHeld() }
       // A flush ends the stream: what follows starts from a key frame.
-      self.reorder.lock()
-      self.lastOut = -Double.infinity
-      self.reorder.unlock()
+      self.endStream(session)
     }
   }
 
@@ -482,9 +574,8 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
     background = nil
     if let session {
       queue.async {
-        self.failed = true
+        self.stop()
         VTDecompressionSessionInvalidate(session)
-        self.discardHeld()
       }
     }
     session = nil

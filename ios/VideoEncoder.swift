@@ -97,6 +97,12 @@ final class HybridNativeVideoEncoder: HybridNativeVideoEncoderSpec {
     if tooLarge {
       throw WebCodecsError.notSupported("\(config.width)x\(config.height) is above the codec's highest level")
     }
+    // A per-frame quantizer needs BaseFrameQP, which only VideoToolbox's
+    // low-latency H.264 mode takes: refused, so that Mediabunny falls back to
+    // a bitrate instead of encoding at the default rate.
+    if config.bitrateMode == "quantizer" {
+      throw WebCodecsError.notSupported("bitrateMode quantizer")
+    }
     super.init()
 
     var session: VTCompressionSession?
@@ -148,7 +154,24 @@ final class HybridNativeVideoEncoder: HybridNativeVideoEncoderSpec {
       maxFrameDelay = 3
     }
     if let bitrate = config.bitrate, bitrate > 0 {
-      set(kVTCompressionPropertyKey_AverageBitRate, Int(bitrate) as CFNumber)
+      var constant = false
+      if #available(iOS 16.0, *), config.bitrateMode == "constant" {
+        // Not every encoder has CBR (kVTPropertyNotSupportedErr): the
+        // average bitrate then. It excludes AverageBitRate and DataRateLimits.
+        constant =
+          VTSessionSetProperty(
+            session, key: kVTCompressionPropertyKey_ConstantBitRate, value: Int(bitrate) as CFNumber) == noErr
+      }
+      if !constant {
+        set(kVTCompressionPropertyKey_AverageBitRate, Int(bitrate) as CFNumber)
+      }
+      if config.bitrateMode != "constant" {
+        // "variable" (WebCodecs' default): AverageBitRate alone overshoots
+        // freely, so cap each second at 1.5x the bitrate, as WebRTC does.
+        // Some encoders have no data rate limits; the average still holds.
+        let limits = [bitrate * 1.5 / 8, 1] as CFArray
+        set(kVTCompressionPropertyKey_DataRateLimits, limits)
+      }
     }
     if let framerate = config.framerate, framerate > 0 {
       set(kVTCompressionPropertyKey_ExpectedFrameRate, framerate as CFNumber)
