@@ -14,6 +14,36 @@ runs:
       with:
         node-version-file: .nvmrc
 
+    # Without its cache folder Yarn downloads every package again, even when
+    # node_modules is there (about 3 minutes on macOS), and without
+    # node_modules it links the whole tree again. The key covers everything
+    # that decides what gets installed, and there is no partial match, so a
+    # restored tree always belongs to this exact lockfile. The install below
+    # still runs with --immutable and checks it.
+    - name: Restore dependencies
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          .yarn/cache
+          .yarn/install-state.gz
+          node_modules
+          example/node_modules
+        key: yarn-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.nvmrc', '.yarnrc.yml', '.yarn/releases/**', '.yarn/patches/**', 'yarn.lock', 'package.json', 'example/package.json') }}
+
     - name: Install dependencies
       run: yarn install --immutable
       shell: bash
+
+    # Saved right after the install, before pod install or a build writes
+    # anything into node_modules.
+    - name: Save dependencies
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          .yarn/cache
+          .yarn/install-state.gz
+          node_modules
+          example/node_modules
+        key: ${{ steps.cache.outputs.cache-primary-key }}
