@@ -3309,6 +3309,244 @@ describe("react-native-webcodecs + Mediabunny", () => {
     }
   }, 300000);
 
+  // Decoding from a key frame that is not the first: after a seek
+  // (flush() then a later key frame), or a GOP that goes back in time.
+  describe("decoding from a later key frame", () => {
+    interface Runs {
+      supported: boolean;
+      // Every packet, in decoding order (microseconds).
+      packets: { timestamp: number; key: boolean }[];
+      // Each run's output timestamps, in output order.
+      runs: number[][];
+      errors: string[];
+    }
+
+    const hasLibx265 = () => {
+      try {
+        return /libx265/.test(
+          execFileSync("ffmpeg", ["-hide_banner", "-encoders"], {
+            encoding: "utf8",
+          }),
+        );
+      } catch {
+        return false;
+      }
+    };
+
+    // Two GOPs of 30 frames at 30 fps, made with ffmpeg once.
+    const gopClip = (name: string, codec: string[]) => {
+      const clip = path.join(clipDirectory, name);
+      fs.mkdirSync(clipDirectory, { recursive: true });
+      if (!fs.existsSync(clip)) {
+        execFileSync(
+          "ffmpeg",
+          [
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30:duration=2",
+            "-pix_fmt",
+            "yuv420p",
+          ].concat(codec, [clip]),
+        );
+      }
+      return pushFile(clip);
+    };
+
+    // Decodes `runs` of GOPs (each a list of [first, end) GOP ranges, in
+    // that order, without a flush between them), each run followed by a
+    // flush, with one decoder.
+    const decodeRuns = (file: string, runs: number[][][]) =>
+      runOnDevice<Runs>(
+        ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+          const input = new mb.Input({
+            source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+            formats: mb.ALL_FORMATS,
+          });
+          const result: any = {
+            supported: false,
+            packets: [],
+            runs: [],
+            errors: [],
+          };
+          return input.getPrimaryVideoTrack().then((track: any) =>
+            track.getDecoderConfig().then((config: any) =>
+              wc.VideoDecoder.isConfigSupported(config).then((s: any) => {
+                result.supported = s.supported;
+                if (!s.supported) {
+                  input.dispose();
+                  return result;
+                }
+                const chunks: any[] = [];
+                const keys: number[] = [];
+                const iterator = new mb.EncodedPacketSink(track).packets();
+                const read = (): Promise<void> =>
+                  iterator.next().then((r: any) => {
+                    if (r.done) {
+                      return undefined;
+                    }
+                    const chunk = r.value.toEncodedVideoChunk();
+                    if (chunk.type === "key") {
+                      keys.push(chunks.length);
+                    }
+                    chunks.push(chunk);
+                    result.packets.push({
+                      timestamp: chunk.timestamp,
+                      key: chunk.type === "key",
+                    });
+                    return read();
+                  });
+                let current: number[] = [];
+                const decoder = new wc.VideoDecoder({
+                  output: (frame: any) => {
+                    current.push(frame.timestamp);
+                    frame.close();
+                  },
+                  error: (e: any) => result.errors.push(String(e)),
+                });
+                decoder.configure(config);
+                const order: number[][] = [];
+                const decodeFrom = (i: number): Promise<void> => {
+                  if (i >= order.length || decoder.state === "closed") {
+                    return Promise.resolve();
+                  }
+                  decoder.decode(chunks[order[i][0]]);
+                  return new Promise((resolve) => setTimeout(resolve, 0)).then(
+                    () => decodeFrom(i + 1),
+                  );
+                };
+                const run = (n: number): Promise<void> => {
+                  if (n >= ctx.runs.length || decoder.state === "closed") {
+                    return Promise.resolve();
+                  }
+                  current = [];
+                  result.runs.push(current);
+                  order.length = 0;
+                  ctx.runs[n].forEach((range: number[]) => {
+                    const end =
+                      range[1] < keys.length ? keys[range[1]] : chunks.length;
+                    for (let p = keys[range[0]]; p < end; p++) {
+                      order.push([p]);
+                    }
+                  });
+                  return decodeFrom(0)
+                    .then(() =>
+                      decoder.state === "closed" ? undefined : decoder.flush(),
+                    )
+                    .catch((e: any) => {
+                      result.errors.push(`flush: ${e}`);
+                    })
+                    .then(() => run(n + 1));
+                };
+                return read()
+                  .then(() => run(0))
+                  .then(() => {
+                    if (decoder.state !== "closed") {
+                      decoder.close();
+                    }
+                    input.dispose();
+                    return result;
+                  });
+              }),
+            ),
+          );
+        },
+        { file, runs },
+        120000,
+      );
+
+    const sorted = (values: number[]) => values.slice().sort((a, b) => a - b);
+    // The packets of GOP `gop` (0-based), in decoding order.
+    const gopOf = (packets: Runs["packets"], gop: number) => {
+      const keys = packets
+        .map((p, i) => (p.key ? i : -1))
+        .filter((i) => i >= 0);
+      return packets.slice(keys[gop], keys[gop + 1] ?? packets.length);
+    };
+
+    // x265's open GOPs: the second key frame is a CRA, and the 4 frames
+    // after it in decoding order (RASL, shown before it) reference the
+    // first GOP. Decoded from that CRA after a flush, as a seek does, they
+    // cannot be decoded: VideoToolbox fails them with
+    // kVTVideoDecoderReferenceMissingErr (-17694) or bad data, which closed
+    // the decoder. They are left out, as Chromium does (Android's decoders
+    // may output them).
+    it("decodes HEVC from an open-GOP key frame (CRA) after a flush", async () => {
+      if (!supported() || !probes() || !hasLibx265()) {
+        return;
+      }
+      const file = await gopClip("clip-hevc-open-gop.mp4", [
+        "-c:v",
+        "libx265",
+        "-tag:v",
+        "hvc1",
+        "-x265-params",
+        "open-gop=1:keyint=30:min-keyint=30:scenecut=0:log-level=error",
+      ]);
+      const decoded = await decodeRuns(file, [[[0, 2]], [[1, 2]]]);
+      console.log(`open GOP: ${JSON.stringify(decoded)}`);
+      if (!decoded.supported) {
+        return;
+      }
+      const all = decoded.packets.map((p) => p.timestamp);
+      const second = gopOf(decoded.packets, 1).map((p) => p.timestamp);
+      const cra = second[0]!;
+      const fromCra = sorted(second.filter((t) => t >= cra));
+      expect(second.length - fromCra.length).toBe(4);
+      expect({
+        errors: decoded.errors,
+        first: decoded.runs[0],
+      }).toEqual({ errors: [], first: sorted(all) });
+      if (ios()) {
+        expect(decoded.runs[1]).toEqual(fromCra);
+      } else {
+        expect([fromCra, sorted(second)]).toContainEqual(decoded.runs[1]);
+      }
+    }, 300000);
+
+    // A key frame earlier than the frames before it, without a flush: the
+    // second GOP, then the first. Each GOP's frames come out in order, all
+    // of the second's before the first's: frames held for reordering go
+    // out at that key frame instead of being sorted in with the first
+    // GOP's.
+    it("outputs a GOP that goes back in time after the one before it", async () => {
+      if (!supported() || !probes()) {
+        return;
+      }
+      const file = await gopClip("clip-h264-two-gops.mp4", [
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "high",
+        "-g",
+        "30",
+        "-keyint_min",
+        "30",
+        "-sc_threshold",
+        "0",
+      ]);
+      const decoded = await decodeRuns(file, [
+        [
+          [1, 2],
+          [0, 1],
+        ],
+      ]);
+      console.log(`back in time: ${JSON.stringify(decoded)}`);
+      if (!decoded.supported) {
+        return;
+      }
+      const times = (gop: number) =>
+        sorted(gopOf(decoded.packets, gop).map((p) => p.timestamp));
+      expect({ errors: decoded.errors, frames: decoded.runs[0] }).toEqual({
+        errors: [],
+        frames: times(1).concat(times(0)),
+      });
+    }, 300000);
+  });
+
   // The example app's screens, through its own code (example/src/Tests.tsx
   // hands it over): the Lottie share card exported as the Video Export
   // screens do, and videos compressed as the Compress screen does.
