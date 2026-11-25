@@ -4155,6 +4155,120 @@ describe("react-native-webcodecs + Mediabunny", () => {
       }
     }, 300000);
 
+    // x264's open GOPs (open-gop=1, with B-frames): the second key frame is
+    // not an IDR but an I picture (nal_unit_type 1, slice_type 7) behind a
+    // recovery point SEI (payload type 6, recovery_frame_cnt 0), which the
+    // MP4 lists as a sync sample (stss). The B pictures after it in
+    // decoding order (shown before it, 2 with this host's x264) belong to
+    // the open GOP: they reference pictures of the first GOP. Decoded from
+    // there after a flush, as a seek does, they cannot be decoded. They are
+    // left out, as FFmpeg's decoder does (`ffmpeg -ss 0.99 -noaccurate_seek`
+    // on this clip outputs the 30 frames from the I picture on) and as
+    // Chromium, WebKit and VLC do on VideoToolbox (issue #2); the pictures
+    // from the I picture on are whole (exact_match_flag 1), so they all come
+    // out, as they look in the whole clip. Android's decoders may output the
+    // leading ones too.
+    // On the iOS Simulator (26.5 and 27.2), VideoToolbox fails the first
+    // leading B picture with -8969 (codecBadDataErr) rather than
+    // kVTVideoDecoderReferenceMissingErr (-17694), the only status the
+    // decoder drops a frame for, so the decoder closes with
+    // "decoder-failed" and this test fails there. On the Android emulator
+    // (API 35, c2.goldfish.h264.decoder), it fails too: the decoder gives
+    // no input buffer after the seek ("no input buffer").
+    it("decodes H.264 from a recovery point (non-IDR key frame) after a flush", async () => {
+      if (!supported() || !probes()) {
+        return;
+      }
+      const name = "clip-h264-open-gop.mp4";
+      const file = await gopClip(name, [
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "high",
+        "-bf",
+        "3",
+        "-x264-params",
+        "open-gop=1:keyint=30:min-keyint=30:scenecut=0:b-pyramid=none:log-level=error",
+      ]);
+      // The second key frame, in the bitstream: a recovery point, not an
+      // IDR.
+      const trace = execFileSync(
+        "sh",
+        [
+          "-c",
+          'ffmpeg -hide_banner -i "$0" -c:v copy -bsf:v trace_headers -f null - 2>&1',
+          path.join(clipDirectory, name),
+        ],
+        { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+      );
+      const keyPackets = trace
+        .split(/^.*Packet: /m)
+        .filter((p) => /^\d+ bytes, key frame/.test(p));
+      const values = (packet: string, field: string) =>
+        Array.from(
+          packet.matchAll(
+            new RegExp(`\\s${field}\\s+[01]+\\s*=\\s*(\\d+)`, "g"),
+          ),
+          (m) => Number(m[1]),
+        );
+      const recovery = keyPackets[1] ?? "";
+      expect({
+        first: values(keyPackets[0] ?? "", "nal_unit_type").includes(5),
+        idr: values(recovery, "nal_unit_type").includes(5),
+        slice: values(recovery, "nal_unit_type").includes(1),
+        sei: values(recovery, "last_payload_type_byte").includes(6),
+        // I slices only (slice_type 7: I, as are all the picture's).
+        slices: values(recovery, "slice_type"),
+        recoveryFrameCount: values(recovery, "recovery_frame_cnt"),
+      }).toEqual({
+        first: true,
+        idr: false,
+        slice: true,
+        sei: true,
+        slices: [7],
+        recoveryFrameCount: [0],
+      });
+
+      // The whole clip, then (after a flush) from the second key frame.
+      const decoded = await decodeRuns(file, [[[0, 2]], [[1, 2]]], true);
+      console.log(
+        `recovery point: ${JSON.stringify({ ...decoded, grids: undefined })}`,
+      );
+      if (!decoded.supported) {
+        return;
+      }
+      const all = decoded.packets.map((p) => p.timestamp);
+      const second = gopOf(decoded.packets, 1).map((p) => p.timestamp);
+      const key = second[0]!;
+      const fromKey = sorted(second.filter((t) => t >= key));
+      expect(second.length - fromKey.length).toBeGreaterThan(0);
+      expect({
+        errors: decoded.errors,
+        first: decoded.runs[0],
+      }).toEqual({ errors: [], first: sorted(all) });
+      if (ios()) {
+        expect(decoded.runs[1]).toEqual(fromKey);
+      } else {
+        expect([fromKey, sorted(second)]).toContainEqual(decoded.runs[1]);
+      }
+      // From the key frame on, each picture is the one its timestamp says:
+      // closest to the frame of that timestamp in the whole clip's decode.
+      const reference = decoded.grids[0]!;
+      const distance = (a: number[], b: number[]) =>
+        a.reduce((sum, v, i) => sum + Math.abs(v - b[i]!), 0);
+      const pictures = fromKey.map((t) => {
+        const got = decoded.grids[1]![String(t)]!;
+        let best = "";
+        Object.entries(reference).forEach(([at, want]) => {
+          if (!best || distance(got, want) < distance(got, reference[best]!)) {
+            best = at;
+          }
+        });
+        return best;
+      });
+      expect(pictures).toEqual(fromKey.map(String));
+    }, 300000);
+
     // A key frame earlier than the frames before it, without a flush: the
     // second GOP, then the first. Each GOP's frames come out in order, all
     // of the second's before the first's: frames held for reordering go
