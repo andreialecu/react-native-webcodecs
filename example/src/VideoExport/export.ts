@@ -28,6 +28,8 @@ import {
   VideoSampleSource,
 } from "mediabunny";
 
+import app from "../../app.json";
+
 import { AV1_MAIN10, HEVC_MAIN10, HLG_COLOR_SPACE, HlgRenderer } from "./hdr";
 
 // The export on iOS and Android: Skia draws each frame of the animation into
@@ -66,7 +68,17 @@ export const assetBytes = async (asset: number) => {
   if (!source) {
     throw new Error("Asset not found");
   }
-  const response = await fetch(source.uri);
+  // A release build on Android bundles the asset as a raw resource and gives
+  // its name, not a URL. fetch() reads non-HTTP URIs through the
+  // ContentResolver, which opens android.resource:// URIs.
+  const uri =
+    Platform.OS === "android" && !source.uri.includes(":")
+      ? `android.resource://${app.android.package}/raw/${source.uri}`
+      : source.uri;
+  const response = await fetch(uri);
+  if (!response.ok) {
+    throw new Error(`Could not load ${uri}: ${response.status}`);
+  }
   return new Uint8Array(await response.arrayBuffer());
 };
 
