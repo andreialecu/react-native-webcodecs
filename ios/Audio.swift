@@ -307,10 +307,6 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
   private var failed = false
   // flush(): the input procedure ends the stream when it has nothing more.
   private var endOfStream = false
-  // What flush() makes a new converter from.
-  private let sourceFormat: AudioStreamBasicDescription
-  private let destinationFormat: AudioStreamBasicDescription
-  private let cookie: Data?
 
   init(
     config: NativeAudioDecoderConfig,
@@ -335,9 +331,6 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
     if source.mChannelsPerFrame == 0 { source.mChannelsPerFrame = UInt32(config.numberOfChannels) }
     framesPerPacket = max(Int(source.mFramesPerPacket), 1024)
     let destination = floatFormat(sampleRate: source.mSampleRate, channels: Int(source.mChannelsPerFrame))
-    sourceFormat = source
-    destinationFormat = destination
-    self.cookie = cookie
     let converter = try makeConverter(source, destination, cookie)
     // What the converter outputs, which the AudioData say.
     var current = destination
@@ -455,19 +448,7 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
       // (MDCT and SBR state), as after a seek.
       self.endOfStream = true
       self.pull()
-      // A new converter, not AudioConverterReset: after the end of the
-      // stream, a reset converter put out nothing more on the CI Simulator.
-      if let old = self.converter {
-        do {
-          self.converter = try makeConverter(
-            self.sourceFormat, self.destinationFormat, self.cookie)
-        } catch {
-          self.failed = true
-          self.error(errorMessage("EncodingError", "audio-failed", "\(error)"))
-          return
-        }
-        AudioConverterDispose(old)
-      }
+      if let converter = self.converter { AudioConverterReset(converter) }
       self.endOfStream = false
       self.packet = nil
       // A later decode() may jump: start timing from its timestamp again.
