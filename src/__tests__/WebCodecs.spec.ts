@@ -519,6 +519,7 @@ const runOnDevice = async <R>(
     example: any;
     mediabunny: any;
     webcodecs: any;
+    device: GPUDevice;
     ctx: any;
   }) => Promise<R>,
   ctx: object,
@@ -526,12 +527,14 @@ const runOnDevice = async <R>(
 ): Promise<R> => {
   const key = `__e2e_${Math.random().toString(36).slice(2)}`;
   await client.eval(
-    ({ example, mediabunny, webcodecs, ctx: c }) => {
+    ({ example, mediabunny, webcodecs, device, ctx: c }) => {
       const g = globalThis as any;
       const run = eval(`(${c.fn})`);
       g[c.key] = null;
       Promise.resolve()
-        .then(() => run({ example, mediabunny, webcodecs, ctx: c.args }))
+        .then(() =>
+          run({ example, mediabunny, webcodecs, device, ctx: c.args }),
+        )
         .then(
           (value: any) => (g[c.key] = { value }),
           (e: any) => (g[c.key] = { error: String((e && e.stack) || e) }),
@@ -3878,6 +3881,9 @@ describe("react-native-webcodecs + Mediabunny", () => {
       packets: { timestamp: number; key: boolean }[];
       // Each run's output timestamps, in output order.
       runs: number[][];
+      // With `grids`: each output frame's mean luma (0-255) over a 16x16
+      // grid, by timestamp, per run.
+      grids: Record<string, number[]>[];
       errors: string[];
     }
 
@@ -3919,9 +3925,9 @@ describe("react-native-webcodecs + Mediabunny", () => {
     // Decodes `runs` of GOPs (each a list of [first, end) GOP ranges, in
     // that order, without a flush between them), each run followed by a
     // flush, with one decoder.
-    const decodeRuns = (file: string, runs: number[][][]) =>
+    const decodeRuns = (file: string, runs: number[][][], grids = false) =>
       runOnDevice<Runs>(
-        ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+        ({ mediabunny: mb, webcodecs: wc, device, ctx }) => {
           const input = new mb.Input({
             source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
             formats: mb.ALL_FORMATS,
@@ -3930,7 +3936,67 @@ describe("react-native-webcodecs + Mediabunny", () => {
             supported: false,
             packets: [],
             runs: [],
+            grids: [],
             errors: [],
+          };
+          // The frame (through WebGPU, as an app draws it), as the mean
+          // luma of each cell of a 16x16 grid.
+          const grid = (frame: any): Promise<number[]> => {
+            const width = frame.displayWidth;
+            const height = frame.displayHeight;
+            const buffer = RNWebGPU.createNativeBufferFromPointer(
+              frame.pixelBuffer,
+              { colorSpace: frame.colorSpace.toJSON() },
+            );
+            const texture = device.createTexture({
+              size: [width, height],
+              format: "rgba8unorm",
+              usage:
+                GPUTextureUsage.RENDER_ATTACHMENT |
+                GPUTextureUsage.COPY_SRC |
+                GPUTextureUsage.TEXTURE_BINDING,
+            });
+            device.queue.copyExternalImageToTexture(
+              { source: buffer },
+              { texture },
+              [width, height],
+            );
+            const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+            const readback = device.createBuffer({
+              size: bytesPerRow * height,
+              usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+            });
+            const encoder = device.createCommandEncoder();
+            encoder.copyTextureToBuffer(
+              { texture },
+              { buffer: readback, bytesPerRow },
+              [width, height],
+            );
+            device.queue.submit([encoder.finish()]);
+            return readback.mapAsync(GPUMapMode.READ).then(() => {
+              buffer.release();
+              frame.close();
+              const data = new Uint8Array(readback.getMappedRange());
+              const sums = new Array(256).fill(0);
+              const counts = new Array(256).fill(0);
+              for (let y = 0; y < height; y += 2) {
+                for (let x = 0; x < width; x += 2) {
+                  const o = y * bytesPerRow + x * 4;
+                  const cell =
+                    Math.floor((y * 16) / height) * 16 +
+                    Math.floor((x * 16) / width);
+                  sums[cell] +=
+                    0.299 * data[o]! +
+                    0.587 * data[o + 1]! +
+                    0.114 * data[o + 2]!;
+                  counts[cell]++;
+                }
+              }
+              readback.unmap();
+              readback.destroy();
+              texture.destroy();
+              return sums.map((v, i) => Math.round(v / counts[i]));
+            });
           };
           return input.getPrimaryVideoTrack().then((track: any) =>
             track.getDecoderConfig().then((config: any) =>
@@ -3960,10 +4026,29 @@ describe("react-native-webcodecs + Mediabunny", () => {
                     return read();
                   });
                 let current: number[] = [];
+                let currentGrids: Record<string, number[]> = {};
+                let sampling: Promise<void> = Promise.resolve();
                 const decoder = new wc.VideoDecoder({
                   output: (frame: any) => {
                     current.push(frame.timestamp);
-                    frame.close();
+                    if (!ctx.grids) {
+                      frame.close();
+                      return;
+                    }
+                    if (!(frame.duration > 0)) {
+                      result.errors.push(`no duration at ${frame.timestamp}`);
+                    }
+                    const into = currentGrids;
+                    sampling = sampling
+                      .then(() => grid(frame))
+                      .then(
+                        (g) => {
+                          into[String(frame.timestamp)] = g;
+                        },
+                        (e: any) => {
+                          result.errors.push(`grid: ${e}`);
+                        },
+                      );
                   },
                   error: (e: any) => result.errors.push(String(e)),
                 });
@@ -3984,6 +4069,8 @@ describe("react-native-webcodecs + Mediabunny", () => {
                   }
                   current = [];
                   result.runs.push(current);
+                  currentGrids = {};
+                  result.grids.push(currentGrids);
                   order.length = 0;
                   ctx.runs[n].forEach((range: number[]) => {
                     const end =
@@ -3999,6 +4086,7 @@ describe("react-native-webcodecs + Mediabunny", () => {
                     .catch((e: any) => {
                       result.errors.push(`flush: ${e}`);
                     })
+                    .then(() => sampling)
                     .then(() => run(n + 1));
                 };
                 return read()
@@ -4014,7 +4102,7 @@ describe("react-native-webcodecs + Mediabunny", () => {
             ),
           );
         },
-        { file, runs },
+        { file, runs, grids },
         120000,
       );
 
@@ -4088,32 +4176,48 @@ describe("react-native-webcodecs + Mediabunny", () => {
         "-sc_threshold",
         "0",
       ]);
-      const decoded = await decodeRuns(file, [
+      // The second GOP then the first without a flush; then each GOP on
+      // its own (from a flushed decoder), for what each frame looks like.
+      const decoded = await decodeRuns(
+        file,
         [
-          [1, 2],
-          [0, 1],
+          [
+            [1, 2],
+            [0, 1],
+          ],
+          [[0, 1]],
+          [[1, 2]],
         ],
-      ]);
-      console.log(`back in time: ${JSON.stringify(decoded)}`);
+        true,
+      );
+      console.log(
+        `back in time: ${JSON.stringify({ ...decoded, grids: undefined })}`,
+      );
       if (!decoded.supported) {
         return;
       }
       const times = (gop: number) =>
         sorted(gopOf(decoded.packets, gop).map((p) => p.timestamp));
-      if (!ios()) {
-        // Android (c2 decoders on the emulator) puts out the first GOP in
-        // decode order and holds the second GOP's last frames until the
-        // end of the stream; every frame still comes out, once.
-        expect(decoded.errors).toEqual([]);
-        expect(sorted(decoded.runs[0])).toEqual(
-          sorted(times(1).concat(times(0))),
-        );
-        return;
-      }
       expect({ errors: decoded.errors, frames: decoded.runs[0] }).toEqual({
         errors: [],
         frames: times(1).concat(times(0)),
       });
+      // Each picture is the one its timestamp says: closest to the frame of
+      // that timestamp decoded on its own.
+      const reference = { ...decoded.grids[1], ...decoded.grids[2] };
+      const distance = (a: number[], b: number[]) =>
+        a.reduce((sum, v, i) => sum + Math.abs(v - b[i]!), 0);
+      const pictures = decoded.runs[0]!.map((t) => {
+        const got = decoded.grids[0]![String(t)]!;
+        let best = "";
+        Object.entries(reference).forEach(([key, want]) => {
+          if (!best || distance(got, want) < distance(got, reference[best]!)) {
+            best = key;
+          }
+        });
+        return best;
+      });
+      expect(pictures).toEqual(decoded.runs[0]!.map(String));
     }, 300000);
   });
 
