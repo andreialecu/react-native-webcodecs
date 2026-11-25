@@ -85,14 +85,64 @@ jobs:
       - name: Install xcpretty
         run: command -v xcpretty >/dev/null || sudo gem install xcpretty --no-document
 
+      # The compilation cache is only valid for the Xcode that wrote it. It
+      # lives outside the checkout so that Jest and ESLint never walk it.
+      - name: Show Xcode version
+        id: xcode
+        run: |
+          xcodebuild -version
+          echo "build=$(xcodebuild -version | awk '/Build version/ { print $3 }')" >> "$GITHUB_OUTPUT"
+          echo "XCODE_CAS=$RUNNER_TEMP/xcode-cas" >> "$GITHUB_ENV"
+
+      # Pods holds the React Native, Hermes and Skia prebuilts unpacked, which
+      # is most of pod install's time. pod install still runs and brings Pods
+      # in line with the Podfile when anything differs.
+      - name: Restore Pods
+        id: pods
+        uses: actions/cache/restore@v4
+        with:
+          path: example/ios/Pods
+          key: pods-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('example/ios/Podfile', 'example/ios/Podfile.lock', 'yarn.lock') }}
+
       - name: Install CocoaPods
         working-directory: example/ios
         run: pod install
 
+      - name: Save Pods
+        if: steps.pods.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: example/ios/Pods
+          key: ${{ steps.pods.outputs.cache-primary-key }}
+
+      # Asks Metro for the bundle the app will load while Xcode builds, so the
+      # first launch does not wait for it. The URL is the one the debug app
+      # requests; a different one would bundle with other options and warm
+      # nothing.
       - name: Start Package Manager
         working-directory: example
-        run: CI=true yarn start --port $METRO_PORT --reset-cache &
+        run: |
+          CI=true yarn start --port "$METRO_PORT" --reset-cache &
+          (
+            until curl -sf "http://localhost:$METRO_PORT/status" > /dev/null; do sleep 1; done
+            curl -sf -o /dev/null "http://localhost:$METRO_PORT/index.bundle?platform=ios&dev=true&lazy=true&minify=false&inlineSourceMap=false&modulesOnly=false&runModule=true&excludeSource=true&sourcePaths=url-server&app=com.reactnativewebcodecs.example"
+          ) > /dev/null 2>&1 &
 
+      # Xcode's compilation cache stores each compile's output under a hash of
+      # all its inputs (sources, headers, flags, compiler), so a stale entry is
+      # never used: anything that changed is a miss and compiles as usual.
+      - name: Restore compilation cache
+        id: cas
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.XCODE_CAS }}
+          key: xcode-cas-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.build }}-${{ hashFiles('example/ios/Podfile.lock', 'yarn.lock') }}
+          restore-keys: |
+            xcode-cas-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.build }}-
+
+      # The runner is Apple silicon, so only arm64 is built: the generic
+      # destination alone would build x86_64 as well. The raw log is kept to
+      # count the compilation cache hits.
       - name: Build example for iOS
         working-directory: example/ios
         run: |
@@ -103,9 +153,26 @@ jobs:
             -sdk iphonesimulator \
             -destination "generic/platform=iOS Simulator" \
             -derivedDataPath build \
+            ARCHS=arm64 \
             COMPILER_INDEX_STORE_ENABLE=NO \
-            build | xcpretty
+            COMPILATION_CACHE_ENABLE_CACHING=YES \
+            COMPILATION_CACHE_CAS_PATH="$XCODE_CAS" \
+            COMPILATION_CACHE_ENABLE_DIAGNOSTIC_REMARKS=YES \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | xcpretty
+          echo "Compilation cache: $(grep -c '^Cache hit' "$RUNNER_TEMP/xcodebuild.log") hits, $(grep -c '^Cache miss' "$RUNNER_TEMP/xcodebuild.log") misses, $(du -sh "$XCODE_CAS" | cut -f1)"
 
+      # Saved right after the build, so a failing e2e run still keeps it.
+      - name: Save compilation cache
+        if: steps.cas.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.XCODE_CAS }}
+          key: ${{ steps.cas.outputs.cache-primary-key }}
+
+      # Booted only now, not in the background during the earlier steps: on
+      # the runner a booting simulator slowed the steps running beside it for
+      # minutes (unpacking Node.js went from 5 s to over a minute), more than
+      # the boot itself takes.
       - name: Prepare iOS simulator
         run: |
           RUNTIME=$(xcrun simctl list runtimes available --json | jq -r '
@@ -115,8 +182,8 @@ jobs:
             .devicetypes | map(select(.name | test("^iPhone [0-9]+ Pro$")))
             | sort_by(.name | capture("^iPhone (?<n>[0-9]+) Pro$").n | tonumber) | last | .identifier')
           UDID=$(xcrun simctl create "$IOS_SIMULATOR" "$DEVICE_TYPE" "$RUNTIME")
-          echo "IOS_SIMULATOR_UDID=$UDID" >> $GITHUB_ENV
-          echo "SIMULATOR_UDID=$UDID" >> $GITHUB_ENV
+          echo "IOS_SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
+          echo "SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
 
