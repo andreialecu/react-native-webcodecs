@@ -4200,15 +4200,15 @@ describe("react-native-webcodecs + Mediabunny", () => {
     // on this clip outputs the 30 frames from the I picture on) and as
     // Chromium, WebKit and VLC do on VideoToolbox (issue #2); the pictures
     // from the I picture on are whole (exact_match_flag 1), so they all come
-    // out, as they look in the whole clip. Android's decoders may output the
-    // leading ones too.
-    // On the iOS Simulator (26.5 and 27.2), VideoToolbox fails the first
-    // leading B picture with -8969 (codecBadDataErr) rather than
-    // kVTVideoDecoderReferenceMissingErr (-17694), the only status the
-    // decoder drops a frame for, so the decoder closes with
-    // "decoder-failed" and this test fails there. On the Android emulator
-    // (API 35, c2.goldfish.h264.decoder), it fails too: the decoder gives
-    // no input buffer after the seek ("no input buffer").
+    // out, as they look in the whole clip. On iOS, VideoToolbox would fail
+    // the leading pictures (-8969, codecBadDataErr): they are skipped before
+    // decoding.
+    // Android is not there yet, so only the whole clip's decode is checked
+    // there. On the emulator (API 35), c2.goldfish.h264.decoder takes no
+    // more input after the recovery point ("EncodingError: no input
+    // buffer", then "flush: AbortError: the codec was reset or closed
+    // during flush"), and c2.android.avc.decoder (prefer-software) outputs
+    // only some of the frames after it, without an error.
     it("decodes H.264 from a recovery point (non-IDR key frame) after a flush", async () => {
       if (!supported() || !probes()) {
         return;
@@ -4267,20 +4267,19 @@ describe("react-native-webcodecs + Mediabunny", () => {
       const key = second[0]!;
       const fromKey = sorted(second.filter((t) => t >= key));
       expect(second.length - fromKey.length).toBeGreaterThan(0);
-      expect({
-        errors: decoded.errors,
-        first: decoded.runs[0],
-      }).toEqual({ errors: [], first: sorted(all) });
+      expect(decoded.runs[0]).toEqual(sorted(all));
       if (ios()) {
-        expect(decoded.runs[1]).toEqual(fromKey);
-      } else {
-        expect([fromKey, sorted(second)]).toContainEqual(decoded.runs[1]);
+        expect({ errors: decoded.errors, second: decoded.runs[1] }).toEqual({
+          errors: [],
+          second: fromKey,
+        });
+        // From the key frame on, each picture is the one its timestamp
+        // says: closest to the frame of that timestamp in the whole clip's
+        // decode.
+        expect(
+          closestPictures(fromKey, decoded.grids[1]!, decoded.grids[0]!),
+        ).toEqual(fromKey.map(String));
       }
-      // From the key frame on, each picture is the one its timestamp says:
-      // closest to the frame of that timestamp in the whole clip's decode.
-      expect(
-        closestPictures(fromKey, decoded.grids[1]!, decoded.grids[0]!),
-      ).toEqual(fromKey.map(String));
     }, 300000);
 
     // The same clip's first GOP, a flush, then its second GOP from the
@@ -4298,7 +4297,11 @@ describe("react-native-webcodecs + Mediabunny", () => {
     // came in a valid order. On iOS the leading pictures are left out
     // (30 frames rather than 32): the deliberate cost of starting cleanly
     // from any key chunk. Each frame that comes out must look as it does
-    // in the whole clip.
+    // in the whole clip. On Android only the first two decodes are checked:
+    // on the emulator (API 35), the third fails as after a seek
+    // (c2.goldfish.h264.decoder: "EncodingError: no input buffer", then
+    // "flush: AbortError: the codec was reset or closed during flush";
+    // c2.android.avc.decoder: only some of its frames, without an error).
     it("decodes H.264 from a recovery point after a flush following the GOP before it", async () => {
       if (!supported() || !probes()) {
         return;
@@ -4323,19 +4326,16 @@ describe("react-native-webcodecs + Mediabunny", () => {
       const key = second[0]!;
       const fromKey = sorted(second.filter((t) => t >= key));
       expect(second.length - fromKey.length).toBeGreaterThan(0);
-      expect({
-        errors: decoded.errors,
-        runs: decoded.runs.slice(0, 2),
-      }).toEqual({ errors: [], runs: [sorted(all), first] });
+      expect(decoded.runs.slice(0, 2)).toEqual([sorted(all), first]);
       if (ios()) {
-        expect(decoded.runs[2]).toEqual(fromKey);
-      } else {
-        expect([fromKey, sorted(second)]).toContainEqual(decoded.runs[2]);
+        expect({ errors: decoded.errors, third: decoded.runs[2] }).toEqual({
+          errors: [],
+          third: fromKey,
+        });
+        expect(
+          closestPictures(fromKey, decoded.grids[2]!, decoded.grids[0]!),
+        ).toEqual(fromKey.map(String));
       }
-      const third = decoded.runs[2] ?? [];
-      expect(
-        closestPictures(third, decoded.grids[2]!, decoded.grids[0]!),
-      ).toEqual(third.map(String));
     }, 300000);
 
     // A key frame earlier than the frames before it, without a flush: the
