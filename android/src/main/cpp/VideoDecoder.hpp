@@ -172,11 +172,7 @@ public:
       i += length;
     }
     int64_t ts = static_cast<int64_t>(timestamp);
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _durations[ts] = duration;
-    }
-    _input.post([this, annexB = std::move(annexB), ts, key] {
+    _input.post([this, annexB = std::move(annexB), ts, duration, key] {
       // A key frame earlier than a chunk before it (a GOP that goes back in
       // time, without a flush): a new stream, as on iOS. The frames still
       // held for reordering go out first, as a flush puts them out, and the
@@ -184,10 +180,18 @@ public:
       // emulator's) held the previous GOP's last frames until the end of
       // the stream and put out the earlier GOP in decoding order (right
       // pictures, wrong order).
-      if (key && _queuedSinceFlush > 0 && ts < _latestQueued) {
+      if (key && ts < _latestQueued) {
         if (!drainCodec()) {
           return;
         }
+      }
+      {
+        // Here, after any drain or earlier flush, not on the JS thread:
+        // takeDuration() drops every entry up to the picture put out, which
+        // would take those of a GOP going back in time while the GOP before
+        // it still comes out.
+        std::lock_guard<std::mutex> lock(_mutex);
+        _durations[ts] = duration;
       }
       queueInput(annexB.data(), annexB.size(), ts, key ? kBufferFlagKeyFrame : 0);
     });
@@ -493,8 +497,7 @@ private:
       return 0;
     }
     double duration = it->second;
-    // Only this one: those before it may be a GOP queued to go back in time.
-    _durations.erase(it);
+    _durations.erase(_durations.begin(), std::next(it));
     return duration;
   }
 
@@ -590,7 +593,8 @@ private:
   std::thread _drain;
   // Chunks queued since configure() or the last flush (the input thread's).
   int64_t _queuedSinceFlush = 0;
-  // The latest timestamp queued since then (the input thread's).
+  // The latest timestamp queued since then, INT64_MIN when none (the input
+  // thread's).
   int64_t _latestQueued = INT64_MIN;
 
   SerialQueue _input{"wc-vdec-input"};

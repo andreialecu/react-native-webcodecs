@@ -4031,12 +4031,12 @@ describe("react-native-webcodecs + Mediabunny", () => {
                 const decoder = new wc.VideoDecoder({
                   output: (frame: any) => {
                     current.push(frame.timestamp);
-                    if (ctx.grids && !(frame.duration > 0)) {
-                      result.errors.push(`no duration at ${frame.timestamp}`);
-                    }
                     if (!ctx.grids) {
                       frame.close();
                       return;
+                    }
+                    if (!(frame.duration > 0)) {
+                      result.errors.push(`no duration at ${frame.timestamp}`);
                     }
                     const into = currentGrids;
                     sampling = sampling
