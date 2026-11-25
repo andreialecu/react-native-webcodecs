@@ -177,7 +177,9 @@ export class VideoFrame {
    *   a decoder. The frame takes it over: close the frame, not the surface.
    * - `new VideoFrame({ handle }, init)`: any native surface handle, such as
    *   a react-native-webgpu NativeBuffer. The frame takes its own reference,
-   *   so the source can be released right after. On Android, encode()
+   *   so the source can be released right after. On iOS it also keeps the
+   *   producer's pool from reusing the surface until the frame is closed:
+   *   frames held open can starve a camera's pool. On Android, encode()
    *   returns once such a frame has been read, so its producer may then
    *   write into the buffer again (encode() waits for the frames queued
    *   before it).
