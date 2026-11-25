@@ -539,10 +539,15 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
       // in an open-GOP stream, or after any flush or configure): the
       // pictures after it in decoding order but shown before it (leading
       // pictures) may reference frames before it, which the decoder does
-      // not have. VideoToolbox fails them, with
+      // not have after the reset below. They are skipped, by timestamp,
+      // until the next key frame, as FFmpeg leaves them out after a seek.
+      // They are skipped even when they might decode (a closed GOP whose
+      // key frame is a non-IDR I picture): whether they reference earlier
+      // frames cannot be told without parsing their slices, VideoToolbox
+      // fails a picture with missing references either as
       // kVTVideoDecoderReferenceMissingErr or as bad data (-8969), which
-      // could also be real corruption. So they are skipped, by timestamp,
-      // until the next key frame, as FFmpeg and Chromium leave them out.
+      // could also be real corruption, and a failed picture can leave
+      // later ones decoded against a broken reference.
       // A sample that cannot be read is decoded.
       if let h264NalLength {
         if first {
@@ -586,7 +591,7 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
       // against stale state, silently corrupted (Apple's advice to
       // Chromium, crbug 451536366), or fail it (-12350 for an H.264
       // recovery point after a seek). This is after a flush too: a flush
-      // requires a key frame next (WebCodecs' [[key chunk required]]), and
+      // requires a key chunk next (WebCodecs' [[key chunk required]]), and
       // whether it continues the stream or comes from a seek cannot be
       // told, so it starts one, and its leading pictures are skipped above.
       if first {
