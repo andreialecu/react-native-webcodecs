@@ -294,8 +294,14 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
   private let error: (String) -> Void
   private let queue = DispatchQueue(label: "webcodecs.audio-decoder")
   private var packet: Data?
-  private var packetDescription = AudioStreamPacketDescription()
-  private var held: Data?
+  // The packet the converter reads, and its description: AudioToolbox keeps
+  // both pointers until the next input call, so they must not move. (A
+  // pointer from Data.withUnsafeBytes is only valid inside the closure: for
+  // a packet of 14 bytes or less, such as silent AAC, it points at a
+  // temporary copy.)
+  private var held: UnsafeMutableRawPointer?
+  private let packetDescription = UnsafeMutablePointer<AudioStreamPacketDescription>.allocate(
+    capacity: 1)
   private var start: Double?
   private var framesOut: Int64 = 0
   private var failed = false
@@ -349,6 +355,8 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
   }
 
   deinit {
+    held?.deallocate()
+    packetDescription.deallocate()
     if let converter { AudioConverterDispose(converter) }
   }
 
@@ -360,17 +368,18 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
       packets.pointee = 0
       return endOfStream ? noErr : noMoreInputNow
     }
-    held = packet  // valid until the next call
+    held?.deallocate()
+    let bytes = UnsafeMutableRawPointer.allocate(byteCount: max(packet.count, 1), alignment: 16)
+    packet.copyBytes(to: bytes.assumingMemoryBound(to: UInt8.self), count: packet.count)
+    held = bytes  // valid until the next call
     self.packet = nil
-    packetDescription = AudioStreamPacketDescription(
+    packetDescription.pointee = AudioStreamPacketDescription(
       mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(packet.count))
-    held!.withUnsafeMutableBytes { raw in
-      data.pointee.mNumberBuffers = 1
-      data.pointee.mBuffers.mData = raw.baseAddress
-      data.pointee.mBuffers.mDataByteSize = UInt32(raw.count)
-      data.pointee.mBuffers.mNumberChannels = UInt32(channels)
-    }
-    withUnsafeMutablePointer(to: &packetDescription) { descriptions?.pointee = $0 }
+    data.pointee.mNumberBuffers = 1
+    data.pointee.mBuffers.mData = bytes
+    data.pointee.mBuffers.mDataByteSize = UInt32(packet.count)
+    data.pointee.mBuffers.mNumberChannels = UInt32(channels)
+    descriptions?.pointee = packetDescription
     packets.pointee = 1
     return noErr
   }
@@ -413,14 +422,15 @@ final class HybridNativeAudioDecoder: HybridNativeAudioDecoderSpec {
             Unmanaged.passUnretained(self).toOpaque(), &frames, &list, nil)
         }
         total += Int(frames)
-        if status == noMoreInputNow || frames == 0 {
-          done = true
-          break
-        }
-        if status != noErr {
+        // An error first: with 0 frames it would otherwise pass for the end.
+        if status != noErr && status != noMoreInputNow {
           failed = true
           error(errorMessage("EncodingError", "audio-failed", "AudioConverter failed (\(status))"))
           return
+        }
+        if status == noMoreInputNow || frames == 0 {
+          done = true
+          break
         }
       }
       if total > 0 {

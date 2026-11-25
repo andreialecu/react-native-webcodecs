@@ -2311,6 +2311,90 @@ describe("react-native-webcodecs + Mediabunny", () => {
     expect(result.after).toBeLessThan(0.001);
   }, 180000);
 
+  it("decodes AAC packets of a few bytes", async () => {
+    if (!probes()) {
+      return;
+    }
+    // Digital silence: the encoder makes each packet 4 bytes.
+    const file = await soundClip("tone-then-silence.m4a", [
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440:sample_rate=48000:duration=4",
+      "-af",
+      "volume=volume=0:enable='gte(t,2)'",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+    ]);
+    const result = await runOnDevice<any>(
+      ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+        const input = new mb.Input({
+          source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+          formats: mb.ALL_FORMATS,
+        });
+        return input.getPrimaryAudioTrack().then((track: any) =>
+          track.getDecoderConfig().then((config: any) => {
+            const packets: any[] = [];
+            const sink = new mb.EncodedPacketSink(track).packets();
+            const read = (): Promise<void> =>
+              sink.next().then((r: any) => {
+                if (r.done) {
+                  return undefined;
+                }
+                if (r.value.timestamp >= 3 && r.value.timestamp < 3.5) {
+                  packets.push(r.value);
+                }
+                return read();
+              });
+            const errors: string[] = [];
+            let frames = 0;
+            let peak = 0;
+            const decoder = new wc.AudioDecoder({
+              output: (data: any) => {
+                const n = data.numberOfFrames * data.numberOfChannels;
+                const buffer = new Float32Array(n);
+                data.copyTo(buffer, { planeIndex: 0, format: "f32" });
+                for (let i = 0; i < n; i++) {
+                  peak = Math.max(peak, Math.abs(buffer[i]));
+                }
+                frames += data.numberOfFrames;
+                data.close();
+              },
+              error: (e: any) => errors.push(String(e)),
+            });
+            decoder.configure(config);
+            return read()
+              .then(() => {
+                packets.forEach((p: any) =>
+                  decoder.decode(p.toEncodedAudioChunk()),
+                );
+                return decoder.flush();
+              })
+              .then(() => {
+                decoder.close();
+                input.dispose();
+                return {
+                  errors,
+                  frames,
+                  peak,
+                  sizes: packets.map((p: any) => p.byteLength),
+                };
+              });
+          }),
+        );
+      },
+      { file },
+      120000,
+    );
+    expect(result.errors).toEqual([]);
+    expect(result.sizes.length).toBeGreaterThan(10);
+    expect(Math.max(...result.sizes)).toBeLessThanOrEqual(14);
+    expect(result.frames).toBeGreaterThan(0);
+    expect(result.peak).toBeLessThan(0.001);
+  }, 180000);
+
   it("flushes a VideoEncoder given two frames with one timestamp", async () => {
     if (!supported()) {
       return;
