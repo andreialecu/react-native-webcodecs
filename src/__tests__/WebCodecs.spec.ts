@@ -906,6 +906,7 @@ const allocatedCodecs = () =>
     .filter((name): name is string => !!name);
 
 const ios = () => client.OS === "ios";
+const onAndroid = () => client.OS === "android";
 const supported = () => client.OS === "ios" || client.OS === "android";
 
 describe("react-native-webcodecs + Mediabunny", () => {
@@ -4237,6 +4238,206 @@ describe("react-native-webcodecs + Mediabunny", () => {
       } else {
         expect([fromCra, sorted(second)]).toContainEqual(decoded.runs[1]);
       }
+    }, 300000);
+
+    // An x264 open-GOP clip: its second key frame is a recovery point.
+    // What Android's emulator decoder (c2.goldfish.h264.decoder, API 35)
+    // reports when decoding from it after a flush: a known failure, to be
+    // fixed separately.
+    const androidRecoveryPointErrors = [
+      "EncodingError: no input buffer",
+      "flush: AbortError: the codec was reset or closed during flush",
+    ];
+    const h264OpenGopName = "clip-h264-open-gop.mp4";
+    const h264OpenGopClip = () =>
+      gopClip(h264OpenGopName, [
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "high",
+        "-bf",
+        "3",
+        "-x264-params",
+        "open-gop=1:keyint=30:min-keyint=30:scenecut=0:b-pyramid=none:log-level=error",
+      ]);
+    // For each frame of `run` (timestamps), the timestamp of the frame of
+    // `reference` (a decode's grids) it looks most like.
+    const closestPictures = (
+      run: number[],
+      grids: Record<string, number[]>,
+      reference: Record<string, number[]>,
+    ) => {
+      const distance = (a: number[], b: number[]) =>
+        a.reduce((sum, v, i) => sum + Math.abs(v - b[i]!), 0);
+      return run.map((t) => {
+        const got = grids[String(t)]!;
+        let best = "";
+        Object.entries(reference).forEach(([at, want]) => {
+          if (!best || distance(got, want) < distance(got, reference[best]!)) {
+            best = at;
+          }
+        });
+        return best;
+      });
+    };
+
+    // x264's open GOPs (open-gop=1, with B-frames): the second key frame is
+    // not an IDR but an I picture (nal_unit_type 1, slice_type 7) behind a
+    // recovery point SEI (payload type 6, recovery_frame_cnt 0), which the
+    // MP4 lists as a sync sample (stss). The B pictures after it in
+    // decoding order (shown before it, 2 with this host's x264) belong to
+    // the open GOP: they reference pictures of the first GOP. Decoded from
+    // there after a flush, as a seek does, they cannot be decoded. They are
+    // left out, as FFmpeg's decoder does (`ffmpeg -ss 0.99 -noaccurate_seek`
+    // on this clip outputs the 30 frames from the I picture on) and as
+    // Chromium, WebKit and VLC do on VideoToolbox (issue #2); the pictures
+    // from the I picture on are whole (exact_match_flag 1), so they all come
+    // out, without an error, as they look in the whole clip. On iOS the
+    // leading pictures are skipped before decoding.
+    // On Android this records a known failure of the emulator's decoders,
+    // to be fixed separately: the whole clip decodes without an error, then
+    // c2.goldfish.h264.decoder (API 35) takes no more input after the
+    // recovery point, and the run from it is empty. The exact outcome is
+    // checked, so that any change, a fix included, shows up here.
+    it("decodes H.264 from a recovery point (non-IDR key frame) after a flush", async () => {
+      if (!supported() || !probes()) {
+        return;
+      }
+      const name = h264OpenGopName;
+      const file = await h264OpenGopClip();
+      // The second key frame, in the bitstream: a recovery point, not an
+      // IDR.
+      const trace = execFileSync(
+        "sh",
+        [
+          "-c",
+          'ffmpeg -hide_banner -i "$0" -c:v copy -bsf:v trace_headers -f null - 2>&1',
+          path.join(clipDirectory, name),
+        ],
+        { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+      );
+      const keyPackets = trace
+        .split(/^.*Packet: /m)
+        .filter((p) => /^\d+ bytes, key frame/.test(p));
+      const values = (packet: string, field: string) =>
+        Array.from(
+          packet.matchAll(
+            new RegExp(`\\s${field}\\s+[01]+\\s*=\\s*(\\d+)`, "g"),
+          ),
+          (m) => Number(m[1]),
+        );
+      const recovery = keyPackets[1] ?? "";
+      expect({
+        first: values(keyPackets[0] ?? "", "nal_unit_type").includes(5),
+        idr: values(recovery, "nal_unit_type").includes(5),
+        slice: values(recovery, "nal_unit_type").includes(1),
+        sei: values(recovery, "last_payload_type_byte").includes(6),
+        // I slices only (slice_type 7: I, as are all the picture's).
+        slices: values(recovery, "slice_type"),
+        recoveryFrameCount: values(recovery, "recovery_frame_cnt"),
+      }).toEqual({
+        first: true,
+        idr: false,
+        slice: true,
+        sei: true,
+        slices: [7],
+        recoveryFrameCount: [0],
+      });
+
+      // The whole clip, then (after a flush) from the second key frame.
+      const decoded = await decodeRuns(file, [[[0, 2]], [[1, 2]]], true);
+      console.log(
+        `recovery point: ${JSON.stringify({ ...decoded, grids: undefined })}`,
+      );
+      if (!decoded.supported) {
+        return;
+      }
+      const all = decoded.packets.map((p) => p.timestamp);
+      const second = gopOf(decoded.packets, 1).map((p) => p.timestamp);
+      const key = second[0]!;
+      const fromKey = sorted(second.filter((t) => t >= key));
+      expect(second.length - fromKey.length).toBeGreaterThan(0);
+      expect(decoded.runs[0]).toEqual(sorted(all));
+      if (onAndroid()) {
+        // Known failure (see above): errors only once the recovery point
+        // is decoded, as the whole clip's run is complete.
+        expect({ errors: decoded.errors, runs: decoded.runs }).toEqual({
+          errors: androidRecoveryPointErrors,
+          runs: [sorted(all), []],
+        });
+        return;
+      }
+      expect({ errors: decoded.errors, second: decoded.runs[1] }).toEqual({
+        errors: [],
+        second: fromKey,
+      });
+      // From the key frame on, each picture is the one its timestamp says:
+      // closest to the frame of that timestamp in the whole clip's decode.
+      expect(
+        closestPictures(fromKey, decoded.grids[1]!, decoded.grids[0]!),
+      ).toEqual(fromKey.map(String));
+    }, 300000);
+
+    // The same clip's first GOP, a flush, then its second GOP from the
+    // recovery point: playback that flushes at a GOP boundary and goes on.
+    // flush() sets [[key chunk required]] (WebCodecs, VideoDecoder flush()
+    // step 2), so the chunk after it must be a key chunk. The recovery
+    // point is one: the MP4 lists it as a sync sample, and Chromium takes
+    // an H.264 chunk with a recovery point SEI as a key chunk too
+    // (ParseH264KeyFrame, third_party/blink/renderer/modules/webcodecs/
+    // video_decoder.cc). A decoder cannot tell this from a seek to the same
+    // chunk, so it may start there as from any key chunk: the leading B
+    // pictures, which reference the first GOP, may be left out, as after a
+    // seek, or output, as the spec allows. Chromium's H264Decoder::Flush()
+    // outputs the pictures it holds and clears its DPB
+    // (media/gpu/h264_decoder.cc). The chunks are valid and come in a valid
+    // order, so there is no error, and each frame that comes out looks as
+    // it does in the whole clip.
+    // On Android this records the same known failure of the emulator's
+    // decoder as after a seek (see above): the first two decodes are
+    // complete, the third is empty.
+    it("decodes H.264 from a recovery point after a flush following the GOP before it", async () => {
+      if (!supported() || !probes()) {
+        return;
+      }
+      const file = await h264OpenGopClip();
+      // The whole clip (for what each frame looks like), then the first
+      // GOP, then the second, each followed by a flush.
+      const decoded = await decodeRuns(
+        file,
+        [[[0, 2]], [[0, 1]], [[1, 2]]],
+        true,
+      );
+      console.log(
+        `recovery point after its GOP: ${JSON.stringify({ ...decoded, grids: undefined })}`,
+      );
+      if (!decoded.supported) {
+        return;
+      }
+      const all = decoded.packets.map((p) => p.timestamp);
+      const first = sorted(gopOf(decoded.packets, 0).map((p) => p.timestamp));
+      const second = gopOf(decoded.packets, 1).map((p) => p.timestamp);
+      const key = second[0]!;
+      const fromKey = sorted(second.filter((t) => t >= key));
+      expect(second.length - fromKey.length).toBeGreaterThan(0);
+      expect(decoded.runs.slice(0, 2)).toEqual([sorted(all), first]);
+      if (onAndroid()) {
+        // Known failure (see above): errors only once the recovery point
+        // is decoded, as the first two runs are complete.
+        expect({ errors: decoded.errors, runs: decoded.runs }).toEqual({
+          errors: androidRecoveryPointErrors,
+          runs: [sorted(all), first, []],
+        });
+        return;
+      }
+      // The frames from the key frame on, with or without the leading
+      // pictures.
+      const third = decoded.runs[2] ?? [];
+      expect(decoded.errors).toEqual([]);
+      expect([fromKey, sorted(second)]).toContainEqual(third);
+      expect(
+        closestPictures(third, decoded.grids[2]!, decoded.grids[0]!),
+      ).toEqual(third.map(String));
     }, 300000);
 
     // A key frame earlier than the frames before it, without a flush: the
