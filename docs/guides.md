@@ -160,8 +160,9 @@ frame.close();
 | Android | The decoder's own YUV (NV12) `AHardwareBuffer`. It can be wider or taller than the frame (software decoders pad the width to a multiple of 128): the picture is its top-left `codedWidth` x `codedHeight`, so sample only that. |
 
 The frame's `colorSpace` comes from the stream (Mediabunny passes the
-track's to `configure`). Android's buffers carry no color information of
-their own, so pass it to `createNativeBufferFromPointer`: without it,
+track's to `configure`; on Android, what the config leaves out is what the
+decoder reads in the stream). Android's buffers carry no color information
+of their own, so pass it to `createNativeBufferFromPointer`: without it,
 BT.709 video is read with the BT.601 matrix, and pure red comes out as
 (225, 0, 31). The option takes react-native-webgpu 0.26.0 or later, and
 names color spaces as Dawn does (`"rec709"`, `range: "narrow"`), not as

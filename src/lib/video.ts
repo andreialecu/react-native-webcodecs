@@ -862,16 +862,23 @@ export class VideoDecoder extends CodecBase {
       frame.surface.release();
       return;
     }
-    // RGB pictures were converted from the stream's YCbCr to full range,
-    // whatever range the stream has; NV12 ones keep the stream's tags.
+    // The config's color space, and for what it leaves out, the stream's as
+    // the decoder reports it (Android), as in WebCodecs. RGB pictures were
+    // converted from the stream's YCbCr to full range, whatever range the
+    // stream has; NV12 ones keep the stream's tags.
+    const given = this._colorSpace;
+    const stream = frame.colorSpace;
     const rgb =
       frame.surface.format === "BGRA" || frame.surface.format === "RGBA";
     const videoFrame = new VideoFrame(frame.surface, {
       timestamp: frame.timestamp,
       duration: frame.duration || undefined,
-      colorSpace: rgb
-        ? { ...this._colorSpace, fullRange: true }
-        : this._colorSpace,
+      colorSpace: {
+        primaries: given?.primaries ?? stream?.primaries,
+        transfer: given?.transfer ?? stream?.transfer,
+        matrix: given?.matrix ?? stream?.matrix,
+        fullRange: rgb ? true : (given?.fullRange ?? stream?.fullRange),
+      },
     });
     try {
       this._output(videoFrame);

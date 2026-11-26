@@ -122,6 +122,9 @@ export interface NativeDecodedFrame {
   surface: NativeSurface;
   timestamp: number;
   duration: number;
+  // The stream's color space as the decoder reports it (Android: the output
+  // format's color aspects, from the VUI); unset members it does not know.
+  colorSpace?: NativeColorSpace;
 }
 
 export interface NativeVideoDecoder extends HybridObject<Native> {

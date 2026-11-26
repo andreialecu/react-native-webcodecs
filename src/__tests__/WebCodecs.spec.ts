@@ -3856,6 +3856,113 @@ describe("react-native-webcodecs + Mediabunny", () => {
     });
   }, 300000);
 
+  // A config without a colorSpace (a VideoDecoder used without Mediabunny):
+  // the frames have the stream's own, from its VUI, not BT.709. Members the
+  // config gives win over the stream's, as in WebCodecs. Android only for
+  // now: iOS takes the config's.
+  it("gives decoded frames the stream's color space when the config has none (Android)", async () => {
+    if (client.OS !== "android" || !probes()) {
+      return;
+    }
+    const clip = path.join(clipDirectory, "clip-bt601-full.mp4");
+    fs.mkdirSync(clipDirectory, { recursive: true });
+    if (!fs.existsSync(clip)) {
+      execFileSync("ffmpeg", [
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=red:s=320x240:r=30:d=0.5",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuvj420p",
+        // In the VUI: -color_primaries and -color_trc leave them unspecified.
+        "-x264-params",
+        "colorprim=smpte170m:transfer=smpte170m:colormatrix=smpte170m:fullrange=on",
+        clip,
+      ]);
+    }
+    const file = await pushFile(clip);
+    const decoded = await runOnDevice<{
+      errors: string[];
+      stream: unknown;
+      overridden: unknown;
+    }>(
+      ({ mediabunny: mb, webcodecs: wc, ctx }) => {
+        const input = new mb.Input({
+          source: new mb.CustomSource(wc.fileSourceOptions(ctx.file)),
+          formats: mb.ALL_FORMATS,
+        });
+        const errors: string[] = [];
+        // The first frame's colorSpace, decoding with `config`.
+        const firstColorSpace = (track: any, config: any) => {
+          let first: any = null;
+          const decoder = new wc.VideoDecoder({
+            output: (frame: any) => {
+              first = first || frame.colorSpace.toJSON();
+              frame.close();
+            },
+            error: (e: any) => errors.push(`decoder: ${e}`),
+          });
+          decoder.configure(config);
+          const packets = new mb.EncodedPacketSink(track).packets();
+          const step = (): Promise<void> =>
+            packets.next().then((r: any) => {
+              if (r.done) {
+                return undefined;
+              }
+              decoder.decode(r.value.toEncodedVideoChunk());
+              return step();
+            });
+          return step()
+            .then(() => decoder.flush())
+            .then(() => {
+              decoder.close();
+              return first;
+            });
+        };
+        return input.getPrimaryVideoTrack().then((track: any) =>
+          track.getDecoderConfig().then((trackConfig: any) => {
+            const config = Object.assign({}, trackConfig);
+            delete config.colorSpace;
+            return firstColorSpace(track, config).then((stream: any) =>
+              firstColorSpace(
+                track,
+                Object.assign({}, config, {
+                  colorSpace: { matrix: "bt709" },
+                }),
+              ).then((overridden: any) => {
+                input.dispose();
+                return { errors, stream, overridden };
+              }),
+            );
+          }),
+        );
+      },
+      { file },
+      120000,
+    );
+    console.log(`stream color space: ${JSON.stringify(decoded)}`);
+    expect(decoded).toEqual({
+      errors: [],
+      stream: {
+        primaries: "smpte170m",
+        transfer: "smpte170m",
+        matrix: "smpte170m",
+        fullRange: true,
+      },
+      overridden: {
+        primaries: "smpte170m",
+        transfer: "smpte170m",
+        matrix: "bt709",
+        fullRange: true,
+      },
+    });
+  }, 300000);
+
   // A config without codedWidth/codedHeight (allowed: the avcC has the
   // size): the decoder must still take a 4K key frame. Sized for 1920x1080,
   // Android's software decoder has 2 MiB input buffers, and this key frame

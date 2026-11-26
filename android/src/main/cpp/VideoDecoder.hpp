@@ -11,6 +11,7 @@
 #include <map>
 
 #include "HybridNativeVideoDecoderSpec.hpp"
+#include "NativeColorSpace.hpp"
 #include "NativeDecodedFrame.hpp"
 #include "Capabilities.hpp"
 #include "NativeVideoDecoderConfig.hpp"
@@ -18,6 +19,59 @@
 #include "VideoEncoder.hpp"
 
 namespace margelo::nitro::webcodecs {
+
+// MediaFormat's color aspects (KEY_COLOR_STANDARD, _TRANSFER, _RANGE) as a
+// WebCodecs color space. 0 (unspecified) and values WebCodecs has no name for
+// leave the member out. SDR video's transfer is BT.601's or BT.709's curve,
+// the same one, named after the standard.
+inline NativeColorSpace colorSpaceOf(int32_t standard, int32_t transfer, int32_t range) {
+  NativeColorSpace colorSpace;
+  bool bt601 = false;
+  switch (standard) {
+    case 1:  // BT.709
+      colorSpace.primaries = "bt709";
+      colorSpace.matrix = "bt709";
+      break;
+    case 2:  // BT.601 625 (PAL)
+    case 3:  // BT.601 625, unadjusted
+      colorSpace.primaries = "bt470bg";
+      colorSpace.matrix = "bt470bg";
+      bt601 = true;
+      break;
+    case 4:  // BT.601 525 (NTSC)
+    case 5:  // BT.601 525, unadjusted
+      colorSpace.primaries = "smpte170m";
+      colorSpace.matrix = "smpte170m";
+      bt601 = true;
+      break;
+    case 6:  // BT.2020
+      colorSpace.primaries = "bt2020";
+      colorSpace.matrix = "bt2020-ncl";
+      break;
+    default:
+      break;
+  }
+  switch (transfer) {
+    case 1:
+      colorSpace.transfer = "linear";
+      break;
+    case 3:  // SDR video
+      colorSpace.transfer = bt601 ? "smpte170m" : "bt709";
+      break;
+    case 6:
+      colorSpace.transfer = "pq";
+      break;
+    case 7:
+      colorSpace.transfer = "hlg";
+      break;
+    default:
+      break;
+  }
+  if (range == 1 || range == 2) {
+    colorSpace.fullRange = range == 1;
+  }
+  return colorSpace;
+}
 
 struct ReaderOwner {
   AImageReader* reader;
@@ -361,8 +415,11 @@ private:
     while (draining()) {
       AMediaCodecBufferInfo info{};
       ssize_t index = AMediaCodec_dequeueOutputBuffer(_codec, &info, 10000);
-      if (index == AMEDIACODEC_INFO_TRY_AGAIN_LATER || index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED ||
-          index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+      if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+        readColorSpace();
+        continue;
+      }
+      if (index == AMEDIACODEC_INFO_TRY_AGAIN_LATER || index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
         continue;
       }
       if (isCodecError(index)) {
@@ -486,8 +543,33 @@ private:
     // picture is sampled through the buffer's own YCbCr conversion.
     auto surface = std::make_shared<HybridNativeSurface>(ref, -1, static_cast<uint32_t>(std::max(visibleWidth, 0)),
                                                          static_cast<uint32_t>(std::max(visibleHeight, 0)), "NV12");
-    _output(NativeDecodedFrame(surface, static_cast<double>(pts), duration));
+    std::optional<NativeColorSpace> colorSpace;
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      colorSpace = _colorSpace;
+    }
+    _output(NativeDecodedFrame(surface, static_cast<double>(pts), duration, colorSpace));
     countDelivered();
+  }
+
+  // On the drain thread: the color space of the pictures to come, from the
+  // output format's color aspects (the stream's VUI). Pictures come out after
+  // the format change that describes them.
+  void readColorSpace() {
+    AMediaFormat* format = AMediaCodec_getOutputFormat(_codec);
+    if (!format) {
+      return;
+    }
+    int32_t standard = 0;
+    int32_t transfer = 0;
+    int32_t range = 0;
+    AMediaFormat_getInt32(format, "color-standard", &standard);
+    AMediaFormat_getInt32(format, "color-transfer", &transfer);
+    AMediaFormat_getInt32(format, "color-range", &range);
+    AMediaFormat_delete(format);
+    auto colorSpace = colorSpaceOf(standard, transfer, range);
+    std::lock_guard<std::mutex> lock(_mutex);
+    _colorSpace = colorSpace;
   }
 
   double takeDuration(int64_t ts) {
@@ -576,6 +658,8 @@ private:
   std::mutex _mutex;
   std::condition_variable _cv;
   std::map<int64_t, double> _durations;
+  // The stream's color space, as the decoder last reported it.
+  std::optional<NativeColorSpace> _colorSpace;
   int64_t _rendered = 0;
   int64_t _delivered = 0;
   int64_t _acquired = 0;

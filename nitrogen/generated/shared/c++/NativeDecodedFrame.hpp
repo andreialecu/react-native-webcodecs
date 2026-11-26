@@ -30,9 +30,13 @@
 
 // Forward declaration of `HybridNativeSurfaceSpec` to properly resolve imports.
 namespace margelo::nitro::webcodecs { class HybridNativeSurfaceSpec; }
+// Forward declaration of `NativeColorSpace` to properly resolve imports.
+namespace margelo::nitro::webcodecs { struct NativeColorSpace; }
 
 #include <memory>
 #include "HybridNativeSurfaceSpec.hpp"
+#include "NativeColorSpace.hpp"
+#include <optional>
 
 namespace margelo::nitro::webcodecs {
 
@@ -44,10 +48,11 @@ namespace margelo::nitro::webcodecs {
     std::shared_ptr<HybridNativeSurfaceSpec> surface     SWIFT_PRIVATE;
     double timestamp     SWIFT_PRIVATE;
     double duration     SWIFT_PRIVATE;
+    std::optional<NativeColorSpace> colorSpace     SWIFT_PRIVATE;
 
   public:
     NativeDecodedFrame() = default;
-    explicit NativeDecodedFrame(std::shared_ptr<HybridNativeSurfaceSpec> surface, double timestamp, double duration): surface(surface), timestamp(timestamp), duration(duration) {}
+    explicit NativeDecodedFrame(std::shared_ptr<HybridNativeSurfaceSpec> surface, double timestamp, double duration, std::optional<NativeColorSpace> colorSpace): surface(surface), timestamp(timestamp), duration(duration), colorSpace(colorSpace) {}
 
   public:
     friend bool operator==(const NativeDecodedFrame& lhs, const NativeDecodedFrame& rhs) = default;
@@ -65,7 +70,8 @@ namespace margelo::nitro {
       return margelo::nitro::webcodecs::NativeDecodedFrame(
         JSIConverter<std::shared_ptr<margelo::nitro::webcodecs::HybridNativeSurfaceSpec>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "surface"))),
         JSIConverter<double>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "timestamp"))),
-        JSIConverter<double>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "duration")))
+        JSIConverter<double>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "duration"))),
+        JSIConverter<std::optional<margelo::nitro::webcodecs::NativeColorSpace>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "colorSpace")))
       );
     }
     static inline jsi::Value toJSI(jsi::Runtime& runtime, const margelo::nitro::webcodecs::NativeDecodedFrame& arg) {
@@ -73,6 +79,7 @@ namespace margelo::nitro {
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "surface"), JSIConverter<std::shared_ptr<margelo::nitro::webcodecs::HybridNativeSurfaceSpec>>::toJSI(runtime, arg.surface));
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "timestamp"), JSIConverter<double>::toJSI(runtime, arg.timestamp));
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "duration"), JSIConverter<double>::toJSI(runtime, arg.duration));
+      obj.setProperty(runtime, PropNameIDCache::get(runtime, "colorSpace"), JSIConverter<std::optional<margelo::nitro::webcodecs::NativeColorSpace>>::toJSI(runtime, arg.colorSpace));
       return obj;
     }
     static inline bool canConvert(jsi::Runtime& runtime, const jsi::Value& value) {
@@ -86,6 +93,7 @@ namespace margelo::nitro {
       if (!JSIConverter<std::shared_ptr<margelo::nitro::webcodecs::HybridNativeSurfaceSpec>>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "surface")))) return false;
       if (!JSIConverter<double>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "timestamp")))) return false;
       if (!JSIConverter<double>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "duration")))) return false;
+      if (!JSIConverter<std::optional<margelo::nitro::webcodecs::NativeColorSpace>>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "colorSpace")))) return false;
       return true;
     }
   };

@@ -30,6 +30,8 @@ namespace margelo::nitro::webcodecs { struct NativeVideoDecoderConfig; }
 namespace margelo::nitro::webcodecs { class HybridNativeVideoDecoderSpec; }
 // Forward declaration of `NativeDecodedFrame` to properly resolve imports.
 namespace margelo::nitro::webcodecs { struct NativeDecodedFrame; }
+// Forward declaration of `NativeColorSpace` to properly resolve imports.
+namespace margelo::nitro::webcodecs { struct NativeColorSpace; }
 // Forward declaration of `NativeAudioEncoderConfig` to properly resolve imports.
 namespace margelo::nitro::webcodecs { struct NativeAudioEncoderConfig; }
 // Forward declaration of `HybridNativeAudioEncoderSpec` to properly resolve imports.
@@ -57,6 +59,7 @@ namespace margelo::nitro::webcodecs { class HybridNativeFileSpec; }
 #include "NativeVideoDecoderConfig.hpp"
 #include "HybridNativeVideoDecoderSpec.hpp"
 #include "NativeDecodedFrame.hpp"
+#include "NativeColorSpace.hpp"
 #include "NativeAudioEncoderConfig.hpp"
 #include "HybridNativeAudioEncoderSpec.hpp"
 #include "NativeAudioDecoderConfig.hpp"
