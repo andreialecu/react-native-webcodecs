@@ -554,7 +554,7 @@ final class HybridNativeVideoDecoder: HybridNativeVideoDecoderSpec {
         guard let imageBuffer else { return }  // dropped
         let ts = pts.isValid ? Double(CMTimeConvertScale(pts, timescale: 1_000_000, method: .roundHalfAwayFromZero).value) : timestamp
         let d = dur.isValid ? Double(CMTimeConvertScale(dur, timescale: 1_000_000, method: .roundHalfAwayFromZero).value) : duration
-        self.hold(NativeDecodedFrame(surface: HybridNativeSurface(pixelBuffer: imageBuffer), timestamp: ts, duration: d))
+        self.hold(NativeDecodedFrame(surface: HybridNativeSurface(pixelBuffer: imageBuffer), timestamp: ts, duration: d, colorSpace: nil))
       }
       if status != noErr && status != kVTVideoDecoderReferenceMissingErr {
         self.fail(HybridNativeVideoEncoder.describe(status).replacingOccurrences(of: "encoder", with: "decoder"))

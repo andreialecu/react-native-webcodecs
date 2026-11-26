@@ -18,11 +18,17 @@ public extension NativeDecodedFrame {
   /**
    * Create a new instance of `NativeDecodedFrame`.
    */
-  init(surface: (any HybridNativeSurfaceSpec), timestamp: Double, duration: Double) {
+  init(surface: (any HybridNativeSurfaceSpec), timestamp: Double, duration: Double, colorSpace: NativeColorSpace?) {
     self.init({ () -> bridge.std__shared_ptr_HybridNativeSurfaceSpec_ in
       let __cxxWrapped = surface.getCxxWrapper()
       return __cxxWrapped.getCxxPart()
-    }(), timestamp, duration)
+    }(), timestamp, duration, { () -> bridge.std__optional_NativeColorSpace_ in
+      if let __unwrappedValue = colorSpace {
+        return bridge.create_std__optional_NativeColorSpace_(__unwrappedValue)
+      } else {
+        return .init()
+      }
+    }())
   }
 
   @inline(__always)
@@ -42,5 +48,10 @@ public extension NativeDecodedFrame {
   @inline(__always)
   var duration: Double {
     return self.__duration
+  }
+  
+  @inline(__always)
+  var colorSpace: NativeColorSpace? {
+    return self.__colorSpace.value
   }
 }

@@ -26,6 +26,8 @@ namespace margelo::nitro::webcodecs { class HybridNativeVideoDecoderSpec; }
 namespace margelo::nitro::webcodecs { class HybridNativeVideoEncoderSpec; }
 // Forward declaration of `HybridWebCodecsSpec` to properly resolve imports.
 namespace margelo::nitro::webcodecs { class HybridWebCodecsSpec; }
+// Forward declaration of `NativeColorSpace` to properly resolve imports.
+namespace margelo::nitro::webcodecs { struct NativeColorSpace; }
 // Forward declaration of `NativeDecodedAudio` to properly resolve imports.
 namespace margelo::nitro::webcodecs { struct NativeDecodedAudio; }
 // Forward declaration of `NativeDecodedFrame` to properly resolve imports.
@@ -60,6 +62,7 @@ namespace NitroWebCodecs { class HybridWebCodecsSpec_cxx; }
 #include "HybridNativeVideoDecoderSpec.hpp"
 #include "HybridNativeVideoEncoderSpec.hpp"
 #include "HybridWebCodecsSpec.hpp"
+#include "NativeColorSpace.hpp"
 #include "NativeDecodedAudio.hpp"
 #include "NativeDecodedFrame.hpp"
 #include "NativeEncodedChunk.hpp"
@@ -392,6 +395,21 @@ namespace margelo::nitro::webcodecs::bridge::swift {
   Func_void_std__string create_Func_void_std__string(void* NON_NULL swiftClosureWrapper) noexcept;
   inline Func_void_std__string_Wrapper wrap_Func_void_std__string(Func_void_std__string value) noexcept {
     return Func_void_std__string_Wrapper(std::move(value));
+  }
+  
+  // pragma MARK: std::optional<NativeColorSpace>
+  /**
+   * Specialized version of `std::optional<NativeColorSpace>`.
+   */
+  using std__optional_NativeColorSpace_ = std::optional<NativeColorSpace>;
+  inline std::optional<NativeColorSpace> create_std__optional_NativeColorSpace_(const NativeColorSpace& value) noexcept {
+    return std::optional<NativeColorSpace>(value);
+  }
+  inline bool has_value_std__optional_NativeColorSpace_(const std::optional<NativeColorSpace>& optional) noexcept {
+    return optional.has_value();
+  }
+  inline NativeColorSpace get_std__optional_NativeColorSpace_(const std::optional<NativeColorSpace>& optional) noexcept {
+    return optional.value();
   }
   
   // pragma MARK: std::function<void(const NativeDecodedFrame& /* frame */)>
