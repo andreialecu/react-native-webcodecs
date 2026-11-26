@@ -88,9 +88,7 @@ await output.finalize();
 
 The texture must belong to Skia's own device, hence `importDevice(Skia.getNativeDevice())`.
 On the Android emulator, Skia's device importing the pool's buffers needs
-[react-native-skia#4510](https://github.com/wcandillon/react-native-skia/pull/4510);
-see [Related changes](../README.md#unreleased-changes-in-other-libraries). Real devices are
-not affected.
+react-native-skia 3.11.1 or later. Real devices are not affected.
 
 ## Sound
 
@@ -145,7 +143,7 @@ const frame = sample.toVideoFrame() as unknown as VideoFrame;
 sample.close();
 
 const buffer = RNWebGPU.createNativeBufferFromPointer(frame.pixelBuffer, {
-  colorSpace: frame.colorSpace.toJSON(),
+  colorSpace: frame.nativeBufferColorSpace,
 });
 device.queue.copyExternalImageToTexture(
   { source: buffer },
@@ -165,9 +163,11 @@ The frame's `colorSpace` comes from the stream (Mediabunny passes the
 track's to `configure`). Android's buffers carry no color information of
 their own, so pass it to `createNativeBufferFromPointer`: without it,
 BT.709 video is read with the BT.601 matrix, and pure red comes out as
-(225, 0, 31). That option is
-[wcandillon/react-native-webgpu#642](https://github.com/wcandillon/react-native-webgpu/pull/642),
-not in a release yet (see [Related changes](../README.md#unreleased-changes-in-other-libraries)).
+(225, 0, 31). The option takes react-native-webgpu 0.26.0 or later, and
+names color spaces as Dawn does (`"rec709"`, `range: "narrow"`), not as
+WebCodecs does (`"bt709"`, `fullRange: false`): `frame.nativeBufferColorSpace`
+is the frame's `colorSpace` in those names. On iOS the pixel buffer has its
+own, and passing it changes nothing.
 
 Close every frame when you are done with it. Android's decoder stalls while
 JavaScript holds all of its output frames.

@@ -41,9 +41,7 @@ about 1000 nits, HLG's peak.
 
 The same screen previews the animation in HDR before export, on a WebGPU
 canvas with `toneMapping: { mode: "extended" }`
-([`HdrPreview.tsx`](../example/src/VideoExport/HdrPreview.tsx)). On
-iOS 26 and later that needs
-[wcandillon/react-native-webgpu#643](https://github.com/wcandillon/react-native-webgpu/pull/643).
+([`HdrPreview.tsx`](../example/src/VideoExport/HdrPreview.tsx)).
 The iOS build also runs on an Apple silicon Mac as a "Designed for iPad" app,
 and the preview shows in HDR there too, on the MacBook's XDR display (checked
 by eye; the Mac export has not been measured).

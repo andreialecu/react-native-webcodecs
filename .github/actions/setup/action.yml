@@ -29,7 +29,7 @@ runs:
           .yarn/install-state.gz
           node_modules
           example/node_modules
-        key: yarn-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.nvmrc', '.yarnrc.yml', '.yarn/releases/**', '.yarn/patches/**', 'yarn.lock', 'package.json', 'example/package.json') }}
+        key: yarn-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.nvmrc', '.yarnrc.yml', '.yarn/releases/**', 'yarn.lock', 'package.json', 'example/package.json') }}
 
     - name: Install dependencies
       run: yarn install --immutable

@@ -100,8 +100,8 @@ const drawSkottie = (
 
 // Skia draws frame `index` straight into a pool surface, on its own device:
 // no copy, no readback. The encoder waits for Skia's GPU work through the
-// fence. (On the Android emulator this needs react-native-skia#4510, applied
-// here as a patch.)
+// fence. (On the Android emulator this needs react-native-skia 3.11.1 or
+// later.)
 const drawFrame = (
   animation: SkSkottieAnimation,
   pool: Pool,

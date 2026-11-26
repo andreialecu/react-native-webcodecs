@@ -9,6 +9,11 @@ import type {
 
 import { avcCodedSize } from "./avc";
 import {
+  type ColorSpaceInit,
+  type NativeBufferColorSpace,
+  toNativeBufferColorSpace,
+} from "./colorSpace";
+import {
   cloneConfig,
   CodecBase,
   domError,
@@ -30,13 +35,6 @@ const BT709 = {
   matrix: "bt709",
   fullRange: false,
 } as const;
-
-type ColorSpaceInit = {
-  primaries?: string | null;
-  transfer?: string | null;
-  matrix?: string | null;
-  fullRange?: boolean | null;
-};
 
 const sameColorSpace = (a: ColorSpaceInit, b: ColorSpaceInit) =>
   a.primaries === b.primaries &&
@@ -299,6 +297,16 @@ export class VideoFrame {
    */
   get pixelBuffer(): bigint | null {
     return this._surface ? this._surface.pixelBuffer : null;
+  }
+
+  /**
+   * Not in WebCodecs: `colorSpace` in the names react-native-webgpu's
+   * createNativeBufferFromPointer takes, to pass with `pixelBuffer`
+   * (`{ colorSpace: frame.nativeBufferColorSpace }`). Android needs it: see
+   * docs/guides.md, "Read video into WebGPU".
+   */
+  get nativeBufferColorSpace(): NativeBufferColorSpace {
+    return toNativeBufferColorSpace(this.colorSpace);
   }
 
   /** @internal */

@@ -88,7 +88,7 @@
     "react-native": "0.88.1",
     "react-native-builder-bob": "^0.23.2",
     "react-native-nitro-modules": "0.37.2",
-    "react-native-webgpu": "0.23.0",
+    "react-native-webgpu": "0.26.0",
     "semantic-release": "^25.0.9",
     "semantic-release-yarn": "^3.0.2",
     "typescript": "^5.2.2",
@@ -117,9 +117,7 @@
   ],
   "resolutions": {
     "@types/react": "^19.2.0",
-    "@webgpu/types": "^0.1.42",
-    "react-native-webgpu@0.23.0": "patch:react-native-webgpu@npm%3A0.23.0#./.yarn/patches/react-native-webgpu-npm-0.23.0-50f3d74c47.patch",
-    "react-native-skia@3.10.0": "patch:react-native-skia@npm%3A3.10.0#./.yarn/patches/react-native-skia-npm-3.10.0-c316c6c886.patch"
+    "@webgpu/types": "^0.1.42"
   },
   "packageManager": "yarn@3.6.4"
 }

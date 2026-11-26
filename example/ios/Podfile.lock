@@ -38,7 +38,7 @@ PODS:
     - ReactCommon/turbomodule/core
     - ReactNativeDependencies
     - Yoga
-  - NitroWebCodecs (0.0.0):
+  - NitroWebCodecs (0.1.2):
     - hermes-engine
     - NitroModules
     - RCTRequired
@@ -1470,7 +1470,7 @@ PODS:
     - ReactCommon/turbomodule/core
     - ReactNativeDependencies
     - Yoga
-  - react-native-skia (3.10.0):
+  - react-native-skia (3.13.1):
     - hermes-engine
     - RCTRequired
     - RCTTypeSafety
@@ -1495,7 +1495,7 @@ PODS:
     - ReactCommon/turbomodule/core
     - ReactNativeDependencies
     - Yoga
-  - react-native-webgpu (0.23.0):
+  - react-native-webgpu (0.26.0):
     - hermes-engine
     - RCTRequired
     - RCTTypeSafety
@@ -2507,7 +2507,7 @@ SPEC CHECKSUMS:
   glog: 3cf7cb46f743c4bc758ae3e6d9c15bd1b4cfd6d4
   hermes-engine: 84812cfd4974d62f62521511b2f1826f4edf3544
   NitroModules: f1a11047ebbb0202a7d0033d6e99ad0527d34b00
-  NitroWebCodecs: e30f1a26a3a6ce35b76ae9130f8573ae51926b4d
+  NitroWebCodecs: da03c3d8d8b626911fa601545ea7e1f3895f44b6
   RCT-Folly: 82921e585c0400eda46fac1068297aa9dfb035e4
   RCTDeprecation: c62b9b3fbf0d26b76755f3ebd1c913a4fb469dde
   RCTRequired: d0563e2484633b657976195f0543e180133afd3a
@@ -2549,8 +2549,8 @@ SPEC CHECKSUMS:
   React-microtasksnativemodule: 0207d6133274a7cbfc3d0dae326e3055c8cfcf9e
   React-mutationobservernativemodule: b97a67c29f724d18a92379e7390f24350acb433a
   react-native-safe-area-context: 56700b839169ce88ffcec68c40447916fe512462
-  react-native-skia: 8bc263ce99daef1d357c65681e5085b1d3d95157
-  react-native-webgpu: bfb5c38c9e985bc1492d497108253d5848376e5f
+  react-native-skia: f14a3198e8e004c9865987258c9c4dba874a076b
+  react-native-webgpu: b363c118a58d82d5ac694b6bde22ee128d653121
   React-NativeModulesApple: 8cfb2f308f48c48068c96b932e7f0e4297c23342
   React-networking: 3325cf73ecbdaacab0da91260b094baf36061a56
   React-oscompat: a776760fdfa152e12114f8c30d833963daac27e1

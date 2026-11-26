@@ -4042,11 +4042,11 @@ __metadata:
     react-native-reanimated: 4.7.1
     react-native-safe-area-context: ^5.4.0
     react-native-screens: ^4.30.1
-    react-native-skia: 3.10.0
+    react-native-skia: 3.13.1
     react-native-test-app: 5.4.17
     react-native-web: ^0.21.2
     react-native-webcodecs: "workspace:*"
-    react-native-webgpu: 0.23.0
+    react-native-webgpu: 0.26.0
     react-native-worklets: 0.13.1
     react-test-renderer: 19.3.0
     typescript: ~5.6.3
@@ -11352,44 +11352,11 @@ __metadata:
   languageName: node
   linkType: hard
 
-"react-native-skia-graphite-android@npm:158.0.0":
-  version: 158.0.0
-  resolution: "react-native-skia-graphite-android@npm:158.0.0"
-  checksum: b8306f52ce35761df064f4f0103f977802fc48cfe43d3b354ece441a34c7d4841ce3626186d9ffb53e6f1d62ba4d10845d71d87b9aa4c923228d4c410390d3c0
-  languageName: node
-  linkType: hard
-
-"react-native-skia-graphite-apple-ios@npm:158.0.0":
-  version: 158.0.0
-  resolution: "react-native-skia-graphite-apple-ios@npm:158.0.0"
-  checksum: be8cea926a20756cf48088cdc75ca9b4b4b4c328e4cd7ad846c6d31d4fbdf6114dbfa00d546b83541a86534160e2bf3ae53bc1d378dfee57e7d44e09d7a0542b
-  languageName: node
-  linkType: hard
-
-"react-native-skia-graphite-apple-macos@npm:158.0.0":
-  version: 158.0.0
-  resolution: "react-native-skia-graphite-apple-macos@npm:158.0.0"
-  checksum: 61b14ad117919ce1215c1e44ba5f478cd97ebabead39df71a069e06992e6385fb1d85406fcc898c5d189e665e899ccd02b816cd34a389607ea765a7f47bc129a
-  languageName: node
-  linkType: hard
-
-"react-native-skia-graphite-apple-tvos@npm:158.0.0":
-  version: 158.0.0
-  resolution: "react-native-skia-graphite-apple-tvos@npm:158.0.0"
-  checksum: eb4191148323277e0a4c5c0ef9fc38afc8b55ff629badf7c7c23cddb2c6fb9ef328e976c3758c7637e76ab0122155365cebad9fad0587aefc06a0fa3898711b9
-  languageName: node
-  linkType: hard
-
-"react-native-skia@npm:3.10.0":
-  version: 3.10.0
-  resolution: "react-native-skia@npm:3.10.0"
+"react-native-skia@npm:3.13.1":
+  version: 3.13.1
+  resolution: "react-native-skia@npm:3.13.1"
   dependencies:
     canvaskit-wasm: 0.41.1
-    react-native-skia-graphite-android: 158.0.0
-    react-native-skia-graphite-apple-ios: 158.0.0
-    react-native-skia-graphite-apple-macos: 158.0.0
-    react-native-skia-graphite-apple-tvos: 158.0.0
-    react-native-webgpu-dawn: 158.0.0
     react-reconciler: 0.33.0
   peerDependencies:
     react: ">=19.0"
@@ -11405,36 +11372,7 @@ __metadata:
       optional: true
   bin:
     setup-skia-web: scripts/setup-canvaskit.js
-  checksum: 1827e9b8af63d0d5c2b08dbc1348f449d6e3590e765efdd517c32f90b15e1673cd760c13a35b645827c91ceb4c8c2d00ad34ca551b7a72c1ee4dfd1a1ce00305
-  languageName: node
-  linkType: hard
-
-"react-native-skia@patch:react-native-skia@npm%3A3.10.0#./.yarn/patches/react-native-skia-npm-3.10.0-c316c6c886.patch::locator=react-native-webcodecs%40workspace%3A.":
-  version: 3.10.0
-  resolution: "react-native-skia@patch:react-native-skia@npm%3A3.10.0#./.yarn/patches/react-native-skia-npm-3.10.0-c316c6c886.patch::version=3.10.0&hash=bbabb5&locator=react-native-webcodecs%40workspace%3A."
-  dependencies:
-    canvaskit-wasm: 0.41.1
-    react-native-skia-graphite-android: 158.0.0
-    react-native-skia-graphite-apple-ios: 158.0.0
-    react-native-skia-graphite-apple-macos: 158.0.0
-    react-native-skia-graphite-apple-tvos: 158.0.0
-    react-native-webgpu-dawn: 158.0.0
-    react-reconciler: 0.33.0
-  peerDependencies:
-    react: ">=19.0"
-    react-native: ">=0.79"
-    react-native-reanimated: ">=4.0.0"
-    react-native-worklets: ">=0.7.0"
-  peerDependenciesMeta:
-    react-native:
-      optional: true
-    react-native-reanimated:
-      optional: true
-    react-native-worklets:
-      optional: true
-  bin:
-    setup-skia-web: scripts/setup-canvaskit.js
-  checksum: 72008b5140b48e59f245f7d3243401d7958586193bebd98d68984a4fca58fefa8758c7e3046f434c7c903a2ba4bc134db1a16a29c550c1d79e81a042857ab192
+  checksum: 952ad3cc426972ba96423fb0fa98b46933f382fdcf878c8baf80af2c3036862ef0cd974ab341cf5090d320322db2d24fe4fa7f8dbdfef5849b0391f132cea18b
   languageName: node
   linkType: hard
 
@@ -11523,7 +11461,7 @@ __metadata:
     react-native: 0.88.1
     react-native-builder-bob: ^0.23.2
     react-native-nitro-modules: 0.37.2
-    react-native-webgpu: 0.23.0
+    react-native-webgpu: 0.26.0
     semantic-release: ^25.0.9
     semantic-release-yarn: ^3.0.2
     typescript: ^5.2.2
@@ -11534,18 +11472,9 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"react-native-webgpu-dawn@npm:158.0.0":
-  version: 158.0.0
-  resolution: "react-native-webgpu-dawn@npm:158.0.0"
-  checksum: 91affe20aa3a65cb2f33861c501cf56bb2d59b148fa159f4dc8bbdf232e995db42ae499ea86f131cb107106b55eaa747ec42f36565db7e43a823a9d4f64ec9dd
-  languageName: node
-  linkType: hard
-
-"react-native-webgpu@npm:0.23.0":
-  version: 0.23.0
-  resolution: "react-native-webgpu@npm:0.23.0"
-  dependencies:
-    react-native-webgpu-dawn: 158.0.0
+"react-native-webgpu@npm:0.26.0":
+  version: 0.26.0
+  resolution: "react-native-webgpu@npm:0.26.0"
   peerDependencies:
     react: "*"
     react-native: ">=0.81.0"
@@ -11556,26 +11485,7 @@ __metadata:
       optional: true
     react-native-worklets:
       optional: true
-  checksum: 25615918489dc45f7c189696b153749f3d1a234eea493f5b086837ca899cc7294938a03c0ac77cf798a15458496213af6a4a3cb3bd6fa5c89e54bf5ce1e6dcc9
-  languageName: node
-  linkType: hard
-
-"react-native-webgpu@patch:react-native-webgpu@npm%3A0.23.0#./.yarn/patches/react-native-webgpu-npm-0.23.0-50f3d74c47.patch::locator=react-native-webcodecs%40workspace%3A.":
-  version: 0.23.0
-  resolution: "react-native-webgpu@patch:react-native-webgpu@npm%3A0.23.0#./.yarn/patches/react-native-webgpu-npm-0.23.0-50f3d74c47.patch::version=0.23.0&hash=5f2fe8&locator=react-native-webcodecs%40workspace%3A."
-  dependencies:
-    react-native-webgpu-dawn: 158.0.0
-  peerDependencies:
-    react: "*"
-    react-native: ">=0.81.0"
-    react-native-reanimated: ">=4.2.1"
-    react-native-worklets: ">=0.7.2"
-  peerDependenciesMeta:
-    react-native-reanimated:
-      optional: true
-    react-native-worklets:
-      optional: true
-  checksum: 7c64ce764886731a9cc54bd5e94f53a5ac4ff371d5c47633189b924126e2d7f26bf03ce6fd1627ad81fd11c240ff1b6f80998baef366a3f989e4b2edd504ac85
+  checksum: bf98c0f8d0554093e34ff0cde7cece1107eaf4d4ee4baa8a2bd26482c033d8523ea34bb728db830575315fbd18c09eba8a9871120ea3ae3da6703b8d0652d7a8
   languageName: node
   linkType: hard
 
