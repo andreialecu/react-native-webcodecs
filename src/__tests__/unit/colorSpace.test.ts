@@ -1,3 +1,6 @@
+import type { NativeBufferColorSpace as WebGPUNativeBufferColorSpace } from "react-native-webgpu";
+
+import type { NativeBufferColorSpace } from "../../lib/colorSpace";
 import { toNativeBufferColorSpace } from "../../lib/colorSpace";
 
 // What react-native-webgpu's createNativeBufferFromPointer takes, from the
@@ -73,3 +76,10 @@ describe("toNativeBufferColorSpace", () => {
     expect(toNativeBufferColorSpace({})).toEqual({});
   });
 });
+
+// The type is react-native-webgpu's, redeclared so that it stays a dev
+// dependency: tsc fails here if the two drift apart.
+type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+const sameType: Same<NativeBufferColorSpace, WebGPUNativeBufferColorSpace> =
+  true;
+void sameType;

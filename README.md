@@ -102,11 +102,10 @@ To draw frames or read decoded ones on the GPU, add
 
 ### Versions
 
-React Native WebGPU 0.26.0 or later: reading decoded video into WebGPU with
-the right colors on Android takes the `colorSpace` option of
-`createNativeBufferFromPointer` ([Read video into WebGPU](docs/guides.md#read-video-into-webgpu)).
-React Native Skia 3.11.1 or later, if Skia draws into pool surfaces on the
-Android emulator.
+- React Native WebGPU 0.26.0 or later, for decoded video in the right colors
+  on Android ([Read video into WebGPU](docs/guides.md#read-video-into-webgpu)).
+- React Native Skia 3.11.1 or later, for Skia drawing into pool surfaces on
+  the Android emulator.
 
 ## Codecs
 

@@ -8,8 +8,11 @@ import type {
 } from "../specs/WebCodecs.nitro";
 
 import { avcCodedSize } from "./avc";
-import type { NativeBufferColorSpace } from "./colorSpace";
-import { toNativeBufferColorSpace } from "./colorSpace";
+import {
+  type ColorSpaceInit,
+  type NativeBufferColorSpace,
+  toNativeBufferColorSpace,
+} from "./colorSpace";
 import {
   cloneConfig,
   CodecBase,
@@ -32,13 +35,6 @@ const BT709 = {
   matrix: "bt709",
   fullRange: false,
 } as const;
-
-type ColorSpaceInit = {
-  primaries?: string | null;
-  transfer?: string | null;
-  matrix?: string | null;
-  fullRange?: boolean | null;
-};
 
 const sameColorSpace = (a: ColorSpaceInit, b: ColorSpaceInit) =>
   a.primaries === b.primaries &&
@@ -304,18 +300,10 @@ export class VideoFrame {
   }
 
   /**
-   * Not in WebCodecs: `colorSpace` as react-native-webgpu's
-   * createNativeBufferFromPointer takes it, next to `pixelBuffer`:
-   *
-   * ```ts
-   * RNWebGPU.createNativeBufferFromPointer(frame.pixelBuffer, {
-   *   colorSpace: frame.nativeBufferColorSpace,
-   * });
-   * ```
-   *
-   * A decoder's buffers on Android carry no color information of their own:
-   * without it, BT.709 video is read with the BT.601 matrix. On Apple
-   * platforms the pixel buffer has its own, and this repeats them.
+   * Not in WebCodecs: `colorSpace` in the names react-native-webgpu's
+   * createNativeBufferFromPointer takes, to pass with `pixelBuffer`
+   * (`{ colorSpace: frame.nativeBufferColorSpace }`). Android needs it: see
+   * docs/guides.md, "Read video into WebGPU".
    */
   get nativeBufferColorSpace(): NativeBufferColorSpace {
     return toNativeBufferColorSpace(this.colorSpace);

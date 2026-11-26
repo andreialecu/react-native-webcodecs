@@ -17,65 +17,55 @@ export interface NativeBufferColorSpace {
     | "bt-1886";
 }
 
-/** @internal The members of a WebCodecs color space it reads. */
-export interface WebCodecsColorSpace {
+/** @internal A WebCodecs color space, as VideoColorSpaceInit. */
+export type ColorSpaceInit = {
   primaries?: string | null;
   transfer?: string | null;
   matrix?: string | null;
   fullRange?: boolean | null;
-}
-
-const PRIMARIES: Record<string, NativeBufferColorSpace["primaries"]> = {
-  bt709: "srgb",
-  bt470bg: "rec601",
-  smpte170m: "rec601",
-  bt2020: "rec2020",
-  smpte432: "display-p3",
 };
 
-const TRANSFER: Record<string, NativeBufferColorSpace["transfer"]> = {
-  bt709: "smpte-170m",
-  smpte170m: "smpte-170m",
-  "iec61966-2-1": "srgb",
-  linear: "identity",
-  pq: "pq",
-  hlg: "hlg",
-};
+const PRIMARIES = new Map<string, NativeBufferColorSpace["primaries"]>([
+  ["bt709", "srgb"],
+  ["bt470bg", "rec601"],
+  ["smpte170m", "rec601"],
+  ["bt2020", "rec2020"],
+  ["smpte432", "display-p3"],
+]);
 
-const MATRIX: Record<string, NativeBufferColorSpace["matrix"]> = {
-  bt709: "rec709",
-  bt470bg: "rec601",
-  smpte170m: "rec601",
-  "bt2020-ncl": "rec2020",
-};
+const TRANSFER = new Map<string, NativeBufferColorSpace["transfer"]>([
+  ["bt709", "smpte-170m"],
+  ["smpte170m", "smpte-170m"],
+  ["iec61966-2-1", "srgb"],
+  ["linear", "identity"],
+  ["pq", "pq"],
+  ["hlg", "hlg"],
+]);
 
-const lookup = <T>(table: Record<string, T>, name?: string | null) =>
-  name != null && Object.prototype.hasOwnProperty.call(table, name)
-    ? table[name]
-    : undefined;
+const MATRIX = new Map<string, NativeBufferColorSpace["matrix"]>([
+  ["bt709", "rec709"],
+  ["bt470bg", "rec601"],
+  ["smpte170m", "rec601"],
+  ["bt2020-ncl", "rec2020"],
+]);
 
 /**
  * @internal A WebCodecs color space in Dawn's names. Members it has no name
  * for are left out, so the buffer's own stay.
  */
 export const toNativeBufferColorSpace = (
-  colorSpace: WebCodecsColorSpace,
+  colorSpace: ColorSpaceInit,
 ): NativeBufferColorSpace => {
-  const result: NativeBufferColorSpace = {};
-  const primaries = lookup(PRIMARIES, colorSpace.primaries);
-  if (primaries) {
-    result.primaries = primaries;
-  }
-  const transfer = lookup(TRANSFER, colorSpace.transfer);
-  if (transfer) {
-    result.transfer = transfer;
-  }
-  const matrix = lookup(MATRIX, colorSpace.matrix);
-  if (matrix) {
-    result.matrix = matrix;
-  }
-  if (typeof colorSpace.fullRange === "boolean") {
-    result.range = colorSpace.fullRange ? "full" : "narrow";
-  }
-  return result;
+  const primaries = PRIMARIES.get(colorSpace.primaries ?? "");
+  const transfer = TRANSFER.get(colorSpace.transfer ?? "");
+  const matrix = MATRIX.get(colorSpace.matrix ?? "");
+  const { fullRange } = colorSpace;
+  return {
+    ...(primaries && { primaries }),
+    ...(transfer && { transfer }),
+    ...(matrix && { matrix }),
+    ...(typeof fullRange === "boolean" && {
+      range: fullRange ? "full" : "narrow",
+    }),
+  };
 };
