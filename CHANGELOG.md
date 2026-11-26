@@ -1,5 +1,13 @@
 # Changelog
 
+# [0.2.0](https://github.com/andreialecu/react-native-webcodecs/compare/v0.1.3...v0.2.0) (2026-11-26)
+
+
+### Features
+
+* add VideoFrame.nativeBufferColorSpace, on react-native-webgpu 0.26.0 ([6c21300](https://github.com/andreialecu/react-native-webcodecs/commit/6c21300ac955567ea42251954b34749748a85afb)), closes [wcandillon/react-native-skia#4510](https://github.com/wcandillon/react-native-skia/issues/4510) [wcandillon/react-native-webgpu#643](https://github.com/wcandillon/react-native-webgpu/issues/643)
+* **android:** decoded frames take the stream's color space where the config has none ([68f8e5b](https://github.com/andreialecu/react-native-webcodecs/commit/68f8e5b5792dac2c27630b5fd8d68dc5e072ef5b))
+
 ## [0.1.3](https://github.com/andreialecu/react-native-webcodecs/compare/v0.1.2...v0.1.3) (2026-11-25)
 
 
