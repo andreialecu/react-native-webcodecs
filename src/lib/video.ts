@@ -8,6 +8,8 @@ import type {
 } from "../specs/WebCodecs.nitro";
 
 import { avcCodedSize } from "./avc";
+import type { NativeBufferColorSpace } from "./colorSpace";
+import { toNativeBufferColorSpace } from "./colorSpace";
 import {
   cloneConfig,
   CodecBase,
@@ -299,6 +301,24 @@ export class VideoFrame {
    */
   get pixelBuffer(): bigint | null {
     return this._surface ? this._surface.pixelBuffer : null;
+  }
+
+  /**
+   * Not in WebCodecs: `colorSpace` as react-native-webgpu's
+   * createNativeBufferFromPointer takes it, next to `pixelBuffer`:
+   *
+   * ```ts
+   * RNWebGPU.createNativeBufferFromPointer(frame.pixelBuffer, {
+   *   colorSpace: frame.nativeBufferColorSpace,
+   * });
+   * ```
+   *
+   * A decoder's buffers on Android carry no color information of their own:
+   * without it, BT.709 video is read with the BT.601 matrix. On Apple
+   * platforms the pixel buffer has its own, and this repeats them.
+   */
+  get nativeBufferColorSpace(): NativeBufferColorSpace {
+    return toNativeBufferColorSpace(this.colorSpace);
   }
 
   /** @internal */

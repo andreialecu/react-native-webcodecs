@@ -1160,7 +1160,7 @@ describe("react-native-webcodecs + Mediabunny", () => {
               // whose color space comes from the frame).
               const buffer = RNWebGPU.createNativeBufferFromPointer(
                 frame.pixelBuffer,
-                { colorSpace: frame.colorSpace.toJSON() },
+                { colorSpace: frame.nativeBufferColorSpace },
               );
               const { format, timestamp } = frame;
               const size = 128;
@@ -4030,7 +4030,7 @@ describe("react-native-webcodecs + Mediabunny", () => {
             const height = frame.displayHeight;
             const buffer = RNWebGPU.createNativeBufferFromPointer(
               frame.pixelBuffer,
-              { colorSpace: frame.colorSpace.toJSON() },
+              { colorSpace: frame.nativeBufferColorSpace },
             );
             const texture = device.createTexture({
               size: [width, height],

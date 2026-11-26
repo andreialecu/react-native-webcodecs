@@ -19,6 +19,7 @@ import {
 export * from "./lib/audio";
 export * from "./lib/background";
 export * from "./lib/files";
+export type { NativeBufferColorSpace } from "./lib/colorSpace";
 export type { WebCodecsError } from "./lib/native";
 export * from "./lib/video";
 

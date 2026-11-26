@@ -158,7 +158,7 @@ const makeScaler = (width: number, height: number, rotation: number) => {
       }
       const decoded = RNWebGPU.createNativeBufferFromPointer(
         frame.pixelBuffer!,
-        { colorSpace: frame.colorSpace.toJSON() },
+        { colorSpace: frame.nativeBufferColorSpace },
       );
       device.queue.copyExternalImageToTexture(
         { source: decoded },

@@ -36,9 +36,7 @@ GPU fences between them, never pixels through JavaScript.
 
 **Status:** young (0.x). Tested on the iOS Simulator, an Android emulator, one
 iPhone and, for the web build, Chromium. H.264 and AAC everywhere, HEVC on
-iOS, HDR export on iOS, Android and the web. Some paths need
-[changes not yet released](#unreleased-changes-in-other-libraries) in other
-libraries.
+iOS, HDR export on iOS, Android and the web.
 
 ## Installation
 
@@ -102,25 +100,13 @@ To draw frames or read decoded ones on the GPU, add
 (`react-native-webgpu`), and [React Native Skia](https://shopify.github.io/react-native-skia/)
 (`react-native-skia`) if you draw with Skia.
 
-### Temporary patches
+### Versions
 
-Until [three pull requests](#unreleased-changes-in-other-libraries) to
-William Candillon's react-native-webgpu and react-native-skia are released,
-some paths need them applied as patches. Exports of SDR video work without
-them. With Yarn, copy the patch files from
-[`.yarn/patches`](.yarn/patches) into your app and point `resolutions` at
-them:
-
-```json
-"resolutions": {
-  "react-native-webgpu@0.23.0": "patch:react-native-webgpu@npm%3A0.23.0#./.yarn/patches/react-native-webgpu-npm-0.23.0-50f3d74c47.patch",
-  "react-native-skia@3.10.0": "patch:react-native-skia@npm%3A3.10.0#./.yarn/patches/react-native-skia-npm-3.10.0-c316c6c886.patch"
-}
-```
-
-With npm or pnpm, apply the same diffs with
-[patch-package](https://github.com/ds300/patch-package) or `pnpm patch`.
-The patches are for those exact versions, and go away once the changes ship.
+React Native WebGPU 0.26.0 or later: reading decoded video into WebGPU with
+the right colors on Android takes the `colorSpace` option of
+`createNativeBufferFromPointer` ([Read video into WebGPU](docs/guides.md#read-video-into-webgpu)).
+React Native Skia 3.11.1 or later, if Skia draws into pool surfaces on the
+Android emulator.
 
 ## Codecs
 
@@ -275,19 +261,6 @@ including running it on a Mac.
   <img src="docs/compress.gif" width="300" alt="The example app compressing a phone video picked from the library" />
 </p>
 <p align="center"><sub>A 20-second 1080p HEVC phone video, 40.3 MB, compressed to 720p H.264: 5.3 MB, in 3.2 s on the iOS Simulator. <a href="docs/guides.md#compress-a-video">How it works</a>.</sub></p>
-
-## Unreleased changes in other libraries
-
-Some paths need changes that are not released yet. This repository applies
-them as Yarn patches (`.yarn/patches`); an app needs the same until they
-ship (see [Temporary patches](#temporary-patches)). This is temporary,
-pending review by William Candillon, who maintains both libraries.
-
-| Change | Needed for |
-| :-- | :-- |
-| [wcandillon/react-native-webgpu#642](https://github.com/wcandillon/react-native-webgpu/pull/642) | Correct colors when reading decoded video into WebGPU on Android. |
-| [wcandillon/react-native-webgpu#643](https://github.com/wcandillon/react-native-webgpu/pull/643) | HDR preview on a WebGPU canvas on iOS 26. Exports do not need it. |
-| [wcandillon/react-native-skia#4510](https://github.com/wcandillon/react-native-skia/pull/4510) | Skia drawing into pool surfaces on the Android emulator. Real devices do not need it. |
 
 ## Acknowledgements
 
